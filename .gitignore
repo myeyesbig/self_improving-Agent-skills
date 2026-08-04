@@ -1,0 +1,23 @@
+# Python
+backend/.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Node / Next.js
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+npm-debug.log*
+
+# macOS
+.DS_Store
+
+# WorkBuddy local data (memory, task state — not part of the project)
+.workbuddy/
+
+# Logs & env
+*.log
+.env
+.env.*
+!.env.example
