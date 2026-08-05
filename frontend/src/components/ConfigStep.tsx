@@ -1,7 +1,21 @@
 "use client";
 
+// =============================================================================
+// 【文件头】ConfigStep.tsx —— 第二步：配置测试场景与评估标准
+// 职责：展示并编辑上一步生成的 scenarios（测试场景）和 evals（评估标准），
+//       支持勾选 / 增删 / 编辑 / 重新生成，最后保存到后端并进入优化。
+// 接收：父组件传入的 sessionId / apiKey / scenarios / evals 及变更回调。
+// 输出：把勾选后的结果上报给父组件（onScenariosChange / onEvalsChange），
+//       并调用 onComplete() 推动步骤前进。
+// 建议先看：handleContinue（保存 + 前进）与 handleRegenerate（重新生成）。
+// 【初学者提示】组件把 props 传入的数据复制到局部 state 并附加 selected /
+//       editing 标记；所有更新都用展开运算符（...）做"不可变更新"，再配合
+//       map / filter 生成新数组，React 才能正确感知变化并重渲染。
+// =============================================================================
+
 import { useState } from "react";
 import { CheckSquare, Square, Plus, X, RefreshCw, ArrowRight } from "lucide-react";
+import { regenerateConfig, updateConfig } from "@/lib/api";
 
 interface ConfigStepProps {
   sessionId: string;
@@ -22,6 +36,8 @@ export default function ConfigStep({
   onEvalsChange,
   onComplete,
 }: ConfigStepProps) {
+  // 【初学者提示】props 里的是父组件存的"初始数据"；这里用 map 给每一项
+  // 附加 UI 状态：selected（是否勾选参与优化）、editing（是否处于编辑态）。
   const [scenarios, setScenarios] = useState(
     initialScenarios.map((s) => ({ ...s, selected: true, editing: false }))
   );
@@ -32,6 +48,8 @@ export default function ConfigStep({
   const [showAddScenario, setShowAddScenario] = useState(false);
   const [showAddEval, setShowAddEval] = useState(false);
 
+  // 【初学者提示】以下五个 handler 都遵循同一模式：用 map / filter 生成新
+  // 数组（不改原数组），只有 id 匹配的那一项被替换/删除 —— 这就是不可变更新。
   const handleScenarioToggle = (id: number) => {
     setScenarios((prev) =>
       prev.map((s) => (s.id === id ? { ...s, selected: !s.selected } : s))
@@ -44,6 +62,7 @@ export default function ConfigStep({
     );
   };
 
+  // 编辑任意字段：用 [field] 动态键展开覆盖，其他字段保持不变。
   const handleScenarioEdit = (id: number, field: string, value: string) => {
     setScenarios((prev) =>
       prev.map((s) => (s.id === id ? { ...s, [field]: value } : s))
@@ -64,6 +83,7 @@ export default function ConfigStep({
     setEvals((prev) => prev.filter((e) => e.id !== id));
   };
 
+  // 新增：id 取现有最大值 +1，保证不重复；新项默认选中并进入编辑态。
   const handleAddScenario = () => {
     const newId = Math.max(...scenarios.map((s) => s.id), 0) + 1;
     setScenarios((prev) => [
@@ -96,22 +116,13 @@ export default function ConfigStep({
     setShowAddEval(false);
   };
 
+  // 【主流程】重新生成：让后端用 /api/regenerate 重新调用模型生成一份新的
+  // scenarios / evals，然后覆盖本地 state（新项默认全部选中）。
   const handleRegenerate = async () => {
     setIsRegenerating(true);
 
     try {
-      const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8891";
-      const response = await fetch(`${API_BASE}/api/regenerate`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ session_id: sessionId, qwen_api_key: apiKey }),
-      });
-
-      if (!response.ok) {
-        throw new Error("Regeneration failed");
-      }
-
-      const data = await response.json();
+      const data = await regenerateConfig(sessionId, apiKey);
       setScenarios(data.scenarios.map((s: any) => ({ ...s, selected: true })));
       setEvals(data.evals.map((e: any) => ({ ...e, selected: true })));
     } catch (error) {
@@ -121,6 +132,8 @@ export default function ConfigStep({
     }
   };
 
+  // 【主流程】继续：筛选出勾选项，先保存到后端（/api/update-config），再把
+  // 勾选结果上报给父组件（page.tsx 的 state），最后调用 onComplete 跳到步骤 3。
   const handleContinue = async () => {
     const selectedScenarios = scenarios.filter((s) => s.selected);
     const selectedEvals = evals.filter((e) => e.selected);
@@ -131,21 +144,7 @@ export default function ConfigStep({
     }
 
     try {
-      const API_BASE2 = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8891";
-      const response = await fetch(`${API_BASE2}/api/update-config`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          session_id: sessionId,
-          scenarios: selectedScenarios,
-          evals: selectedEvals,
-        }),
-      });
-
-      if (!response.ok) {
-        throw new Error("Failed to save configuration");
-      }
-
+      await updateConfig(sessionId, selectedScenarios, selectedEvals);
       onScenariosChange(selectedScenarios);
       onEvalsChange(selectedEvals);
       onComplete();
@@ -154,6 +153,7 @@ export default function ConfigStep({
     }
   };
 
+  // 派生计数：用于按钮可用性与"已选数量"角标（不改 state，直接由渲染读取）。
   const selectedScenarioCount = scenarios.filter((s) => s.selected).length;
   const selectedEvalCount = evals.filter((e) => e.selected).length;
 
@@ -163,7 +163,7 @@ export default function ConfigStep({
         <div className="flex items-center justify-between mb-6">
           <div className="flex items-center gap-3">
             <h2 className="text-2xl font-bold">Test Scenarios</h2>
-            <span className="px-3 py-1 bg-violet-500/20 text-violet-400 rounded-full text-sm font-medium">
+            <span className="px-3 py-1 bg-cyan-500/20 text-cyan-400 rounded-full text-sm font-medium">
               {selectedScenarioCount} selected
             </span>
           </div>
@@ -191,7 +191,7 @@ export default function ConfigStep({
             <div className="p-4 bg-zinc-900 border border-zinc-800 rounded-lg">
               <button
                 onClick={handleAddScenario}
-                className="w-full py-3 border-2 border-dashed border-zinc-700 rounded-lg hover:border-violet-500 transition-colors text-zinc-400 hover:text-white"
+                className="w-full py-3 border-2 border-dashed border-zinc-700 rounded-lg hover:border-cyan-500 transition-colors text-zinc-400 hover:text-white"
               >
                 Click to add scenario
               </button>
@@ -206,7 +206,7 @@ export default function ConfigStep({
               <div className="flex items-start gap-3">
                 <button
                   onClick={() => handleScenarioToggle(scenario.id)}
-                  className="mt-1 text-violet-500 hover:text-violet-400"
+                  className="mt-1 text-cyan-500 hover:text-cyan-400"
                 >
                   {scenario.selected ? (
                     <CheckSquare className="w-5 h-5" />
@@ -222,7 +222,7 @@ export default function ConfigStep({
                     onChange={(e) =>
                       handleScenarioEdit(scenario.id, "description", e.target.value)
                     }
-                    className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-lg focus:outline-none focus:border-violet-500"
+                    className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-lg focus:outline-none focus:border-cyan-500"
                   />
                   <textarea
                     value={scenario.input}
@@ -231,7 +231,7 @@ export default function ConfigStep({
                     }
                     rows={3}
                     placeholder="Test input..."
-                    className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-lg focus:outline-none focus:border-violet-500 resize-none"
+                    className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-lg focus:outline-none focus:border-cyan-500 resize-none"
                   />
                 </div>
 
@@ -251,7 +251,7 @@ export default function ConfigStep({
         <div className="flex items-center justify-between mb-6">
           <div className="flex items-center gap-3">
             <h2 className="text-2xl font-bold">Evaluation Criteria</h2>
-            <span className="px-3 py-1 bg-violet-500/20 text-violet-400 rounded-full text-sm font-medium">
+            <span className="px-3 py-1 bg-cyan-500/20 text-cyan-400 rounded-full text-sm font-medium">
               {selectedEvalCount} selected
             </span>
           </div>
@@ -271,7 +271,7 @@ export default function ConfigStep({
             <div className="p-4 bg-zinc-900 border border-zinc-800 rounded-lg">
               <button
                 onClick={handleAddEval}
-                className="w-full py-3 border-2 border-dashed border-zinc-700 rounded-lg hover:border-violet-500 transition-colors text-zinc-400 hover:text-white"
+                className="w-full py-3 border-2 border-dashed border-zinc-700 rounded-lg hover:border-cyan-500 transition-colors text-zinc-400 hover:text-white"
               >
                 Click to add criterion
               </button>
@@ -286,7 +286,7 @@ export default function ConfigStep({
               <div className="flex items-start gap-3">
                 <button
                   onClick={() => handleEvalToggle(evalItem.id)}
-                  className="mt-1 text-violet-500 hover:text-violet-400"
+                  className="mt-1 text-cyan-500 hover:text-cyan-400"
                 >
                   {evalItem.selected ? (
                     <CheckSquare className="w-5 h-5" />
@@ -302,7 +302,7 @@ export default function ConfigStep({
                     onChange={(e) =>
                       handleEvalEdit(evalItem.id, "name", e.target.value)
                     }
-                    className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-lg focus:outline-none focus:border-violet-500 font-semibold"
+                    className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-lg focus:outline-none focus:border-cyan-500 font-semibold"
                   />
                   <input
                     type="text"
@@ -311,7 +311,7 @@ export default function ConfigStep({
                       handleEvalEdit(evalItem.id, "question", e.target.value)
                     }
                     placeholder="Yes/no question..."
-                    className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-lg focus:outline-none focus:border-violet-500"
+                    className="w-full px-3 py-2 bg-zinc-800 border border-zinc-700 rounded-lg focus:outline-none focus:border-cyan-500"
                   />
                   <div className="grid grid-cols-2 gap-2">
                     <input

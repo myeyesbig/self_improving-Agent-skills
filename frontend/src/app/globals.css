@@ -1,5 +1,18 @@
 @import "tailwindcss";
 
+/* =============================================================================
+   【文件头】globals.css —— 全局样式
+   职责：在 Tailwind 基础上定义基础层（base）与工具层（utilities）样式：
+         页面背景/文字色、滚动条、毛玻璃卡片、渐变文字/背景、动画，以及
+         浅色模式（html.light）下对 Tailwind 常用色值的覆盖。
+   接收：无；作为全局样式被 layout.tsx 引入。
+   输出：作用于整个应用的主题样式。
+   建议先看：@layer base（基础主题）→ html.light 覆盖（浅色模式适配）。
+   【初学者提示】@layer base / @layer utilities 是 Tailwind 的层（layer）语法，
+         用于控制样式优先级：自定义基础样式放在 base 层，工具类覆盖写在
+         utilities 层，避免与 Tailwind 生成的类名互相打架。
+   ========================================================================== */
+
 @layer base {
   * {
     margin: 0;
@@ -13,12 +26,14 @@
   }
 
   /* Dark mode (default) */
+  /* 深色为默认主题：html.dark 时黑底白字。 */
   html.dark body {
     background-color: #09090b;
     color: #fafafa;
   }
 
   /* Light mode */
+  /* 浅色主题：html.light 时白底深字。 */
   html.light body {
     background-color: #fafafa;
     color: #18181b;
@@ -32,6 +47,7 @@
   }
 
   /* Scrollbar - dark */
+  /* 深色主题滚动条配色（一组）。 */
   html.dark ::-webkit-scrollbar {
     width: 10px;
   }
@@ -47,6 +63,7 @@
   }
 
   /* Scrollbar - light */
+  /* 浅色主题滚动条配色（一组）。 */
   html.light ::-webkit-scrollbar {
     width: 10px;
   }
@@ -64,6 +81,7 @@
 
 @layer utilities {
   /* Glass effect - dark */
+  /* .glass 毛玻璃卡片：深色半透明背景 + 模糊。 */
   html.dark .glass {
     background: rgba(24, 24, 27, 0.6);
     backdrop-filter: blur(12px);
@@ -78,17 +96,20 @@
     box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
   }
 
+  /* 渐变文字与渐变背景：界面主视觉用的青-青绿渐变（SkillForge 品牌色）。 */
   .gradient-text {
-    background: linear-gradient(to right, #8b5cf6, #a855f7);
+    background: linear-gradient(to right, #22d3ee, #14b8a6);
     -webkit-background-clip: text;
     background-clip: text;
     -webkit-text-fill-color: transparent;
   }
 
   .gradient-bg {
-    background: linear-gradient(135deg, #8b5cf6, #a855f7);
+    background: linear-gradient(135deg, #22d3ee, #14b8a6);
   }
 
+  /* 以下三个动画（shimmer / pulse-ring）分组定义：keyframes 紧跟在
+     使用它的类后面，@keyframes 本身不参与层优先级。 */
   .shimmer {
     animation: shimmer 2s infinite;
     background: linear-gradient(
@@ -115,6 +136,9 @@
   }
 
   /* Light mode overrides for common component patterns */
+  /* 【初学者提示】浅色模式覆盖：组件里大量硬编码了深色 Tailwind 类
+     （bg-zinc-900、text-zinc-400 等），这里在 html.light 下用 !important
+     统一覆盖成浅色配色，无需改动每个组件的类名。 */
   html.light .bg-zinc-900 { background-color: #ffffff !important; }
   html.light .bg-zinc-800 { background-color: #f4f4f5 !important; }
   html.light .bg-zinc-700 { background-color: #e4e4e7 !important; }
@@ -128,7 +152,7 @@
   html.light .hover\:bg-zinc-700:hover { background-color: #e4e4e7 !important; }
   html.light .hover\:bg-zinc-800:hover { background-color: #f4f4f5 !important; }
   html.light .hover\:border-zinc-700:hover { border-color: #d4d4d8 !important; }
-  html.light .focus\:border-violet-500:focus { border-color: #8b5cf6 !important; }
+  html.light .focus\:border-cyan-500:focus { border-color: #06b6d4 !important; }
   html.light input, html.light textarea {
     color: #18181b !important;
   }
@@ -137,6 +161,7 @@
   }
 
   /* Recharts overrides for light mode */
+  /* 图表库 Recharts 的网格线与文字也做浅色适配。 */
   html.light .recharts-cartesian-grid line {
     stroke: #e4e4e7 !important;
   }

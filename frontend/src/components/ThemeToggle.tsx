@@ -1,10 +1,23 @@
 "use client";
 
+// =============================================================================
+// 【文件头】ThemeToggle.tsx —— 明暗主题切换按钮
+// 职责：在 <html> 元素上切换 dark / light class，并把选择持久化到
+//       localStorage，刷新后保持用户偏好。
+// 接收：无 props。
+// 输出：修改 document.documentElement 的 class 与 localStorage 的 theme 键。
+// 建议先看：useEffect（恢复上次选择）与 toggle（切换并持久化）。
+// 【初学者提示】主题持久化 = class 只活在当前页面 + localStorage 负责跨刷新
+//       记忆。注意首帧由 layout.tsx 里的内联脚本先读 localStorage，避免闪烁
+//       （见 layout.tsx 的 hydration 说明）。
+// =============================================================================
+
 import { useState, useEffect } from "react";
 
 export default function ThemeToggle() {
   const [isDark, setIsDark] = useState(true);
 
+  // 挂载时读取 localStorage 恢复主题；没有记录则保持默认深色。
   useEffect(() => {
     const saved = localStorage.getItem("theme");
     if (saved === "light") {
@@ -18,6 +31,7 @@ export default function ThemeToggle() {
     }
   }, []);
 
+  // 切换：更新 state、同步 <html> 的 class，并把选择写回 localStorage。
   const toggle = () => {
     const next = !isDark;
     setIsDark(next);

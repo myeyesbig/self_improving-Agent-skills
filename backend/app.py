@@ -1,3 +1,18 @@
+# =============================================================================
+# 【文件头】app.py —— FastAPI 后端入口（HTTP 路由 + 内存会话管理）
+# 职责：定义全部 API 路由（上传 / 分析 / 配置 / 启动优化 / 停止 / 轮询状态 /
+#       SSE 流 / 下载），并用进程内字典 sessions 保存每个会话的状态。
+# 接收：浏览器发来的 .zip 文件 / 多个文件（文件夹上传）、JSON 请求体（含
+#       qwen_api_key 与 session_id）。
+# 输出：JSON 响应体（session_id、scenarios、evals、status、final_result 等）、
+#       SSE 事件流、打包好的 improved_skill.zip。
+# 建议先看：/api/upload → /api/analyze → /api/start → /api/status 这条主链路，
+#       以及 start_optimization() 里的后台任务与闭包 callback。
+# 【注意】前端实际使用 /api/status 轮询（polling）获取进度；/api/stream 的
+#       SSE 路由虽然存在，但当前 UI 并未消费它。另外 /api/stop 只把 session
+#       状态改为 stopped 并关闭事件队列，并不会真正取消后台正在跑的模型调用。
+# =============================================================================
+
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -15,11 +30,13 @@ import shutil
 import re
 import logging
 import traceback
-from qwen_optimizer import SkillOptimizer
+from qwen_optimizer import SkillOptimizer, StopOptimizationError
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# 【安全】上传与会话的硬性限制：总量 10MB、单文件 1MB、最多 50 个文件、
+# 会话 1 小时过期；只允许白名单里的文本扩展名。
 MAX_UPLOAD_SIZE = 10 * 1024 * 1024  # 10 MB total
 MAX_FILE_SIZE = 1 * 1024 * 1024     # 1 MB per file
 MAX_FILE_COUNT = 50
@@ -31,6 +48,7 @@ ALLOWED_EXTENSIONS = {
 
 app = FastAPI()
 
+# CORS：允许所有来源访问 API，便于前端开发时跨端口调用。
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -39,8 +57,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# 【主流程】内存会话表：session_id → 该次上传的完整状态。所有路由都读写这个
+# 字典，进程重启即清空；session 字段的具体含义见 CODE_WALKTHROUGH.zh-CN.md。
 sessions: Dict[str, dict] = {}
 
+
+# -- 请求体模型 ---------------------------------------------------------------
+# 【注意】凭据字段固定为 qwen_api_key（阿里云百炼 DashScope），不兼容任何
+# 不兼容旧版提供商的凭据字段；密钥只随请求体传到内存，绝不持久化。
 
 class AnalyzeRequest(BaseModel):
     session_id: str
@@ -61,10 +85,19 @@ class RegenerateRequest(BaseModel):
 class StartRequest(BaseModel):
     qwen_api_key: str
     max_rounds: Optional[int] = Field(default=20, gt=0, le=50)
+    # 【C3】并行变异数：可选，默认走后端配置（通常为 1）。
+    parallel_mutations: Optional[int] = Field(default=None, ge=1, le=3)
+    # 【C1】策略白名单：可选，默认全量模板。
+    strategy_pool: Optional[List[str]] = None
+    # 【C4】提升阈值：可选，默认 0.0（严格高于）。
+    improvement_threshold: Optional[float] = Field(default=None, ge=0.0)
 
 
 def parse_skill_frontmatter(content: str) -> dict:
     """Parse YAML frontmatter from SKILL.md"""
+    # 简单解析 SKILL.md 顶部的 YAML frontmatter（--- 分隔的键值对），
+    # 用来提取技能名称与描述，展示在界面上；解析失败就返回空 dict。
+    # 支持 `>-` / `|-` / `>` / `|` 折叠块：后续缩进行的文本会拼成单段描述。
     if not content.startswith("---"):
         return {}
     try:
@@ -73,11 +106,30 @@ def parse_skill_frontmatter(content: str) -> dict:
             return {}
         frontmatter = parts[1].strip()
         metadata = {}
-        for line in frontmatter.split("\n"):
-            line = line.strip()
+        lines = frontmatter.split("\n")
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            stripped = line.strip()
             if ":" in line and not line.startswith(" "):
                 key, value = line.split(":", 1)
-                metadata[key.strip()] = value.strip().strip('"')
+                key = key.strip()
+                value = value.strip().strip('"')
+                # 折叠块指示符：收集后续以 2+ 空格缩进的行，折叠成单段文本。
+                if value in (">-", "|-", ">", "|", ">- ", "|- "):
+                    parts_list = []
+                    i += 1
+                    while i < len(lines):
+                        cont = lines[i]
+                        if cont.startswith("  ") or cont.startswith("\t"):
+                            parts_list.append(cont.strip())
+                            i += 1
+                        else:
+                            break
+                    metadata[key] = " ".join(parts_list).strip()
+                    continue
+                metadata[key] = value
+            i += 1
         return metadata
     except Exception:
         return {}
@@ -85,6 +137,8 @@ def parse_skill_frontmatter(content: str) -> dict:
 
 def create_session_from_files(skill_files: dict, file_list: list) -> dict:
     """Create a session dict from skill files"""
+    # 【主流程】上传成功的关键一步：生成 session_id，并把本次上传的技能文件
+    # 与初始状态存进 sessions 表。之后所有路由都凭 session_id 找到这份状态。
     skill_md = None
     for name, content in skill_files.items():
         if name.endswith("SKILL.md"):
@@ -107,6 +161,7 @@ def create_session_from_files(skill_files: dict, file_list: list) -> dict:
         "original_skill_md": skill_md,
         "created_at": time.time(),
     }
+    # 返回给前端的只有 session_id 和文件清单；skill_files 等内部数据不出内存。
     return {"session_id": session_id, "file_list": file_list, "metadata": metadata}
 
 
@@ -118,12 +173,19 @@ def _is_allowed_file(name: str) -> bool:
 
 def _is_safe_path(name: str) -> bool:
     """Reject path traversal attempts."""
+    # 【安全】拒绝路径穿越（..）与绝对路径，防止恶意压缩包把文件写到任意位置。
     return ".." not in name and not os.path.isabs(name)
 
+
+# =============================================================================
+# 路由：上传 → 分析 → 配置 → 优化 → 结果，见 CODE_WALKTHROUGH.zh-CN.md 的链路图
+# =============================================================================
 
 @app.post("/api/upload")
 async def upload_skill(file: UploadFile = File(...)):
     """Accept zip file or multiple files, extract, return file list + parsed SKILL.md metadata"""
+    # 【主流程】步骤 1a：接收 .zip，逐条检查大小 / 路径 / 扩展名后解压成文本，
+    # 最后创建 session 并把 session_id 返回给前端。
     if not file.filename.endswith(".zip"):
         raise HTTPException(status_code=400, detail="Only .zip files are accepted")
     content = await file.read()
@@ -134,6 +196,7 @@ async def upload_skill(file: UploadFile = File(...)):
             skill_files = {}
             file_list = []
             for name in zf.namelist():
+                # 跳过目录条目、macOS 残留与隐藏文件，再依次做路径、扩展名、大小校验。
                 if name.endswith("/") or name.startswith("__MACOSX") or "/.DS_Store" in name or name.endswith(".DS_Store"):
                     continue
                 if not _is_safe_path(name):
@@ -154,6 +217,7 @@ async def upload_skill(file: UploadFile = File(...)):
                 file_list.append(name)
 
             # Normalize paths: strip common prefix directory
+            # 去掉所有文件共有的顶层目录前缀，让路径以 SKILL.md 为根，后续一致。
             if file_list:
                 common = os.path.commonpath(file_list)
                 if common and common != file_list[0]:
@@ -173,6 +237,8 @@ async def upload_skill(file: UploadFile = File(...)):
 @app.post("/api/upload-files")
 async def upload_files(files: List[UploadFile] = File(...)):
     """Accept multiple files (folder upload via webkitdirectory)"""
+    # 【主流程】步骤 1b：文件夹上传（浏览器 webkitdirectory 属性）走这个路由，
+    # 校验逻辑与 ZIP 上传一致，只是输入是文件列表而非压缩包。
     if len(files) > MAX_FILE_COUNT:
         raise HTTPException(status_code=413, detail=f"Too many files (max {MAX_FILE_COUNT})")
     skill_files = {}
@@ -211,6 +277,8 @@ async def upload_files(files: List[UploadFile] = File(...)):
 @app.post("/api/analyze")
 async def analyze_skill(request: AnalyzeRequest):
     """Generate scenarios + evals using Qwen"""
+    # 【主流程】步骤 2：用 SkillOptimizer 的 Executor 助手分析技能文件，
+    # 生成测试场景与评估标准，写回 session，前端据此进入配置页。
     if request.session_id not in sessions:
         raise HTTPException(status_code=404, detail="Session not found")
     session = sessions[request.session_id]
@@ -229,6 +297,7 @@ async def analyze_skill(request: AnalyzeRequest):
 @app.post("/api/regenerate")
 async def regenerate_config(request: RegenerateRequest):
     """Regenerate scenarios/evals for a session"""
+    # 复用 analyze_skill 逻辑：重新生成一份 scenarios/evals，覆盖原配置。
     analyze_req = AnalyzeRequest(session_id=request.session_id, qwen_api_key=request.qwen_api_key)
     return await analyze_skill(analyze_req)
 
@@ -236,6 +305,7 @@ async def regenerate_config(request: RegenerateRequest):
 @app.post("/api/update-config")
 async def update_config(config: SessionConfig):
     """Save user's selected/edited scenarios + evals"""
+    # 【主流程】步骤 3：保存用户在配置页勾选 / 编辑后的 scenarios 与 evals。
     if config.session_id not in sessions:
         raise HTTPException(status_code=404, detail="Session not found")
     session = sessions[config.session_id]
@@ -248,11 +318,14 @@ async def update_config(config: SessionConfig):
 @app.get("/api/stream/{session_id}")
 async def stream_progress(session_id: str):
     """SSE endpoint streaming optimization progress"""
+    # 【注意】SSE（Server-Sent Events）路由：从事件队列里取事件，按 SSE 格式
+    # 推送给浏览器。但当前前端 UI 走的是 /api/status 轮询，这个路由尚未被消费。
     if session_id not in sessions:
         raise HTTPException(status_code=404, detail="Session not found")
     session = sessions[session_id]
 
     async def event_generator():
+        # 【异步】事件队列不存在时惰性创建；None 是结束哨兵，收到即退出循环。
         if "event_queue" not in session:
             session["event_queue"] = asyncio.Queue()
         queue = session["event_queue"]
@@ -278,6 +351,8 @@ async def stream_progress(session_id: str):
 @app.post("/api/start/{session_id}")
 async def start_optimization(session_id: str, request: StartRequest):
     """Start optimization in background task"""
+    # 【主流程】步骤 4：校验会话已配置完成后，把优化任务交给后台运行并立即
+    # 返回 {"status": "started"}，前端随后通过 /api/status 轮询进度。
     if session_id not in sessions:
         raise HTTPException(status_code=404, detail="Session not found")
     session = sessions[session_id]
@@ -289,13 +364,21 @@ async def start_optimization(session_id: str, request: StartRequest):
     session["status"] = "running"
     session["stop_requested"] = False
     # Pre-create the event queue so events aren't lost before SSE connects
+    # 预先创建事件队列，避免后续事件在 SSE 连上之前丢失（同时被 /api/status 复用）。
     session["event_queue"] = asyncio.Queue()
     qwen_key = request.qwen_api_key
 
     async def run_optimization():
+        # 【异步】后台任务：这里是用 asyncio.create_task 启动的协程，不阻塞
+        # 当前请求。qwen_key 来自请求体，只在这个闭包内使用。
         logger.info(f"Starting optimization for session {session_id}")
         optimizer = SkillOptimizer(api_key=qwen_key)
+        # 【C5 停止】把 session 的 stop_requested 交给优化器，轮间协作取消。
+        optimizer.stop_requested = False
 
+        # 【主流程】闭包 callback：优化器的每次 emit 都会回到这里，把事件
+        # 写入事件队列，同时把 baseline / experiment_result / complete 事件
+        # 转换为前端轮询能读到的 session 字段（experiments、final_result）。
         async def callback(event):
             logger.info(f"Callback event: {event['type']}")
             if "event_queue" in session:
@@ -306,6 +389,7 @@ async def start_optimization(session_id: str, request: StartRequest):
                     "pass_rate": event["data"].get("score", 0),
                     "status": "baseline",
                     "per_eval": event["data"].get("per_eval", []),
+                    "dimension_scores": event["data"].get("dimension_scores", {}),
                 })
             elif event["type"] == "experiment_result":
                 session["experiments"].append({
@@ -315,12 +399,16 @@ async def start_optimization(session_id: str, request: StartRequest):
                     "per_eval": event["data"].get("per_eval", []),
                     "description": event["data"].get("description", ""),
                     "strategy": event["data"].get("strategy", ""),
+                    "candidates": event["data"].get("candidates", []),
+                    "dimension_scores": event["data"].get("dimension_scores", {}),
+                    "diff_summary": event["data"].get("diff_summary", ""),
                 })
             elif event["type"] == "complete":
                 session["status"] = "complete"
                 data = event["data"]
                 ml = data.get("mutation_log", [])
                 # Transform to match frontend ResultsStep expectations
+                # 把优化器的返回结构转换成前端 ResultsStep 期望的 final_result 形状。
                 session["final_result"] = {
                     "baseline_score": data.get("baseline_score", 0),
                     "final_score": data.get("final_score", 0),
@@ -345,6 +433,7 @@ async def start_optimization(session_id: str, request: StartRequest):
                     "strategy_stats": data.get("strategy_stats", {}),
                 }
                 session["current_skill_md"] = data.get("improved_skill_md", "")
+                # 结束哨兵：通知 SSE 生成器退出。
                 if "event_queue" in session:
                     await session["event_queue"].put(None)
 
@@ -355,9 +444,12 @@ async def start_optimization(session_id: str, request: StartRequest):
                 evals=session["evals"],
                 max_rounds=request.max_rounds,
                 callback=callback,
+                parallel_mutations=request.parallel_mutations,
+                strategy_pool=request.strategy_pool,
             )
             logger.info(f"Optimization complete: {result['baseline_score']}% -> {result['final_score']}%")
             # Don't overwrite final_result if callback already set it with transformed data
+            # callback 已写入完整 final_result 时不再覆盖；这里是兜底分支。
             if not session.get("final_result"):
                 ml = result.get("mutation_log", [])
                 session["final_result"] = {
@@ -384,10 +476,18 @@ async def start_optimization(session_id: str, request: StartRequest):
                 }
             session["current_skill_md"] = result["improved_skill_md"]
             session["status"] = "complete"
+        except StopOptimizationError:
+            # 【C5 停止】用户请求停止：协作式取消，在轮间生效。
+            logger.info(f"Optimization stopped by user for session {session_id}")
+            session["status"] = "stopped"
+            if "event_queue" in session:
+                await session["event_queue"].put({"type": "stopped", "data": {}})
+                await session["event_queue"].put(None)
         except Exception as e:
             logger.error(f"Optimization error: {traceback.format_exc()}")
             session["status"] = "error"
             # Never surface the API key in error payloads.
+            # 【安全】任何异常信息里如果包含 API Key，一律替换为占位符再返回。
             error_message = str(e)
             if qwen_key:
                 error_message = error_message.replace(qwen_key, "[REDACTED]")
@@ -403,6 +503,8 @@ async def start_optimization(session_id: str, request: StartRequest):
 @app.post("/api/stop/{session_id}")
 async def stop_optimization(session_id: str):
     """Stop optimization"""
+    # 【注意】停止接口的真实行为：只把 session 状态改为 stopped、放入结束哨兵
+    # 关闭事件队列。后台的模型调用仍在跑，不会被真正取消（属当前实现边界）。
     if session_id not in sessions:
         raise HTTPException(status_code=404, detail="Session not found")
     session = sessions[session_id]
@@ -416,6 +518,8 @@ async def stop_optimization(session_id: str):
 @app.get("/api/download/{session_id}")
 async def download_skill(session_id: str):
     """Download improved skill as zip"""
+    # 【主流程】步骤 5：把改进后的 SKILL.md 与其余原始文件重新打包成 zip，
+    # 附带 CHANGELOG.json；临时文件 60 秒后由后台任务清理。
     if session_id not in sessions:
         raise HTTPException(status_code=404, detail="Session not found")
     session = sessions[session_id]
@@ -439,6 +543,7 @@ async def download_skill(session_id: str):
 
 
 async def cleanup_temp_dir(temp_dir: str):
+    """延迟 60 秒删除临时下载目录，避免影响正在发送的文件响应。"""
     await asyncio.sleep(60)
     try:
         shutil.rmtree(temp_dir)
@@ -449,50 +554,84 @@ async def cleanup_temp_dir(temp_dir: str):
 @app.get("/api/examples")
 async def list_examples():
     """List available example skills"""
-    # Sibling skills in this repo double as examples — the app demos on real
-    # skills (e.g. project-graveyard), not on toy prompt files.
-    examples_dir = os.path.join(os.path.dirname(__file__), "..", "..")
+    # 扫描 skill-examples/*.zip 里的 SKILL.md frontmatter，作为"示例技能"
+    # 展示给用户。示例包与上传走同一套校验管线，zip 内路径不会落盘。
+    examples_dir = os.path.join(os.path.dirname(__file__), "..", "skill-examples")
     examples = []
-    if os.path.exists(examples_dir):
-        for name in sorted(os.listdir(examples_dir)):
-            skill_dir = os.path.join(examples_dir, name)
-            skill_md_path = os.path.join(skill_dir, "SKILL.md")
-            if os.path.isdir(skill_dir) and os.path.exists(skill_md_path):
-                with open(skill_md_path, "r") as f:
-                    content = f.read()
-                metadata = parse_skill_frontmatter(content)
-                examples.append({"name": metadata.get("name", name), "description": metadata.get("description", ""), "path": name})
+    if os.path.isdir(examples_dir):
+        for fname in sorted(os.listdir(examples_dir)):
+            if not fname.endswith(".zip"):
+                continue
+            zip_path = os.path.join(examples_dir, fname)
+            try:
+                with zipfile.ZipFile(zip_path, "r") as zf:
+                    skill_md_name = next(
+                        (n for n in zf.namelist() if n.endswith("SKILL.md")),
+                        None,
+                    )
+                    if skill_md_name is None:
+                        continue
+                    content = zf.read(skill_md_name).decode("utf-8", errors="ignore")
+                    metadata = parse_skill_frontmatter(content)
+                    # path 用 zip 文件名（去 .zip 后缀），与 load_example 对应。
+                    examples.append({
+                        "name": metadata.get("name", fname[:-4]),
+                        "description": metadata.get("description", ""),
+                        "path": fname[:-4],
+                    })
+            except zipfile.BadZipFile:
+                logger.warning(f"Skipping invalid example zip: {fname}")
+                continue
     return {"examples": examples}
 
 
 @app.post("/api/examples/{example_name}/load")
 async def load_example(example_name: str):
     """Load an example skill as if it were uploaded"""
+    # 【安全】示例名做白名单正则校验，防止路径穿越。
     if not re.fullmatch(r"[a-zA-Z0-9_-]+", example_name):
         raise HTTPException(status_code=400, detail="Invalid example name")
-    examples_dir = os.path.realpath(os.path.join(os.path.dirname(__file__), "..", ".."))
-    skill_dir = os.path.realpath(os.path.join(examples_dir, example_name))
-    if not skill_dir.startswith(examples_dir + os.sep):
-        raise HTTPException(status_code=400, detail="Invalid example name")
-    if not os.path.isdir(skill_dir):
+    zip_path = os.path.join(
+        os.path.dirname(__file__), "..", "skill-examples", f"{example_name}.zip"
+    )
+    if not os.path.isfile(zip_path):
         raise HTTPException(status_code=404, detail="Example skill not found")
-    skill_files = {}
-    file_list = []
-    for root, dirs, files in os.walk(skill_dir):
-        for fname in files:
-            if fname.startswith("."):
-                continue
-            full_path = os.path.join(root, fname)
-            rel_path = os.path.relpath(full_path, skill_dir)
-            with open(full_path, "r") as f:
-                skill_files[rel_path] = f.read()
-            file_list.append(rel_path)
-    return create_session_from_files(skill_files, file_list)
+    try:
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            skill_files = {}
+            file_list = []
+            for name in zf.namelist():
+                # 与 /api/upload 相同的校验管线：跳过目录/macOS 残留/隐藏文件，
+                # 再做路径穿越、扩展名、大小校验。
+                if name.endswith("/") or name.startswith("__MACOSX") or "/.DS_Store" in name or name.endswith(".DS_Store"):
+                    continue
+                if not _is_safe_path(name):
+                    logger.warning(f"Skipping unsafe zip entry: {name}")
+                    continue
+                if not _is_allowed_file(name):
+                    logger.info(f"Skipping non-text file: {name}")
+                    continue
+                raw = zf.read(name)
+                if len(raw) > MAX_FILE_SIZE:
+                    logger.warning(f"Skipping oversized file: {name} ({len(raw)} bytes)")
+                    continue
+                if len(file_list) >= MAX_FILE_COUNT:
+                    break
+                skill_files[name] = raw.decode("utf-8", errors="ignore")
+                file_list.append(name)
+            if not skill_files:
+                raise HTTPException(status_code=400, detail="Example contains no usable files")
+            return create_session_from_files(skill_files, file_list)
+    except zipfile.BadZipFile:
+        raise HTTPException(status_code=400, detail="Invalid example zip")
 
 
 @app.get("/api/status/{session_id}")
 async def get_status(session_id: str):
     """Poll-based status endpoint. Returns all experiments so far."""
+    # 【主流程】前端轮询（polling）接口：每 3 秒调用一次，返回当前 status、
+    # 已有的 experiments 列表、错误信息与最终结果。这是当前 UI 实际使用的
+    # 进度获取方式（SSE 路由存在但未被消费）。
     if session_id not in sessions:
         raise HTTPException(status_code=404, detail="Session not found")
     session = sessions[session_id]
@@ -511,6 +650,8 @@ async def health_check():
 
 async def _cleanup_expired_sessions():
     """Periodically remove sessions older than SESSION_TTL."""
+    # 【注意】会话清理后台任务：每 5 分钟删除超过 1 小时的会话；运行中的
+    # 会话（running）不会被清理，避免打断正在进行的长任务。
     while True:
         await asyncio.sleep(300)  # every 5 minutes
         now = time.time()
@@ -527,6 +668,7 @@ async def _cleanup_expired_sessions():
 
 @app.on_event("startup")
 async def startup():
+    # 应用启动时拉起会话清理任务。
     asyncio.create_task(_cleanup_expired_sessions())
 
 

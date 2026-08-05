@@ -2,7 +2,7 @@
 
 ## Scope
 
-These instructions apply to the `self-improving-agent-skills` project and all files below this directory.
+These instructions apply to the `skillforge` project (formerly `self-improving-agent-skills`) and all files below this directory.
 
 This is a Qwen-only application. The supported AI stack is Qwen-Agent with Alibaba Cloud Model Studio (DashScope). Do not add Gemini, Google ADK, OpenAI, Anthropic, Ollama, vLLM, or generic provider abstractions unless the user explicitly expands the scope.
 
@@ -12,6 +12,8 @@ This is a Qwen-only application. The supported AI stack is Qwen-Agent with Aliba
 - `backend/qwen_optimizer.py` owns all Qwen-Agent integration and the Executor → Analyst → Mutator optimization loop.
 - `frontend/src/app/page.tsx` owns the four-step page state.
 - `frontend/src/components/` owns upload, configuration, running, and results UI behavior.
+- `frontend/src/lib/api.ts` is the single frontend API client — do not add per-component `API_BASE`/`fetch` URL construction.
+- `skill-examples/*.zip` are bundled example skill packs read by `/api/examples`.
 - `README.md` is the user-facing source of truth for setup and API usage.
 
 Keep provider-specific code inside `backend/qwen_optimizer.py`. Do not spread Qwen SDK calls across API routes.
@@ -19,14 +21,17 @@ Keep provider-specific code inside `backend/qwen_optimizer.py`. Do not spread Qw
 ## Behavioral Invariants
 
 - Preserve the three roles: Executor, Analyst, and Mutator.
-- A mutation must make exactly one targeted change to `SKILL.md`.
-- Keep a mutation only when its score is strictly higher than the current best score.
+- A mutation must make exactly one targeted change to `SKILL.md` — including parallel mutations, each candidate changes exactly one spot.
+- Keep a mutation only when its score is strictly higher than the current best score (optionally plus `improvement_threshold`; default 0.0 preserves strict `>` semantics).
+- The regression guard (`REGRESSION_CHECK`) is strictly protective — it can only reject mutations, never accept a non-improving one. Do not weaken it.
+- Parallel mutations must use independent Assistant instances per slot (no concurrent `run()` on a shared instance).
 - Preserve endpoint paths, response objects, progress events, download layout, upload limits, and session TTL unless the task explicitly changes them.
 - The credential request field is `qwen_api_key`. Do not restore or alias `gemini_api_key`.
 - The default model is `qwen-plus`; `QWEN_MODEL` may override it on the backend.
 - DashScope is the only supported model service.
 - Qwen-Agent calls are synchronous and must run through `asyncio.to_thread` when invoked from async FastAPI code.
 - Structured Analyst and Mutator outputs must be Pydantic-validated. Keep tolerant JSON extraction and explicit fallbacks.
+- `/api/stop` is a cooperative cancel: it takes effect between rounds (the in-flight model call finishes). Keep this documented behavior.
 
 ## Security
 

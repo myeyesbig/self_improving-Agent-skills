@@ -1,8 +1,20 @@
 "use client";
 
+// =============================================================================
+// 【文件头】ResultsStep.tsx —— 第四步：展示优化结果并支持下载
+// 职责：展示基线/最终分数对比、实验统计、被保留的修改清单、SKILL.md 的
+//       文本 diff（差异），并提供"下载改进后的技能包"与"重新开始"。
+// 接收：父组件传入的 final_result（result）、sessionId 与 onStartOver。
+// 输出：通过浏览器 Blob URL 触发下载 /api/download/{sessionId} 的 zip 包。
+// 建议先看：handleDownload（下载流程）与 diff 计算部分。
+// 【初学者提示】下载的原理：fetch 拿到二进制流 → 用 URL.createObjectURL 造
+//       一个临时链接 → 模拟点击 <a download> 触发浏览器下载 → 用完即撤销。
+// =============================================================================
+
 import { useState } from "react";
 import { Download, RotateCcw, TrendingUp, CheckCircle, XCircle } from "lucide-react";
 import { diffLines, Change } from "diff";
+import { downloadSkill } from "@/lib/api";
 
 interface ResultsStepProps {
   result: any;
@@ -17,17 +29,11 @@ export default function ResultsStep({
 }: ResultsStepProps) {
   const [showDiff, setShowDiff] = useState(false);
 
+  // 【主流程】下载：通过统一 API 客户端 GET /api/download/{sessionId} 拿到
+  // zip 的 Blob，用临时 <a> 元素触发下载，最后释放对象 URL 并移除节点。
   const handleDownload = async () => {
     try {
-      const response = await fetch(
-        `${process.env.NEXT_PUBLIC_API_URL || "http://localhost:8891"}/api/download/${sessionId}`
-      );
-
-      if (!response.ok) {
-        throw new Error("Download failed");
-      }
-
-      const blob = await response.blob();
+      const blob = await downloadSkill(sessionId);
       const url = window.URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
@@ -41,13 +47,19 @@ export default function ResultsStep({
     }
   };
 
+  // 【初学者提示】下面的值都是从 result 里"派生"出来的展示数据：
+  // 不修改任何 state，渲染时直接计算。
+  // 提升幅度 = 最终分数 - 基线分数。
   const improvementPercent =
     result.final_score - result.baseline_score;
 
+  // 只展示被保留（keep）的前 5 条修改作为"Top Changes"。
   const topChanges = result.changelog
     ?.filter((c: any) => c.status === "keep")
     .slice(0, 5) || [];
 
+  // 【主流程】用 diff 库逐行比较原始与改进后的 SKILL.md，得到增/删/相同的块，
+  // 供下方 diff 视图着色显示。
   const diff = diffLines(
     result.original_skill_md || "",
     result.improved_skill_md || ""
@@ -64,7 +76,7 @@ export default function ResultsStep({
             <div className="text-sm text-zinc-500 mt-1">Baseline</div>
           </div>
 
-          <TrendingUp className="w-12 h-12 text-violet-500" />
+          <TrendingUp className="w-12 h-12 text-cyan-500" />
 
           <div>
             <div className="text-5xl font-bold gradient-text">
@@ -115,7 +127,15 @@ export default function ResultsStep({
                 <div className="flex items-start gap-3">
                   <CheckCircle className="w-5 h-5 text-green-400 mt-1 flex-shrink-0" />
                   <div className="flex-1">
-                    <div className="font-medium mb-1">{change.description}</div>
+                    <div className="font-medium mb-1 flex flex-wrap items-center gap-2">
+                      {change.description}
+                      {/* 【C6】策略徽章：展示保留的修改用了什么变异策略。 */}
+                      {change.strategy && (
+                        <span className="px-2 py-0.5 rounded-full text-[11px] font-medium bg-cyan-500/10 text-cyan-400 border border-cyan-500/20">
+                          {change.strategy}
+                        </span>
+                      )}
+                    </div>
                     <div className="text-sm text-zinc-400">
                       {change.reasoning}
                     </div>

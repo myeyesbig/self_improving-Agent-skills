@@ -1,120 +1,120 @@
-# ♾️ Self-Improving Agent Skills 
+# 🔥 SkillForge —— 自我进化型 Agent 技能锻造厂
 
-Automatically optimize your agent skills using a multi-agent system built with **Qwen-Agent** and **Qwen via Alibaba Cloud Model Studio (DashScope)**. Upload a skill, let the agents generate test scenarios and evaluation criteria, then watch as three specialized Qwen-Agent assistants collaborate to improve your skill through iterative optimization.
+**SkillForge** 基于 **Qwen-Agent** 与 **阿里云百炼（DashScope）** 构建的多智能体系统，自动优化你的 Agent 技能。上传一个技能，让智能体生成测试场景与评估标准，然后观察三个专业化 Qwen-Agent 助手通过迭代优化协作改进你的技能 —— 每一次变异都在砧台上被锤打、评估，只保留真正更强的版本。
 
-<img width="960" height="718" alt="Screenshot 2026-04-12 at 7 26 04 PM" src="https://github.com/user-attachments/assets/35a31f1a-398d-4797-a5d8-de538b4391e5" />
+> 一个受 Karpathy「自动研究」方法论启发的个人项目：与其手动调提示词，不如定义成功标准，让 AI 自我进化。
 
 
-## How It Works
+## 工作原理
 
-This app implements an automated skill improvement loop inspired by Karpathy's autoresearch methodology, powered by a team of Qwen-Agent assistants:
+本应用实现了受 Karpathy「自动研究」（autoresearch）方法论启发的自动化技能改进循环，由一组 Qwen-Agent 助手驱动：
 
-1. **Upload**: Drop in your skill folder (following [agentskills.io](https://agentskills.io) spec)
-2. **Configure**: The Executor agent generates test scenarios and evaluation criteria. Edit, add, or regenerate as needed
-3. **Optimize**: Three Qwen-Agent assistants collaborate — one executes and scores, one diagnoses failures, one applies fixes
-4. **Results**: Download your improved skill with a detailed changelog
+1. **上传**：拖入你的技能文件夹（遵循 [agentskills.io](https://agentskills.io) 规范）
+2. **配置**：Executor 智能体生成测试场景与评估标准，可按需编辑、添加或重新生成
+3. **优化**：三个 Qwen-Agent 助手协作 —— 一个执行并评分，一个诊断失败原因，一个应用修复
+4. **结果**：下载改进后的技能及详细变更日志
 
-### The Qwen-Agent Team
+### Qwen-Agent 智能体团队
 
-| Agent | Role | What It Does |
+| 智能体 | 角色 | 职责 |
 |-------|------|-------------|
-| **Executor** | Skill Runner & Scorer | Executes the skill against test scenarios, scores outputs against evaluation criteria, and generates initial test scenarios during analysis |
-| **Analyst** | Failure Diagnostician | Examines failed evaluations, identifies root causes, and recommends a mutation strategy. Uses Pydantic `output_schema` for guaranteed structured JSON |
-| **Mutator** | Prompt Editor | Makes exactly ONE targeted change to the skill prompt based on the analyst's diagnosis. Uses Pydantic `output_schema` for guaranteed structured JSON |
+| **Executor** | 技能执行与评分 | 针对测试场景执行技能，按评估标准对输出评分，并在分析阶段生成初始测试场景 |
+| **Analyst** | 失败诊断师 | 检查失败评估、定位根因并推荐变异策略。通过 Pydantic `output_schema` 保证结构化 JSON 输出 |
+| **Mutator** | 提示词编辑 | 基于分析师诊断，对技能提示词做出**恰好一处**针对性修改。通过 Pydantic `output_schema` 保证结构化 JSON 输出 |
 
-### The Optimization Loop
+### 优化循环
 
-- The **Executor** agent runs the skill against all test scenarios
-- The **Executor** then scores each output against binary yes/no evaluation criteria
-- The **Analyst** agent diagnoses failure patterns and picks a strategy (`add_example`, `add_constraint`, `restructure`, or `add_edge_case`)
-- The **Mutator** agent applies ONE surgical fix to the skill prompt
-- The **Executor** re-runs and re-scores the modified skill
-- Changes are kept if the score improves, reverted if not
-- Repeats until the target pass rate is reached or max rounds hit
+- **Executor** 智能体针对所有测试场景运行技能
+- **Executor** 再对每个输出按二值（是/否）评估标准打分，可选**按维度加权**（correctness / clarity / executability 等）
+- **Analyst** 智能体诊断失败模式，并从**可配置策略池**（`add_example`、`add_constraint`、`restructure`、`add_edge_case`、`add_reference`、`rewrite_section`、`fix_format`）中选择策略
+- **Mutator** 智能体对技能提示词应用一处精准修复；开启并行时每轮同时生成多个候选变异
+- **Executor** 重新运行并重新评估修改后的技能（并行时取分数最优的候选）
+- 变异先过**回归守卫**（frontmatter / 标题 / 体积完整性检查），再按「严格高于基线 + 提升阈值」决定保留，否则回滚
+- 评分达到 100%（全部评估通过）立即停止循环，否则循环直至达到最大轮数
 
-## Architecture
+## 架构
 
 ```
-self-improving-agent-skills/
-├── backend/                 # FastAPI server + Qwen-Agent optimization engine
-│   ├── app.py              # REST API endpoints + SSE streaming
-│   ├── qwen_optimizer.py   # Multi-agent optimizer (Executor, Analyst, Mutator)
+skillforge/
+├── backend/                 # FastAPI 服务端 + Qwen-Agent 优化引擎
+│   ├── app.py              # REST API 端点 + SSE 流式推送
+│   ├── qwen_optimizer.py   # 多智能体优化器（Executor、Analyst、Mutator）
 │   └── requirements.txt
 ├── frontend/               # Next.js + React + Tailwind
 │   ├── src/
-│   │   ├── app/            # Main page + layout
-│   │   └── components/     # Upload, Config, Running, Results steps
+│   │   ├── app/            # 主页面 + 布局 + icon.svg（品牌标识）
+│   │   ├── components/     # 上传、配置、运行、结果四个步骤 + Logo
+│   │   └── lib/api.ts      # 前端与后端通信的唯一 API 出口
 │   ├── package.json
 │   └── *.config.ts
-│   ├── code-reviewer/
-│   └── content-writer/
+├── skill-examples/         # 内置示例技能包（.zip，/api/examples 自动读取）
 └── README.md
 ```
 
-## Tech Stack
+## 技术栈
 
-- **Backend**: Python 3.10+, FastAPI, Qwen-Agent, Pydantic
-- **Frontend**: Next.js 15, React 19, Tailwind CSS v4, Recharts
-- **AI**: Qwen-Agent multi-agent system with Qwen via DashScope (`qwen-plus`) — structured output via Pydantic validation on Analyst and Mutator agents
-- **Real-time**: Server-Sent Events (SSE) for live optimization progress
+- **后端**：Python 3.10+、FastAPI、Qwen-Agent、Pydantic
+- **前端**：Next.js 15、React 19、Tailwind CSS v4、Recharts
+- **AI**：基于 Qwen-Agent 的多智能体系统，通过 DashScope 调用 Qwen（`qwen-plus`）—— Analyst 与 Mutator 智能体通过 Pydantic 校验保证结构化输出
+- **实时通信**：Server-Sent Events（SSE）实时推送优化进度
 
-## Quick Start
+## 快速开始
 
-### Backend Setup
+### 后端配置
 
 ```bash
 cd backend
 
-# Create virtual environment
+# 创建虚拟环境
 python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+source venv/bin/activate  # Windows 下: venv\Scripts\activate
 
-# Install dependencies
+# 安装依赖
 pip install -r requirements.txt
 
-# Run server
+# 启动服务
 python app.py
-# Server runs on http://localhost:8891
+# 服务运行在 http://localhost:8891
 ```
 
-The backend uses `qwen-plus` by default. You may override it with the optional `QWEN_MODEL` environment variable, e.g. `QWEN_MODEL=qwen-max python app.py`.
+后端默认使用 `qwen-plus` 模型，可通过可选的 `QWEN_MODEL` 环境变量覆盖，例如 `QWEN_MODEL=qwen-max python app.py`。
 
-### Frontend Setup
+### 前端配置
 
 ```bash
 cd frontend
 
-# Install dependencies
+# 安装依赖
 npm install
 
-# Run development server
+# 启动开发服务器
 npm run dev
-# App runs on http://localhost:3000
+# 应用运行在 http://localhost:3000
 ```
 
-### Usage
+### 使用步骤
 
-1. Get a DashScope API key from [Alibaba Cloud Model Studio (百炼)](https://bailian.console.aliyun.com/)
-2. Open http://localhost:3000
-3. Upload a skill folder as a .zip file (or try an example)
-4. Enter your DashScope API key
-5. Review and edit the generated test scenarios and evaluation criteria
-6. Click "Start Optimization" and watch the agents collaborate to improve your skill
-7. Download your improved skill when complete
+1. 在[阿里云百炼控制台](https://bailian.console.aliyun.com/)获取 DashScope API Key
+2. 打开 http://localhost:3000
+3. 以 .zip 格式上传技能文件夹（或试用示例）
+4. 输入你的 DashScope API Key
+5. 审阅并编辑生成的测试场景与评估标准
+6. 点击「Start Optimization」，观看智能体协作改进你的技能
+7. 完成后下载改进后的技能
 
-## Skill Format
+## 技能格式
 
-Skills follow the [agentskills.io](https://agentskills.io) specification:
+技能遵循 [agentskills.io](https://agentskills.io) 规范：
 
 ```
 my-skill/
-├── SKILL.md           # Required: YAML frontmatter + instructions
-├── scripts/           # Optional: executable code
-├── references/        # Optional: additional docs
-└── assets/            # Optional: templates, resources
+├── SKILL.md           # 必需：YAML frontmatter + 指令
+├── scripts/           # 可选：可执行代码
+├── references/        # 可选：补充文档
+└── assets/            # 可选：模板、资源
 ```
 
-Example SKILL.md:
+SKILL.md 示例：
 
 ```markdown
 ---
@@ -131,100 +131,113 @@ metadata:
 Your skill instructions here...
 ```
 
-## Trying it
+## 试用
 
-Zip any skill folder and upload it — for instance this repo's own
-[project-graveyard](../project-graveyard/):
+将任意技能文件夹打包为 zip 后上传。仓库自带 4 个内置示例技能包（`skill-examples/*.zip`），应用中的「examples」选择器会自动读取它们 —— 都是真实技能，而非玩具示例：
 
 ```bash
-cd agent_skills
-zip -r project-graveyard.zip project-graveyard/
+# 内置示例（应用内一键加载，无需手动打包）
+# project-graveyard / thinking-out-loud / dependency-doctor / commit-archaeologist
+
+# 手动打包自己的技能：
+zip -r my-skill.zip my-skill/
 ```
 
-The app's "examples" picker also lists sibling skills from this repo
-automatically — real skills, not toys.
+## 多智能体优化是如何运作的
 
-## How the Multi-Agent Optimization Works
+### 1. 分析阶段
+**Executor** 智能体分析你的技能并生成：
+- 3-4 个多样化的测试场景
+- 4-6 条二值评估标准（是/否问题）
 
-### 1. Analysis Phase
-The **Executor** agent analyzes your skill and generates:
-- 3-4 diverse test scenarios
-- 4-6 binary evaluation criteria (yes/no questions)
+在优化开始前，你可以编辑、添加或删除场景与标准。
 
-You can edit, add, or remove scenarios and criteria before optimization begins.
+### 2. 基线运行
+**Executor** 智能体针对所有场景运行技能，并按所有评估标准对每个输出评分，确立起始分数。
 
-### 2. Baseline Run
-The **Executor** agent runs the skill against all scenarios and scores each output against all evaluation criteria. This establishes the starting score.
+### 3. 优化循环
+每一轮，三个智能体协作：
+1. **Executor** 针对所有测试场景运行技能并对输出评分（可选按维度加权）
+2. **Analyst** 检查失败项、定位根因并从策略池中选择变异策略（返回经 Pydantic schema 校验的结构化 JSON）
+3. **Mutator** 应用一处针对性修改以改进技能（返回经 Pydantic schema 校验的结构化 JSON）；开启并行变异时每轮同时生成多个候选
+4. **回归守卫** 检查每个候选的结构完整性（frontmatter、标题、体积），命中即拒绝且跳过复评
+5. **Executor** 重新运行并重新评估修改后的技能（并行时取分数最优的候选）
+6. 比较分数 —— 严格高于「基线 + 提升阈值」则保留，否则回滚
+7. 评分达到 100%（全部评估通过）立即停止循环，否则重复直至最大轮数
 
-### 3. Optimization Loop
-For each round, the three agents collaborate:
-1. **Executor** runs the skill against all test scenarios and scores the outputs
-2. **Analyst** examines failures, identifies root cause, and selects a mutation strategy (returns structured JSON validated against a Pydantic schema)
-3. **Mutator** applies ONE specific change to improve the skill (returns structured JSON validated against a Pydantic schema)
-4. **Executor** re-runs and re-scores the modified skill
-5. Score is compared — keep the change if improved, revert if not
-6. Repeat until target pass rate or max rounds reached
+### 4. 输出
+- 应用了全部成功修改的改进版 SKILL.md
+- 详细的变更日志（改了什么、为什么改、用了什么策略、并行候选明细）
+- 性能对比（基线 vs 最终，含逐维度得分趋势）
 
-### 4. Output
-- Improved SKILL.md with all successful changes applied
-- Detailed changelog of what changed and why
-- Performance comparison (baseline vs final)
+### 模型输出语言
 
-## API Endpoints
+模型侧的分析、评分、诊断和修改提示词均以中文原生编写。测试场景、评估标准、评分理由、诊断结果和变更说明默认使用自然、简洁的简体中文，不采用“先用英文生成、再强制翻译”的方式。
 
-| Method | Endpoint | Description |
+- 如果 `SKILL.md` 或用户请求明确指定英文或其他语言，Executor 会优先遵守该显式要求。
+- Mutator 每轮仍只修改一个目标点；对英文技能不会先做全文翻译，只会让本轮新增或改写的正文默认使用中文。
+- JSON 字段名、`mutation_strategy` 枚举、YAML 键、代码、命令和专有标识保持原样，以保证 API 与下载文件兼容。
+
+## API 端点
+
+| 方法 | 端点 | 说明 |
 |--------|----------|-------------|
-| `POST` | `/api/upload` | Upload skill zip file (max 10MB, text files only) |
-| `POST` | `/api/upload-files` | Upload multiple files (folder upload) |
-| `POST` | `/api/analyze` | Generate scenarios and evals (requires DashScope API key) |
-| `POST` | `/api/regenerate` | Regenerate scenarios and evals |
-| `POST` | `/api/update-config` | Save user's selected/edited config |
-| `POST` | `/api/start/{session_id}` | Start optimization |
-| `GET` | `/api/stream/{session_id}` | SSE stream of optimization progress |
-| `POST` | `/api/stop/{session_id}` | Stop optimization |
-| `GET` | `/api/download/{session_id}` | Download improved skill |
-| `GET` | `/api/examples` | List available example skills |
-| `POST` | `/api/examples/{name}/load` | Load an example skill |
-| `GET` | `/api/status/{session_id}` | Poll-based status endpoint |
-| `GET` | `/health` | Health check |
+| `POST` | `/api/upload` | 上传技能 zip（最大 10MB，仅文本文件） |
+| `POST` | `/api/upload-files` | 上传多个文件（文件夹上传） |
+| `POST` | `/api/analyze` | 生成场景与评估标准（需要 DashScope API Key） |
+| `POST` | `/api/regenerate` | 重新生成场景与评估标准 |
+| `POST` | `/api/update-config` | 保存用户选择/编辑的配置 |
+| `POST` | `/api/start/{session_id}` | 启动优化 |
+| `GET` | `/api/stream/{session_id}` | SSE 实时推送优化进度 |
+| `POST` | `/api/stop/{session_id}` | 停止优化 |
+| `GET` | `/api/download/{session_id}` | 下载改进后的技能 |
+| `GET` | `/api/examples` | 列出可用示例技能 |
+| `POST` | `/api/examples/{name}/load` | 加载示例技能 |
+| `GET` | `/api/status/{session_id}` | 轮询式状态端点 |
+| `GET` | `/health` | 健康检查 |
 
-## Configuration
+## 配置
 
-### Backend
+### 后端
 
-The DashScope API key is passed from the frontend with each request (field `qwen_api_key`) and used directly in the Qwen-Agent model configuration — it is never written to a process-wide environment variable, stored in sessions, or logged. The model defaults to `qwen-plus` and can be overridden with the optional `QWEN_MODEL` environment variable. Server runs on port **8891**.
+DashScope API Key 随每次请求由前端传入（字段 `qwen_api_key`），并直接用于 Qwen-Agent 模型配置 —— 绝不写入进程级环境变量、不存入会话、不记入日志。模型默认使用 `qwen-plus`，可通过可选的 `QWEN_MODEL` 环境变量覆盖。服务运行在 **8891** 端口。
 
-Upload limits:
-- **10MB** max total upload size
-- **1MB** max per file
-- **50** max files per upload
-- Text files only (`.md`, `.txt`, `.json`, `.yaml`, `.py`, `.js`, `.ts`, etc.)
+上传限制：
+- 单次上传最大 **10MB**
+- 单文件最大 **1MB**
+- 单次最多 **50** 个文件
+- 仅限文本文件（`.md`、`.txt`、`.json`、`.yaml`、`.py`、`.js`、`.ts` 等）
 
-Sessions expire after **1 hour** automatically.
+会话 **1 小时**后自动过期。
 
-### Frontend
+### 前端
 
-API key is entered in the UI, stored in component state (not persisted), and sent with each request as `qwen_api_key`.
+API Key 在界面中输入，仅保存在组件内存中（不持久化），并以 `qwen_api_key` 字段随每次请求发送。
 
-### Optimization Parameters
+### 优化参数
 
-In `RunningStep.tsx`, adjust `max_rounds` (capped at 50):
+SkillForge 提供一组**可选**优化旋钮，全部默认等价于经典行为（不传即与基础版一致）：
 
-```typescript
-body: JSON.stringify({
-  max_rounds: 20,  // Default: 20, max: 50
-}),
-```
+| 旋钮 | 位置 | 默认 | 说明 |
+|------|------|------|------|
+| `max_rounds` | 请求字段 | 20（≤50） | 最大优化轮数 |
+| `parallel_mutations` | 请求字段 | 后端 `MUTATION_PARALLELISM`（默认 1，上限 3） | 每轮并行生成几个候选变异 |
+| `strategy_pool` | 请求字段 | 全量策略模板 | Analyst 可用的变异策略白名单 |
+| `improvement_threshold` | 请求字段 / `IMPROVEMENT_THRESHOLD` | 0.0 | 新分必须严格高于「基线 + 阈值」才保留 |
+| 维度权重 | `ANALYST_DIMENSION_WEIGHTS`（JSON） | 无（等价旧通过率） | 按 eval 的 `dimension` 字段加权评分 |
+| `REGRESSION_CHECK` | 环境变量 | 1（开启） | 变异先过结构完整性守卫，0 关闭 |
 
-In `qwen_optimizer.py`, adjust the model:
+> **安全与不变量**：凭据字段恒为 `qwen_api_key`；密钥仅存组件内存与请求体，绝不落日志/会话/zip/git。一次变异仍只改 SKILL.md 一处；只有「严格提升」的变异才会被保留，回归守卫只会更严格，绝不会让技能退化。
+
+在 `qwen_optimizer.py` 中调整模型：
 
 ```python
-def __init__(self, api_key: str, model: Optional[str] = None):  # defaults to QWEN_MODEL or "qwen-plus"
+def __init__(self, api_key: str, model: Optional[str] = None):  # 默认取 QWEN_MODEL 或 "qwen-plus"
 ```
 
-## Development
+## 开发
 
-### Backend Tests
+### 后端测试
 
 ```bash
 cd backend
@@ -232,19 +245,19 @@ python -m unittest discover -p 'test_*.py'
 python -c "from qwen_optimizer import SkillOptimizer; print('OK')"
 ```
 
-### Frontend Build
+### 前端构建
 
 ```bash
 cd frontend
 npm run build
 ```
 
-### Live Development
+### 本地开发
 
-Both servers support hot reload. Edit code and see changes immediately.
+两个服务均支持热重载，改完代码即可看到效果。
 
-## Based on Karpathy's Autoresearch
+## 基于 Karpathy 的自动研究（Autoresearch）
 
-This tool applies Andrej Karpathy's autoresearch methodology (using LLMs to iteratively improve their own prompts) to agent skills. The key insight: rather than manually tweaking prompts, define success criteria and let the AI optimize itself — now powered by a team of specialized Qwen-Agent assistants.
+本工具将 Andrej Karpathy 的自动研究方法论（利用 LLM 迭代改进自身提示词）应用于 Agent 技能。核心洞察是：与其手动调整提示词，不如定义成功标准，让 AI 自我优化 —— 现在由一组专业化 Qwen-Agent 助手驱动。
 
-Original concept: [https://github.com/karpathy/autoresearch](https://github.com/karpathy/autoresearch)
+原始概念：[https://github.com/karpathy/autoresearch](https://github.com/karpathy/autoresearch)

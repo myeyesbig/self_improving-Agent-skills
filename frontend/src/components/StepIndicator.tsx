@@ -1,5 +1,15 @@
 "use client";
 
+// =============================================================================
+// 【文件头】StepIndicator.tsx —— 顶部四步进度指示器
+// 职责：根据当前步骤号渲染"上传 → 配置 → 优化 → 结果"的步骤条。
+// 接收：父组件传入的 currentStep（1-4）。
+// 输出：纯展示组件，不修改任何状态。
+// 建议先看：下方对 currentStep 的三段条件判断（已完成 / 当前 / 未到）。
+// 【初学者提示】核心是条件渲染：已完成的步骤显示对勾并点亮，当前步骤放大
+//       高亮，未到步骤显示灰色数字；步骤之间的连接线按完成情况着色。
+// =============================================================================
+
 import { Check } from "lucide-react";
 
 interface StepIndicatorProps {
@@ -32,6 +42,7 @@ export default function StepIndicator({ currentStep }: StepIndicatorProps) {
                 }
               `}
             >
+              {/* 条件渲染：已完成的步骤显示对勾，否则显示步骤数字。 */}
               {currentStep > step.number ? (
                 <Check className="w-6 h-6" />
               ) : (
@@ -58,7 +69,7 @@ export default function StepIndicator({ currentStep }: StepIndicatorProps) {
                 w-16 h-0.5 mx-4 transition-colors
                 ${
                   currentStep > step.number
-                    ? "bg-gradient-to-r from-violet-500 to-purple-500"
+                    ? "bg-gradient-to-r from-cyan-500 to-teal-500"
                     : "bg-zinc-800"
                 }
               `}

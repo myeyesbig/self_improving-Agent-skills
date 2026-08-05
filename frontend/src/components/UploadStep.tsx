@@ -1,7 +1,26 @@
 "use client";
 
-import { useState, useRef } from "react";
+// =============================================================================
+// 【文件头】UploadStep.tsx —— 第一步：上传技能 + 输入 API Key + 触发分析
+// 职责：接收 .zip 或文件夹上传，把文件发给后端换取 session_id；收集用户在
+//       组件内存里输入的 DashScope API Key；点击"Analyze"后调用 /api/analyze。
+// 接收：父组件传入的 onComplete 回调（用于把 sessionId / apiKey 等上报）。
+// 输出：调用 onComplete(...)，把数据交回父组件 page.tsx。
+// 建议先看：uploadZip / uploadMultipleFiles（上传）→ handleAnalyze（分析）。
+// 【初学者提示】API Key 只保存在这个组件的 useState 里（组件内存），
+//       不写入 localStorage、不进 URL，仅在请求体中发送给后端。
+// =============================================================================
+
+import { useState, useRef, useEffect } from "react";
 import { Upload, FileText, Loader2, Sparkles, FolderOpen } from "lucide-react";
+import {
+  uploadZip as apiUploadZip,
+  uploadMultipleFiles as apiUploadMultipleFiles,
+  analyzeSkill,
+  loadExample,
+  listExamples,
+  ExampleSkill,
+} from "@/lib/api";
 
 interface UploadStepProps {
   onComplete: (
@@ -13,22 +32,9 @@ interface UploadStepProps {
   ) => void;
 }
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8891";
-
-const EXAMPLE_SKILLS = [
-  {
-    name: "Code Reviewer",
-    description: "Reviews code for security, performance, and best practices",
-    path: "code-reviewer",
-  },
-  {
-    name: "Content Writer",
-    description: "Writes marketing copy for landing pages and emails",
-    path: "content-writer",
-  },
-];
-
 export default function UploadStep({ onComplete }: UploadStepProps) {
+  // 【初学者提示】isDragging 控制拖拽高亮；apiKey 是组件内存里的密钥；
+  // isUploading / isAnalyzing 是按钮的加载态；sessionId 记录上传结果。
   const [isDragging, setIsDragging] = useState(false);
   const [apiKey, setApiKey] = useState("");
   const [isUploading, setIsUploading] = useState(false);
@@ -36,7 +42,15 @@ export default function UploadStep({ onComplete }: UploadStepProps) {
   const [fileList, setFileList] = useState<string[]>([]);
   const [metadata, setMetadata] = useState<any>(null);
   const [sessionId, setSessionId] = useState<string | null>(null);
+  const [exampleSkills, setExampleSkills] = useState<ExampleSkill[]>([]);
   const folderInputRef = useRef<HTMLInputElement>(null);
+
+  // 挂载时从后端动态拉取示例技能列表（不再硬编码）。
+  useEffect(() => {
+    listExamples()
+      .then(setExampleSkills)
+      .catch(() => setExampleSkills([]));
+  }, []);
 
   const handleDragOver = (e: React.DragEvent) => {
     e.preventDefault();
@@ -50,6 +64,7 @@ export default function UploadStep({ onComplete }: UploadStepProps) {
   const handleDrop = async (e: React.DragEvent) => {
     e.preventDefault();
     setIsDragging(false);
+    // 拖入的文件：优先找 .zip，找不到则当作多文件（文件夹）处理。
     const files = Array.from(e.dataTransfer.files);
     const zipFile = files.find((f) => f.name.endsWith(".zip"));
     if (zipFile) {
@@ -73,20 +88,12 @@ export default function UploadStep({ onComplete }: UploadStepProps) {
     }
   };
 
+  // 【主流程】ZIP 上传：把文件交给统一 API 客户端（POST /api/upload），
+  // 成功后把 session_id / 文件清单 / 元数据存入本组件 state。
   const uploadZip = async (file: File) => {
     setIsUploading(true);
     try {
-      const formData = new FormData();
-      formData.append("file", file);
-      const response = await fetch(`${API_BASE}/api/upload`, {
-        method: "POST",
-        body: formData,
-      });
-      if (!response.ok) {
-        const err = await response.json().catch(() => ({}));
-        throw new Error(err.detail || "Upload failed");
-      }
-      const data = await response.json();
+      const data = await apiUploadZip(file);
       setSessionId(data.session_id);
       setFileList(data.file_list);
       setMetadata(data.metadata);
@@ -97,23 +104,12 @@ export default function UploadStep({ onComplete }: UploadStepProps) {
     }
   };
 
+  // 【主流程】文件夹上传：走 /api/upload-files，用 webkitRelativePath 保留
+  // 相对目录结构，其余逻辑与 ZIP 上传一致。
   const uploadMultipleFiles = async (files: File[]) => {
     setIsUploading(true);
     try {
-      const formData = new FormData();
-      for (const f of files) {
-        const path = (f as any).webkitRelativePath || f.name;
-        formData.append("files", f, path);
-      }
-      const response = await fetch(`${API_BASE}/api/upload-files`, {
-        method: "POST",
-        body: formData,
-      });
-      if (!response.ok) {
-        const err = await response.json().catch(() => ({}));
-        throw new Error(err.detail || "Upload failed");
-      }
-      const data = await response.json();
+      const data = await apiUploadMultipleFiles(files);
       setSessionId(data.session_id);
       setFileList(data.file_list);
       setMetadata(data.metadata);
@@ -124,20 +120,14 @@ export default function UploadStep({ onComplete }: UploadStepProps) {
     }
   };
 
+  // 【主流程】分析请求：把 session_id 与 API Key 一起 POST 给 /api/analyze，
+  // 后端返回模型生成的 scenarios（测试场景）和 evals（评估标准），
+  // 最后调用 onComplete 把全部上下文上交给父组件，由父组件跳到步骤 2。
   const handleAnalyze = async () => {
     if (!apiKey || !sessionId) return;
     setIsAnalyzing(true);
     try {
-      const response = await fetch(`${API_BASE}/api/analyze`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ session_id: sessionId, qwen_api_key: apiKey }),
-      });
-      if (!response.ok) {
-        const err = await response.json().catch(() => ({}));
-        throw new Error(err.detail || "Analysis failed");
-      }
-      const data = await response.json();
+      const data = await analyzeSkill(sessionId, apiKey);
       onComplete(sessionId, apiKey, metadata, data.scenarios, data.evals);
     } catch (error: any) {
       alert(error.message || "Analysis failed. Check your API key.");
@@ -146,6 +136,8 @@ export default function UploadStep({ onComplete }: UploadStepProps) {
     }
   };
 
+  // 示例技能：先 /api/examples/{path}/load 加载，再自动走一次分析，
+  // 效果等同于"上传 + 分析"两步合一。
   const handleExampleSelect = async (examplePath: string) => {
     if (!apiKey) {
       alert("Please enter your DashScope API key first.");
@@ -153,27 +145,14 @@ export default function UploadStep({ onComplete }: UploadStepProps) {
     }
     setIsUploading(true);
     try {
-      const loadResponse = await fetch(`${API_BASE}/api/examples/${examplePath}/load`, {
-        method: "POST",
-      });
-      if (!loadResponse.ok) throw new Error("Failed to load example");
-      const loadData = await loadResponse.json();
+      const loadData = await loadExample(examplePath);
       setSessionId(loadData.session_id);
       setFileList(loadData.file_list);
       setMetadata(loadData.metadata);
       setIsUploading(false);
       setIsAnalyzing(true);
 
-      const analyzeResponse = await fetch(`${API_BASE}/api/analyze`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ session_id: loadData.session_id, qwen_api_key: apiKey }),
-      });
-      if (!analyzeResponse.ok) {
-        const err = await analyzeResponse.json().catch(() => ({}));
-        throw new Error(err.detail || "Analysis failed");
-      }
-      const analyzeData = await analyzeResponse.json();
+      const analyzeData = await analyzeSkill(loadData.session_id, apiKey);
       onComplete(loadData.session_id, apiKey, loadData.metadata, analyzeData.scenarios, analyzeData.evals);
     } catch (error: any) {
       alert(error.message || "Failed to load example skill.");
@@ -193,7 +172,7 @@ export default function UploadStep({ onComplete }: UploadStepProps) {
             onDragLeave={handleDragLeave}
             onDrop={handleDrop}
             className={`glass rounded-2xl p-16 text-center transition-all ${
-              isDragging ? "border-violet-500 bg-violet-500/10 scale-105" : "border-zinc-800 hover:border-zinc-700"
+              isDragging ? "border-cyan-500 bg-cyan-500/10 scale-105" : "border-zinc-800 hover:border-zinc-700"
             }`}
           >
             <input type="file" accept=".zip" onChange={handleZipSelect} className="hidden" id="zip-upload" />
@@ -209,7 +188,7 @@ export default function UploadStep({ onComplete }: UploadStepProps) {
 
             <div className="mb-6">
               {isUploading ? (
-                <Loader2 className="w-16 h-16 mx-auto text-violet-500 animate-spin" />
+                <Loader2 className="w-16 h-16 mx-auto text-cyan-500 animate-spin" />
               ) : (
                 <Upload className="w-16 h-16 mx-auto text-zinc-500" />
               )}
@@ -246,7 +225,7 @@ export default function UploadStep({ onComplete }: UploadStepProps) {
                 value={apiKey}
                 onChange={(e) => setApiKey(e.target.value)}
                 placeholder="Enter your DashScope API key"
-                className="w-full px-4 py-3 bg-zinc-900 border border-zinc-800 rounded-lg focus:outline-none focus:border-violet-500 transition-colors"
+                className="w-full px-4 py-3 bg-zinc-900 border border-zinc-800 rounded-lg focus:outline-none focus:border-cyan-500 transition-colors"
               />
               <span className="text-xs text-zinc-500 mt-1 block">
                 Required for analysis. Stored locally, sent only to the backend.
@@ -258,33 +237,39 @@ export default function UploadStep({ onComplete }: UploadStepProps) {
             <p className="text-center text-zinc-500 mb-4">
               {isAnalyzing ? "Analyzing with Qwen-Agent..." : "Or try an example skill:"}
             </p>
+            {exampleSkills.length === 0 ? (
+              <p className="text-center text-sm text-zinc-600">
+                No example skills available — upload a skill or try a .zip
+              </p>
+            ) : (
             <div className="grid grid-cols-2 gap-4">
-              {EXAMPLE_SKILLS.map((skill) => (
+              {exampleSkills.map((skill) => (
                 <button
                   key={skill.path}
                   onClick={() => handleExampleSelect(skill.path)}
                   disabled={isUploading || isAnalyzing || !apiKey}
                   className={`glass rounded-xl p-6 text-left transition-all ${
                     apiKey && !isUploading && !isAnalyzing
-                      ? "hover:border-violet-500 hover:scale-105 cursor-pointer"
+                      ? "hover:border-cyan-500 hover:scale-105 cursor-pointer"
                       : "opacity-50 cursor-not-allowed"
                   }`}
                 >
                   <h4 className="font-semibold mb-2 flex items-center gap-2">
                     {skill.name}
-                    {isAnalyzing && <Loader2 className="w-4 h-4 animate-spin text-violet-500" />}
+                    {isAnalyzing && <Loader2 className="w-4 h-4 animate-spin text-cyan-500" />}
                   </h4>
                   <p className="text-sm text-zinc-400">{skill.description}</p>
                 </button>
               ))}
             </div>
+            )}
           </div>
         </>
       ) : (
         <div className="space-y-6">
           <div className="glass rounded-2xl p-8">
             <div className="flex items-start gap-4 mb-6">
-              <FileText className="w-8 h-8 text-violet-500" />
+              <FileText className="w-8 h-8 text-cyan-500" />
               <div className="flex-1">
                 <h3 className="text-xl font-semibold mb-1">{metadata?.name || "Skill Uploaded"}</h3>
                 {metadata?.description && <p className="text-zinc-400">{metadata.description}</p>}
@@ -310,7 +295,7 @@ export default function UploadStep({ onComplete }: UploadStepProps) {
                 value={apiKey}
                 onChange={(e) => setApiKey(e.target.value)}
                 placeholder="Enter your DashScope API key"
-                className="w-full px-4 py-3 bg-zinc-900 border border-zinc-800 rounded-lg focus:outline-none focus:border-violet-500 transition-colors"
+                className="w-full px-4 py-3 bg-zinc-900 border border-zinc-800 rounded-lg focus:outline-none focus:border-cyan-500 transition-colors"
               />
             </label>
             <button
