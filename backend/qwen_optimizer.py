@@ -193,6 +193,8 @@ class SkillOptimizer:
         final_confirm: Optional[bool] = None,
         lesson_file: Optional[str] = None,
         lesson_retrieval: Optional[str] = None,
+        lesson_threshold: Optional[float] = None,
+        lesson_top_k: Optional[int] = None,
     ):
         # The key is passed directly into the LLM configuration; it is never
         # written to the process environment, stored in sessions, or logged.
@@ -268,6 +270,21 @@ class SkillOptimizer:
         if lesson_retrieval not in ("off", "tag", "semantic", "hybrid"):
             lesson_retrieval = "off"
         self.lesson_retrieval = lesson_retrieval
+
+        # 【RAG 检索参数】semantic 余弦阈值与检索注入条数（默认 0.3 / 5）；
+        # LESSON_N 管"读取条数"（off/tag 模式），LESSON_TOP_K 管"检索注入条数"。
+        if lesson_threshold is None:
+            try:
+                lesson_threshold = float(os.getenv("LESSON_THRESHOLD", "0.3"))
+            except ValueError:
+                lesson_threshold = 0.3
+        self.lesson_threshold = max(0.0, min(float(lesson_threshold), 1.0))
+        if lesson_top_k is None:
+            try:
+                lesson_top_k = int(os.getenv("LESSON_TOP_K", "5"))
+            except ValueError:
+                lesson_top_k = 5
+        self.lesson_top_k = max(1, int(lesson_top_k))
 
         # 【安全】仅内存持有 key 引用，用于 embedding/rerank 的 DashScope 调用；
         # 绝不打印、不落日志、不写环境变量、不序列化进任何返回结构。
@@ -469,8 +486,11 @@ class SkillOptimizer:
             f"If a criterion is machine-checkable (keyword presence, exact format, "
             f"length), set check_type to one of keyword|regex|yaml_or_json|length "
             f"with its required fields; otherwise omit check_type.\n\n"
+            f"Also return a short domain label for the skill, one of "
+            f"coding|writing|ops|data|other.\n\n"
             f"Return JSON:\n"
-            f'{{"scenarios": [{{"id": 1, "name": "short name", "description": "short name", '
+            f'{{"domain": "coding", '
+            f'"scenarios": [{{"id": 1, "name": "short name", "description": "short name", '
             f'"input": "the user request to test"}}], '
             f'"evals": [{{"id": 1, "name": "what to check", "criterion": "what to check", '
             f'"question": "yes/no question about the output", '
@@ -486,6 +506,9 @@ class SkillOptimizer:
             for e in evals:
                 if isinstance(e, dict) and not e.get("dimension"):
                     e["dimension"] = "correctness"
+        # 【B 选项】归一化 domain：模型可能漏填，兜底 other。
+        if isinstance(result, dict) and not result.get("domain"):
+            result["domain"] = "other"
         return result
 
     async def optimize(
@@ -498,6 +521,7 @@ class SkillOptimizer:
         parallel_mutations: Optional[int] = None,
         strategy_pool: Optional[List[str]] = None,
         patience: Optional[int] = None,
+        domain: Optional[str] = None,
     ) -> dict:
         """Run the optimization loop with 3 Qwen-Agent assistants.
 
@@ -558,7 +582,9 @@ class SkillOptimizer:
 
         # 【P4/RAG】按 LESSON_RETRIEVAL 模式准备注入的经验（off/tag/semantic/
         # hybrid）；依赖基线失败明细构建检索查询，故放在 baseline 之后。
-        lessons = await self._prepare_lessons(skill_md, scenarios, evals, current_details)
+        lessons = await self._prepare_lessons(
+            skill_md, scenarios, evals, current_details, domain=domain,
+        )
 
         # -- Rounds -----------------------------------------------------------
         # 【P3 饱和快速退出】基线无可提升带（100%，或 0 分且所有评估全失败）
@@ -725,7 +751,7 @@ class SkillOptimizer:
                 # tag/semantic 检索模式按技能过滤，created_at 记录时间。
                 self._append_lesson(self.lesson_file, {
                     "skill_name": self._skill_name_from_md(skill_md),
-                    "domain": "",
+                    "domain": domain or "",
                     "skill_description": "",
                     "strategy": analysis.get("mutation_strategy", "unknown"),
                     "diagnosis": (analysis.get("diagnosis") or "")[:200],
@@ -1362,9 +1388,13 @@ class SkillOptimizer:
         return " ".join(str(p) for p in parts if p)
 
     @staticmethod
-    def _build_query(skill_name, scenarios, evals, current_details):
-        """检索查询：技能名 + 最近失败原因 + 场景输入摘要（规则拼接）。"""
-        parts = [f"skill: {skill_name}"] if skill_name else []
+    def _build_query(skill_name, domain, scenarios, evals, current_details):
+        """检索查询：领域 + 技能名 + 最近失败原因 + 场景输入摘要（规则拼接）。"""
+        parts = []
+        if domain:
+            parts.append(f"domain: {domain}")
+        if skill_name:
+            parts.append(f"skill: {skill_name}")
         failed = [d for d in (current_details or []) if not d.get("passed")]
         for d in failed[:3]:
             parts.append(str(d.get("reason") or ""))
@@ -1373,11 +1403,15 @@ class SkillOptimizer:
         return " ".join(p for p in parts if p)
 
     @staticmethod
-    def _tag_filter(lessons, skill_name, limit):
-        """同技能经验优先，不足补通用（无 skill_name 绑定）经验；各自取最近。"""
+    def _tag_filter(lessons, skill_name, domain, limit):
+        """同技能经验优先 → 同领域次之 → 通用兜底；各自取最近。"""
         same = [l for l in lessons if l.get("skill_name") == skill_name]
-        generic = [l for l in lessons if not l.get("skill_name")]
-        pool = (same + generic)
+        same_domain = [
+            l for l in lessons
+            if l.get("skill_name") != skill_name and l.get("domain") == domain and domain
+        ]
+        generic = [l for l in lessons if not l.get("skill_name") and not l.get("domain")]
+        pool = (same + same_domain + generic)
         return pool[-max(1, limit):]
 
     @staticmethod
@@ -1452,8 +1486,11 @@ class SkillOptimizer:
             )
             fused = self._rrf_fuse([dense_rank, sparse_rank])
             return [l for l, _ in fused[:max(1, limit)]]
-        # semantic：余弦 >= 阈值(0.3) 的前 limit 条；无达标返回空（触发降级）。
-        top = [l for l, s in sorted(scored, key=lambda x: x[1], reverse=True) if s >= 0.3]
+        # semantic：余弦 >= 阈值(lesson_threshold) 的前 limit 条；无达标返回空（触发降级）。
+        top = [
+            l for l, s in sorted(scored, key=lambda x: x[1], reverse=True)
+            if s >= self.lesson_threshold
+        ]
         return top[:max(1, limit)]
 
     def _lesson_n(self):
@@ -1462,31 +1499,32 @@ class SkillOptimizer:
         except ValueError:
             return 5
 
-    async def _prepare_lessons(self, skill_md, scenarios, evals, current_details):
+    async def _prepare_lessons(self, skill_md, scenarios, evals, current_details, domain=None):
         """按 LESSON_RETRIEVAL 模式准备注入的经验；任何检索失败降级不中断。"""
         if not self.lesson_file:
             return []
         mode = self.lesson_retrieval
-        n = self._lesson_n()
+        read_n = self._lesson_n()
+        top_k = self.lesson_top_k
         if mode == "off":
-            lessons = self._load_lessons(self.lesson_file, limit=n)
+            lessons = self._load_lessons(self.lesson_file, limit=read_n)
         else:
             all_lessons = self._load_lessons(self.lesson_file, limit=1000)
             if not all_lessons:
                 return []
             skill_name = self._skill_name_from_md(skill_md)
             if mode == "tag":
-                lessons = self._tag_filter(all_lessons, skill_name, n)
+                lessons = self._tag_filter(all_lessons, skill_name, domain, read_n)
             else:
-                query = self._build_query(skill_name, scenarios, evals, current_details)
+                query = self._build_query(skill_name, domain, scenarios, evals, current_details)
                 if not query:
-                    lessons = self._tag_filter(all_lessons, skill_name, n)
+                    lessons = self._tag_filter(all_lessons, skill_name, domain, read_n)
                 else:
                     try:
-                        lessons = await self._retrieve_lessons(all_lessons, query, mode, n)
+                        lessons = await self._retrieve_lessons(all_lessons, query, mode, top_k)
                     except Exception:
                         # 降级链：semantic/hybrid 失败 → tag 过滤（尽力而为）。
-                        lessons = self._tag_filter(all_lessons, skill_name, n)
+                        lessons = self._tag_filter(all_lessons, skill_name, domain, read_n)
         # 【RAG】剥离内部 _id（仅用于 embedding 写回），不让其进入注入内容。
         for l in lessons:
             l.pop("_id", None)

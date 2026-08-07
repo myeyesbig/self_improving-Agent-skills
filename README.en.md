@@ -231,6 +231,8 @@ SkillForge exposes a set of **optional** optimization knobs, all defaulting to c
 | `SKILL_LESSONS_FILE` | env var | none (off) | Cross-session lesson store path (jsonl): kept fixes are persisted and injected as few-shot into Analyst/Mutator on later runs |
 | `LESSON_N` | env var | 5 | How many recent lessons are read per optimization run |
 | `LESSON_RETRIEVAL` | env var | off | Lesson injection mode: `off` (recent N) / `tag` (same-skill hard filter) / `semantic` (embedding retrieval) / `hybrid` (dense+sparse fusion). `semantic`/`hybrid` require a `.db`-suffixed SQLite lesson store and call DashScope text-embedding-v3 |
+| `LESSON_THRESHOLD` | env var | 0.3 | Cosine similarity threshold for semantic retrieval (0~1) |
+| `LESSON_TOP_K` | env var | 5 | How many retrieved lessons are injected (independent of the LESSON_N read count) |
 
 > **Security & invariants**: the credential field is always `qwen_api_key`; the key lives only in component memory and the request body — never in logs, sessions, zips, or git. A mutation still changes exactly one spot in SKILL.md; only strictly-improving mutations are kept, and the regression guard is strictly protective — it can never let a skill degrade.
 

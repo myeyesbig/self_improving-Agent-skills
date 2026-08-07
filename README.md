@@ -238,6 +238,8 @@ SkillForge 提供一组**可选**优化旋钮，全部默认等价于经典行�
 | `SKILL_LESSONS_FILE` | 环境变量 | 无（关闭） | 跨会话经验库路径（jsonl）：保留的修改沉淀为经验，下次优化注入 Analyst/Mutator |
 | `LESSON_N` | 环境变量 | 5 | 每次优化读取的最近经验条数 |
 | `LESSON_RETRIEVAL` | 环境变量 | off | 经验注入方式：`off`（最近 N 条）/ `tag`（同技能硬过滤）/ `semantic`（embedding 语义检索）/ `hybrid`（dense+sparse 混合）。semantic/hybrid 需要经验库使用 `.db` 后缀（SQLite）并调用 DashScope text-embedding-v3 |
+| `LESSON_THRESHOLD` | 环境变量 | 0.3 | semantic 检索的余弦相似度阈值（0~1） |
+| `LESSON_TOP_K` | 环境变量 | 5 | semantic/hybrid 检索后注入的经验条数（与 LESSON_N 读取条数独立） |
 
 > **安全与不变量**：凭据字段恒为 `qwen_api_key`；密钥仅存组件内存与请求体，绝不落日志/会话/zip/git。一次变异仍只改 SKILL.md 一处；只有「严格提升」的变异才会被保留，回归守卫只会更严格，绝不会让技能退化。
 

@@ -1267,6 +1267,74 @@ class TestRetrievalModes(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(top), 2)  # RRF 融合两者都在
 
 
+class TestLessonKnobs(unittest.IsolatedAsyncioTestCase):
+    """Option A: LESSON_THRESHOLD / LESSON_TOP_K configurable."""
+
+    def test_defaults(self):
+        opt = make_optimizer()
+        self.assertEqual(opt.lesson_threshold, 0.3)
+        self.assertEqual(opt.lesson_top_k, 5)
+
+    def test_env_override(self):
+        with patch.dict(os.environ, {"LESSON_THRESHOLD": "0.5", "LESSON_TOP_K": "3"}, clear=False):
+            opt = make_optimizer()
+        self.assertEqual(opt.lesson_threshold, 0.5)
+        self.assertEqual(opt.lesson_top_k, 3)
+
+    def test_constructor_override_beats_env(self):
+        with patch.dict(os.environ, {"LESSON_THRESHOLD": "0.5"}, clear=False):
+            opt = make_optimizer(lesson_threshold=0.9)
+        self.assertEqual(opt.lesson_threshold, 0.9)
+
+    def test_invalid_threshold_clamped(self):
+        opt = make_optimizer(lesson_threshold=5.0)  # 超范围 → 钳到 1.0
+        self.assertEqual(opt.lesson_threshold, 1.0)
+
+    async def test_semantic_uses_configured_threshold(self):
+        opt = make_optimizer()
+        opt.lesson_retrieval = "semantic"
+        opt.lesson_threshold = 0.9  # 只有余弦 1.0 的能过
+        lessons = [
+            {"strategy": "a", "summary": "x", "embedding": [1.0, 0.0]},
+            {"strategy": "b", "summary": "y", "embedding": [0.5, 0.5]},
+        ]
+        with patch.object(opt, "_embed", new=AsyncMock(return_value=[1.0, 0.0])):
+            top = await opt._retrieve_lessons(lessons, "q", "semantic", 5)
+        self.assertEqual([l["strategy"] for l in top], ["a"])
+
+
+class TestDomainTagging(unittest.IsolatedAsyncioTestCase):
+    """Option B: analyze_skill domain label + domain-aware tag filter."""
+
+    async def test_analyze_fills_missing_domain(self):
+        opt = make_optimizer()
+        raw = {"scenarios": [], "evals": []}  # 无 domain
+        with patch.object(opt, "_ask_json", new=AsyncMock(return_value=raw)):
+            result = await opt.analyze_skill({"SKILL.md": "# S"})
+        self.assertEqual(result["domain"], "other")
+
+    async def test_analyze_keeps_domain(self):
+        opt = make_optimizer()
+        raw = {"scenarios": [], "evals": [], "domain": "coding"}
+        with patch.object(opt, "_ask_json", new=AsyncMock(return_value=raw)):
+            result = await opt.analyze_skill({"SKILL.md": "# S"})
+        self.assertEqual(result["domain"], "coding")
+
+    def test_tag_filter_prefers_same_skill_then_domain_then_generic(self):
+        lessons = [
+            {"skill_name": "writer", "domain": "writing", "summary": "w1"},
+            {"skill_name": "coder", "domain": "coding", "summary": "c2"},
+            {"skill_name": "report-bot", "domain": "writing", "summary": "r3"},  # 同领域不同技能
+            {"summary": "g4"},  # 通用
+        ]
+        pool = SkillOptimizer._tag_filter(lessons, "writer", "writing", 5)
+        self.assertEqual([l["summary"] for l in pool], ["w1", "r3", "g4"])
+
+    def test_build_query_includes_domain(self):
+        q = SkillOptimizer._build_query("writer", "writing", [], [], [])
+        self.assertIn("domain: writing", q)
+        self.assertIn("skill: writer", q)
+
 
 class TestStopRequested(unittest.IsolatedAsyncioTestCase):
     """C5: cooperative stop raises between rounds."""

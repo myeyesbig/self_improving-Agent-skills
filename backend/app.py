@@ -287,8 +287,9 @@ async def analyze_skill(request: AnalyzeRequest):
         analysis = await optimizer.analyze_skill(session["skill_files"])
         session["scenarios"] = analysis["scenarios"]
         session["evals"] = analysis["evals"]
+        session["domain"] = analysis.get("domain", "other")
         session["status"] = "analyzed"
-        return {"scenarios": analysis["scenarios"], "evals": analysis["evals"]}
+        return {"scenarios": analysis["scenarios"], "evals": analysis["evals"], "domain": session["domain"]}
     except Exception as e:
         logger.error(f"Analysis error: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail="Analysis failed. Check your DashScope API key and try again.")
@@ -451,6 +452,7 @@ async def start_optimization(session_id: str, request: StartRequest):
                 callback=callback,
                 parallel_mutations=request.parallel_mutations,
                 strategy_pool=request.strategy_pool,
+                domain=session.get("domain"),
             )
             logger.info(f"Optimization complete: {result['baseline_score']}% -> {result['final_score']}%")
             # Don't overwrite final_result if callback already set it with transformed data
