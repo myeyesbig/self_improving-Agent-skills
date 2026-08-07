@@ -83,6 +83,7 @@ async def main():
     ap.add_argument("--queries", default=None, help="人工查询集 jsonl（可选）")
     ap.add_argument("--top-k", type=int, default=5)
     ap.add_argument("--threshold", type=float, default=0.3)
+    ap.add_argument("--rerank", action="store_true", help="开启 gte-rerank 重排（对比用）")
     args = ap.parse_args()
     if not args.api_key:
         args.api_key = os.environ.get("DASHSCOPE_API_KEY")
@@ -98,6 +99,7 @@ async def main():
         lesson_retrieval="semantic",
         lesson_threshold=args.threshold,
         lesson_top_k=args.top_k,
+        lesson_rerank=args.rerank,
     )
     if not args.api_key:
         async def fake_embed(text):

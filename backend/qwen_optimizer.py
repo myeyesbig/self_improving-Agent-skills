@@ -195,6 +195,10 @@ class SkillOptimizer:
         lesson_retrieval: Optional[str] = None,
         lesson_threshold: Optional[float] = None,
         lesson_top_k: Optional[int] = None,
+        lesson_rerank: Optional[bool] = None,
+        lesson_rerank_pool: Optional[int] = None,
+        lesson_min_gain: Optional[float] = None,
+        lesson_min_final: Optional[float] = None,
     ):
         # The key is passed directly into the LLM configuration; it is never
         # written to the process environment, stored in sessions, or logged.
@@ -285,6 +289,35 @@ class SkillOptimizer:
             except ValueError:
                 lesson_top_k = 5
         self.lesson_top_k = max(1, int(lesson_top_k))
+
+        # 【RAG 重排】LESSON_RERANK=1 时对 semantic/hybrid 的候选池调用 DashScope
+        # gte-rerank 重排后取 top-K；默认 0 关闭（保持现有排序）。候选池大小
+        # 由 LESSON_RERANK_POOL 控制（默认 20）。
+        if lesson_rerank is None:
+            lesson_rerank = os.getenv("LESSON_RERANK", "0") != "0"
+        self.lesson_rerank = lesson_rerank
+        if lesson_rerank_pool is None:
+            try:
+                lesson_rerank_pool = int(os.getenv("LESSON_RERANK_POOL", "20"))
+            except ValueError:
+                lesson_rerank_pool = 20
+        self.lesson_rerank_pool = max(2, int(lesson_rerank_pool))
+
+        # 【经验沉淀质量门槛】LESSON_MIN_GAIN（提升幅度）/ LESSON_MIN_FINAL
+        # （最终水位），OR 语义：任一启用的维度达标才沉淀经验；全 0=关闭=
+        # 旧行为（任何 kept 都沉淀）。只影响经验库质量，不动优化保留语义。
+        if lesson_min_gain is None:
+            try:
+                lesson_min_gain = float(os.getenv("LESSON_MIN_GAIN", "0.0"))
+            except ValueError:
+                lesson_min_gain = 0.0
+        self.lesson_min_gain = max(0.0, float(lesson_min_gain))
+        if lesson_min_final is None:
+            try:
+                lesson_min_final = float(os.getenv("LESSON_MIN_FINAL", "0.0"))
+            except ValueError:
+                lesson_min_final = 0.0
+        self.lesson_min_final = max(0.0, float(lesson_min_final))
 
         # 【安全】仅内存持有 key 引用，用于 embedding/rerank 的 DashScope 调用；
         # 绝不打印、不落日志、不写环境变量、不序列化进任何返回结构。
@@ -749,17 +782,20 @@ class SkillOptimizer:
                 # 【P4】保留的修改沉淀为跨会话经验（只记模型生成内容，不落
                 # skill_md / scenario / output / api_key，安全）。skill_name 供
                 # tag/semantic 检索模式按技能过滤，created_at 记录时间。
-                self._append_lesson(self.lesson_file, {
-                    "skill_name": self._skill_name_from_md(skill_md),
-                    "domain": domain or "",
-                    "skill_description": "",
-                    "strategy": analysis.get("mutation_strategy", "unknown"),
-                    "diagnosis": (analysis.get("diagnosis") or "")[:200],
-                    "summary": (best.get("description") or "")[:200],
-                    "score_before": baseline_pct,
-                    "score_after": best["score_after"],
-                    "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
-                })
+                # 【质量门槛】仅当提升幅度或最终水位达标时才沉淀，过滤小修
+                # 噪音（_lesson_qualifies，默认关闭=任何 kept 都沉淀）。
+                if self._lesson_qualifies(baseline_pct, best["score_after"]):
+                    self._append_lesson(self.lesson_file, {
+                        "skill_name": self._skill_name_from_md(skill_md),
+                        "domain": domain or "",
+                        "skill_description": "",
+                        "strategy": analysis.get("mutation_strategy", "unknown"),
+                        "diagnosis": (analysis.get("diagnosis") or "")[:200],
+                        "summary": (best.get("description") or "")[:200],
+                        "score_before": baseline_pct,
+                        "score_after": best["score_after"],
+                        "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
+                    })
                 current_md = best["new_md"]
                 baseline_pct = best["score_after"]
                 current_details = best.get("details", current_details)
@@ -1464,8 +1500,31 @@ class SkillOptimizer:
             self._embed_cache[text] = await asyncio.to_thread(self._embed_sync, text)
         return self._embed_cache[text]
 
+    def _rerank_sync(self, query, docs):
+        """DashScope gte-rerank（同步；在 _rerank 的线程桥接里执行）。"""
+        import dashscope
+        resp = dashscope.TextReRank.call(
+            model="gte-rerank", query=query, documents=docs,
+            api_key=self._api_key, top_n=len(docs),
+        )
+        if getattr(resp, "status_code", 500) != 200:
+            raise RuntimeError(
+                f"rerank failed: {getattr(resp, 'code', '')} {getattr(resp, 'message', '')}"
+            )
+        results = resp.output.get("results", [])
+        # results: [{"index": 0, "relevance_score": 0.9}, ...] → 按分数降序。
+        return sorted(results, key=lambda r: r.get("relevance_score", 0.0), reverse=True)
+
+    async def _rerank(self, query, docs):
+        """rerank（线程桥接，不阻塞事件循环）。"""
+        return await asyncio.to_thread(self._rerank_sync, query, docs)
+
     async def _retrieve_lessons(self, lessons, query, mode, limit):
-        """semantic/hybrid 检索：embedding 余弦（+sparse/RRF），异常向上抛由调用方降级。"""
+        """semantic/hybrid 检索：embedding 余弦（+sparse/RRF）；可选 gte-rerank 重排。
+
+        【D 选项】LESSON_RERANK 开启时对候选池（前 max(limit, rerank_pool) 条）
+        调用 gte-rerank 重排后取 top-K；rerank 失败静默降级到原始排序。
+        """
         qvec = await self._embed(query)
         scored = []
         for l in lessons:
@@ -1485,19 +1544,45 @@ class SkillOptimizer:
                 reverse=True,
             )
             fused = self._rrf_fuse([dense_rank, sparse_rank])
-            return [l for l, _ in fused[:max(1, limit)]]
-        # semantic：余弦 >= 阈值(lesson_threshold) 的前 limit 条；无达标返回空（触发降级）。
-        top = [
-            l for l, s in sorted(scored, key=lambda x: x[1], reverse=True)
-            if s >= self.lesson_threshold
-        ]
-        return top[:max(1, limit)]
+            ranked = [l for l, _ in fused]
+        else:  # semantic：余弦 >= 阈值；无达标返回空（触发外层降级）。
+            ranked = [
+                l for l, s in sorted(scored, key=lambda x: x[1], reverse=True)
+                if s >= self.lesson_threshold
+            ]
+        if not ranked:
+            return []
+        # 【D 选项】可选 rerank 重排候选池后取 top-K；失败降级保持原始排序。
+        if self.lesson_rerank:
+            pool = max(limit, self.lesson_rerank_pool)
+            candidates = ranked[:pool]
+            try:
+                reranked = await self._rerank(
+                    query, [self._lesson_index_text(l) for l in candidates]
+                )
+                ranked = [candidates[i.get("index", 0)] for i in reranked]
+            except Exception:
+                pass  # 降级：保持原始排序
+        return ranked[:max(1, limit)]
 
     def _lesson_n(self):
         try:
             return max(1, int(os.getenv("LESSON_N", "5")))
         except ValueError:
             return 5
+
+    def _lesson_qualifies(self, score_before, score_after):
+        """经验沉淀质量门槛（LESSON_MIN_GAIN / LESSON_MIN_FINAL，OR 语义）。
+
+        任一启用的维度达标即沉淀；两个都关闭（0）时总是沉淀（旧行为）。
+        只影响经验库质量，不改变优化保留语义。
+        """
+        gain = score_after - score_before
+        if self.lesson_min_gain > 0 and gain >= self.lesson_min_gain:
+            return True
+        if self.lesson_min_final > 0 and score_after >= self.lesson_min_final:
+            return True
+        return self.lesson_min_gain <= 0 and self.lesson_min_final <= 0
 
     async def _prepare_lessons(self, skill_md, scenarios, evals, current_details, domain=None):
         """按 LESSON_RETRIEVAL 模式准备注入的经验；任何检索失败降级不中断。"""

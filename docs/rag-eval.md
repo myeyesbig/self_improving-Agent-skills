@@ -46,6 +46,15 @@ cd backend && source .venv/bin/activate
 DASHSCOPE_API_KEY=<key> python eval_lessons.py --lessons /tmp/skill_lessons.db --queries /tmp/queries.jsonl
 ```
 
+### gte-rerank 冒烟（2026-08-07，`--rerank` 对比）
+
+```
+rerank OFF: top-1 1.000 / top-5 0.367 / 端到端 305.4ms
+rerank ON:  top-1 1.000 / top-5 0.367 / 端到端 321.6ms (+16ms = rerank API 真实调用)
+```
+
+**结论**：`gte-rerank` 模型调用成功（无报错，延迟增量佐证真实执行），但在 8 条小库上 **dense 排序已全对（top-1 100%），rerank 无提升空间**——与预期一致。rerank 的价值在候选池大/embedding 排序有噪声的场景，待经验库规模上来后复测（`eval_lessons.py --rerank` 可直接对比）。
+
 ## 附注
 
 - 真实 embedding 当前落库为 **1024 维**（`dimensions=512` 参数未生效，dashscope 默认输出），不影响正确性；如要控制维度需核对 SDK 参数。

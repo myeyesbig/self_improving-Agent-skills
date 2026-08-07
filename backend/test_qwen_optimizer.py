@@ -1336,6 +1336,137 @@ class TestDomainTagging(unittest.IsolatedAsyncioTestCase):
         self.assertIn("skill: writer", q)
 
 
+class TestLessonRerank(unittest.IsolatedAsyncioTestCase):
+    """Option D: LESSON_RERANK gte-rerank reorders candidates, degrades on failure."""
+
+    def test_default_off(self):
+        opt = make_optimizer()
+        self.assertFalse(opt.lesson_rerank)
+        self.assertEqual(opt.lesson_rerank_pool, 20)
+
+    def test_env_override(self):
+        with patch.dict(os.environ, {"LESSON_RERANK": "1", "LESSON_RERANK_POOL": "10"}, clear=False):
+            opt = make_optimizer()
+        self.assertTrue(opt.lesson_rerank)
+        self.assertEqual(opt.lesson_rerank_pool, 10)
+
+    async def test_rerank_reorders_candidates(self):
+        opt = make_optimizer()
+        opt.lesson_retrieval = "semantic"
+        opt.lesson_rerank = True
+        lessons = [
+            {"strategy": "a", "summary": "alpha fix", "embedding": [1.0, 0.0]},
+            {"strategy": "b", "summary": "beta fix", "embedding": [0.9, 0.1]},
+        ]
+        # dense 排序 a 第一；rerank 认为 b 更相关 → 结果应按 b, a。
+        rerank_result = [
+            {"index": 1, "relevance_score": 0.9},
+            {"index": 0, "relevance_score": 0.8},
+        ]
+        with (
+            patch.object(opt, "_embed", new=AsyncMock(return_value=[1.0, 0.0])),
+            patch.object(opt, "_rerank", new=AsyncMock(return_value=rerank_result)) as mock_rerank,
+        ):
+            top = await opt._retrieve_lessons(lessons, "query", "semantic", 5)
+        self.assertEqual([l["strategy"] for l in top], ["b", "a"])
+        # rerank 收到的是候选的检索文本列表。
+        self.assertEqual(len(mock_rerank.await_args[0][1]), 2)
+
+    async def test_rerank_off_does_not_call(self):
+        opt = make_optimizer()
+        opt.lesson_retrieval = "semantic"
+        lessons = [
+            {"strategy": "a", "summary": "alpha fix", "embedding": [1.0, 0.0]},
+            {"strategy": "b", "summary": "beta fix", "embedding": [0.9, 0.1]},
+        ]
+        with (
+            patch.object(opt, "_embed", new=AsyncMock(return_value=[1.0, 0.0])),
+            patch.object(opt, "_rerank", new=AsyncMock()) as mock_rerank,
+        ):
+            top = await opt._retrieve_lessons(lessons, "query", "semantic", 5)
+        self.assertEqual([l["strategy"] for l in top], ["a", "b"])
+        mock_rerank.assert_not_awaited()
+
+    async def test_rerank_failure_degrades_to_original_order(self):
+        opt = make_optimizer()
+        opt.lesson_retrieval = "semantic"
+        opt.lesson_rerank = True
+        lessons = [
+            {"strategy": "a", "summary": "alpha fix", "embedding": [1.0, 0.0]},
+            {"strategy": "b", "summary": "beta fix", "embedding": [0.9, 0.1]},
+        ]
+        with (
+            patch.object(opt, "_embed", new=AsyncMock(return_value=[1.0, 0.0])),
+            patch.object(opt, "_rerank", new=AsyncMock(side_effect=RuntimeError("rerank down"))),
+        ):
+            top = await opt._retrieve_lessons(lessons, "query", "semantic", 5)
+        self.assertEqual([l["strategy"] for l in top], ["a", "b"])  # 降级保持原始排序
+
+
+class TestLessonQualityGate(unittest.IsolatedAsyncioTestCase):
+    """经验沉淀质量门槛：LESSON_MIN_GAIN / LESSON_MIN_FINAL（OR 语义）。"""
+
+    def test_defaults_disabled(self):
+        opt = make_optimizer()
+        self.assertEqual(opt.lesson_min_gain, 0.0)
+        self.assertEqual(opt.lesson_min_final, 0.0)
+
+    def test_env_override(self):
+        with patch.dict(os.environ, {"LESSON_MIN_GAIN": "15", "LESSON_MIN_FINAL": "85"}, clear=False):
+            opt = make_optimizer()
+        self.assertEqual(opt.lesson_min_gain, 15.0)
+        self.assertEqual(opt.lesson_min_final, 85.0)
+
+    def test_gain_gate_or_semantics(self):
+        opt = make_optimizer(lesson_min_gain=15.0, lesson_min_final=85.0)
+        # 幅度达标（50→75, gain 25）→ 沉淀
+        self.assertTrue(opt._lesson_qualifies(50.0, 75.0))
+        # 水位达标（98→100）→ 沉淀（OR 命中 final）
+        self.assertTrue(opt._lesson_qualifies(98.0, 100.0))
+        # 双不达标（50→60）→ 不沉淀
+        self.assertFalse(opt._lesson_qualifies(50.0, 60.0))
+
+    def test_only_final_gate(self):
+        opt = make_optimizer(lesson_min_final=85.0)
+        self.assertFalse(opt._lesson_qualifies(50.0, 75.0))   # 水位 75 < 85
+        self.assertTrue(opt._lesson_qualifies(50.0, 90.0))    # 水位 90 >= 85
+
+    def test_only_gain_gate(self):
+        opt = make_optimizer(lesson_min_gain=20.0)
+        self.assertFalse(opt._lesson_qualifies(90.0, 92.0))   # gain 2 < 20
+        # 只开 gain 时最终水位不参与判断：90→100 的 gain=10 < 20 → 不沉淀。
+        self.assertFalse(opt._lesson_qualifies(90.0, 100.0))
+        self.assertTrue(opt._lesson_qualifies(50.0, 80.0))    # gain 30 >= 20
+
+    def test_disabled_always_true(self):
+        opt = make_optimizer()
+        self.assertTrue(opt._lesson_qualifies(50.0, 52.0))    # 旧行为：任何 kept 都沉淀
+        self.assertTrue(opt._lesson_qualifies(0.0, 100.0))
+
+    async def test_optimize_skips_low_quality_persistence(self):
+        # kept 但未达门槛 → 经验库不新增；达标 → 新增。
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "lessons.db")
+            opt = make_optimizer(lesson_min_gain=15.0, lesson_min_final=85.0)
+            opt.lesson_file = path
+            low_baseline = {"passed": 2, "total": 4, "per_eval": [], "details": []}   # 50%
+            low_kept = {"passed": 2, "total": 4, "per_eval": [], "details": []}       # 50%（不提升→不 kept？）
+            # 用 50→60 构造 kept 但不过门槛：baseline 50，improved 60。
+            improved60 = {"passed": 3, "total": 5, "per_eval": [], "details": []}      # 60%
+            analysis = {"diagnosis": "d", "mutation_strategy": "add_example",
+                        "target_section": "s", "suggested_change": "c"}
+            mutation = {"description": "m", "reasoning": "r", "new_skill_md": "# New"}
+            with (
+                patch.object(opt, "_score_skill", new=AsyncMock(side_effect=[low_baseline, improved60])),
+                patch.object(opt, "_analyze_failures", new=AsyncMock(return_value=analysis)),
+                patch.object(opt, "_mutate_skill", new=AsyncMock(return_value=mutation)),
+            ):
+                await opt.optimize({"SKILL.md": "# S"}, [], [], max_rounds=1)
+            lessons_after_low = SkillOptimizer._load_lessons(path)
+        # 50→60（gain 10 < 15，final 60 < 85）→ 不沉淀。
+        self.assertEqual(len(lessons_after_low), 0)
+
+
 class TestStopRequested(unittest.IsolatedAsyncioTestCase):
     """C5: cooperative stop raises between rounds."""
 

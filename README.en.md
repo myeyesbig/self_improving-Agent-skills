@@ -233,6 +233,10 @@ SkillForge exposes a set of **optional** optimization knobs, all defaulting to c
 | `LESSON_RETRIEVAL` | env var | off | Lesson injection mode: `off` (recent N) / `tag` (same-skill hard filter) / `semantic` (embedding retrieval) / `hybrid` (dense+sparse fusion). `semantic`/`hybrid` require a `.db`-suffixed SQLite lesson store and call DashScope text-embedding-v3 |
 | `LESSON_THRESHOLD` | env var | 0.3 | Cosine similarity threshold for semantic retrieval (0~1) |
 | `LESSON_TOP_K` | env var | 5 | How many retrieved lessons are injected (independent of the LESSON_N read count) |
+| `LESSON_RERANK` | env var | 0 (off) | When on, re-rank the retrieval candidate pool with DashScope gte-rerank before taking top-K (degrades silently on failure) |
+| `LESSON_RERANK_POOL` | env var | 20 | Candidate pool size for reranking |
+| `LESSON_MIN_GAIN` | env var | 0 (off) | Lesson-persistence quality gate — minimum improvement: persist only when score_after − score_before ≥ value (OR semantics; suggested 15) |
+| `LESSON_MIN_FINAL` | env var | 0 (off) | Lesson-persistence quality gate — minimum final score: persist only when score_after ≥ value (OR semantics; suggested 85). Either dimension qualifying persists the lesson, filtering small-fix noise |
 
 > **Security & invariants**: the credential field is always `qwen_api_key`; the key lives only in component memory and the request body — never in logs, sessions, zips, or git. A mutation still changes exactly one spot in SKILL.md; only strictly-improving mutations are kept, and the regression guard is strictly protective — it can never let a skill degrade.
 

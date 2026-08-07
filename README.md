@@ -240,6 +240,10 @@ SkillForge 提供一组**可选**优化旋钮，全部默认等价于经典行�
 | `LESSON_RETRIEVAL` | 环境变量 | off | 经验注入方式：`off`（最近 N 条）/ `tag`（同技能硬过滤）/ `semantic`（embedding 语义检索）/ `hybrid`（dense+sparse 混合）。semantic/hybrid 需要经验库使用 `.db` 后缀（SQLite）并调用 DashScope text-embedding-v3 |
 | `LESSON_THRESHOLD` | 环境变量 | 0.3 | semantic 检索的余弦相似度阈值（0~1） |
 | `LESSON_TOP_K` | 环境变量 | 5 | semantic/hybrid 检索后注入的经验条数（与 LESSON_N 读取条数独立） |
+| `LESSON_RERANK` | 环境变量 | 0（关闭） | 开启后对检索候选池调用 DashScope gte-rerank 重排再取 top-K（失败自动降级） |
+| `LESSON_RERANK_POOL` | 环境变量 | 20 | rerank 的候选池大小 |
+| `LESSON_MIN_GAIN` | 环境变量 | 0（关闭） | 经验沉淀质量门槛-提升幅度：score_after − score_before ≥ 该值才沉淀（OR 语义；推荐开启值 15） |
+| `LESSON_MIN_FINAL` | 环境变量 | 0（关闭） | 经验沉淀质量门槛-最终水位：score_after ≥ 该值才沉淀（OR 语义；推荐开启值 85）。任一维度达标即沉淀，过滤小修噪音 |
 
 > **安全与不变量**：凭据字段恒为 `qwen_api_key`；密钥仅存组件内存与请求体，绝不落日志/会话/zip/git。一次变异仍只改 SKILL.md 一处；只有「严格提升」的变异才会被保留，回归守卫只会更严格，绝不会让技能退化。
 
