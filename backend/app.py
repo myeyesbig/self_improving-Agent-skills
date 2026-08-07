@@ -372,7 +372,12 @@ async def start_optimization(session_id: str, request: StartRequest):
         # 【异步】后台任务：这里是用 asyncio.create_task 启动的协程，不阻塞
         # 当前请求。qwen_key 来自请求体，只在这个闭包内使用。
         logger.info(f"Starting optimization for session {session_id}")
-        optimizer = SkillOptimizer(api_key=qwen_key)
+        # 【P0 修复】把请求里的提升阈值传给优化器构造参数，让前端配置真正生效；
+        # None 时优化器内部仍读 IMPROVEMENT_THRESHOLD 环境变量（默认 0.0）。
+        optimizer = SkillOptimizer(
+            api_key=qwen_key,
+            improvement_threshold=request.improvement_threshold,
+        )
         # 【C5 停止】把 session 的 stop_requested 交给优化器，轮间协作取消。
         optimizer.stop_requested = False
 

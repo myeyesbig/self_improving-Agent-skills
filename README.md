@@ -25,11 +25,11 @@
 ### 优化循环
 
 - **Executor** 智能体针对所有测试场景运行技能
-- **Executor** 再对每个输出按二值（是/否）评估标准打分，可选**按维度加权**（correctness / clarity / executability 等）
-- **Analyst** 智能体诊断失败模式，并从**可配置策略池**（`add_example`、`add_constraint`、`restructure`、`add_edge_case`、`add_reference`、`rewrite_section`、`fix_format`）中选择策略
+- **Executor** 再对每个输出按二值（是/否）评估标准打分，可选**按维度加权**（correctness / clarity / executability 等）；带 `check_type` 的可程序化标准（keyword / regex / yaml_or_json / length）直接用 Python 规则判定，不消耗 LLM 调用
+- **Analyst** 智能体诊断失败模式，并从**可配置策略池**（`add_example`、`add_constraint`、`restructure`、`add_edge_case`、`add_reference`、`rewrite_section`、`fix_format`）中选择策略；会看到最近几轮的修改记忆，已尝试未提升的策略会被标注 blocked，被拒的编辑摘要会被注入避免重复
 - **Mutator** 智能体对技能提示词应用一处精准修复；开启并行时每轮同时生成多个候选变异
 - **Executor** 重新运行并重新评估修改后的技能（并行时取分数最优的候选）
-- 变异先过**回归守卫**（frontmatter / 标题 / 体积完整性检查），再按「严格高于基线 + 提升阈值」决定保留，否则回滚
+- 变异先过**回归守卫**（frontmatter / 标题 / 体积完整性检查），再按「严格高于基线 + 提升阈值（+ 可选的噪声地板）」决定保留，否则回滚；开启 `EDIT_LIMIT` 时超幅度的变异在复评前即被拒绝
 - 评分达到 100%（全部评估通过）立即停止循环，否则循环直至达到最大轮数
 
 ## 架构
@@ -59,6 +59,8 @@ skillforge/
 - **实时通信**：Server-Sent Events（SSE）实时推送优化进度
 
 ## 快速开始
+
+> **一键启动**：项目根目录执行 `./start-dev.sh` 可同时拉起前后端（单终端，Ctrl+C 全部停止；端口已占用时自动跳过）。默认模型 `qwen3.7-max-2026-05-17` 并开启思考模式，可用 `QWEN_MODEL` / `QWEN_ENABLE_THINKING` 环境变量覆盖。
 
 ### 后端配置
 
@@ -226,6 +228,16 @@ SkillForge 提供一组**可选**优化旋钮，全部默认等价于经典行�
 | `improvement_threshold` | 请求字段 / `IMPROVEMENT_THRESHOLD` | 0.0 | 新分必须严格高于「基线 + 阈值」才保留 |
 | 维度权重 | `ANALYST_DIMENSION_WEIGHTS`（JSON） | 无（等价旧通过率） | 按 eval 的 `dimension` 字段加权评分 |
 | `REGRESSION_CHECK` | 环境变量 | 1（开启） | 变异先过结构完整性守卫，0 关闭 |
+| `NOISE_FLOOR` | 环境变量 | 0.0 | 候选提升须超过「基线 + 阈值 + 噪声地板」才保留，防止评分波动被当成真进步 |
+| `EDIT_LIMIT` | 环境变量 | 0.0 | 单次变异相对原文本的变化比例上限，超限直接拒绝（`edit_limit_exceeded`），0 关闭 |
+| `QWEN_ENABLE_THINKING` | 环境变量 | 0（关闭） | 打开模型思考模式；部分模型（如 `qwen3.7-max-2026-05-17`）强制要求开启 |
+| `MEMORY_ROUNDS` | 环境变量 | 3 | 注入给 Analyst 的最近轮次记忆条数（轮间经验，避免反复修同一根因） |
+| `PATIENCE` | 环境变量 | 0（关闭） | 连续 N 轮未提升即提前终止优化（耐心早停） |
+| `SATURATION_EXIT` | 环境变量 | 0（关闭） | 基线无可提升带（100% 或 0 分全失败）时跳过全部轮次 |
+| `FINAL_CONFIRM` | 环境变量 | 0（关闭） | 完成前对最终版本独立复核，未超过基线则回退（防单点幸运） |
+| `SKILL_LESSONS_FILE` | 环境变量 | 无（关闭） | 跨会话经验库路径（jsonl）：保留的修改沉淀为经验，下次优化注入 Analyst/Mutator |
+| `LESSON_N` | 环境变量 | 5 | 每次优化读取的最近经验条数 |
+| `LESSON_RETRIEVAL` | 环境变量 | off | 经验注入方式：`off`（最近 N 条）/ `tag`（同技能硬过滤）/ `semantic`（embedding 语义检索）/ `hybrid`（dense+sparse 混合）。semantic/hybrid 需要经验库使用 `.db` 后缀（SQLite）并调用 DashScope text-embedding-v3 |
 
 > **安全与不变量**：凭据字段恒为 `qwen_api_key`；密钥仅存组件内存与请求体，绝不落日志/会话/zip/git。一次变异仍只改 SKILL.md 一处；只有「严格提升」的变异才会被保留，回归守卫只会更严格，绝不会让技能退化。
 

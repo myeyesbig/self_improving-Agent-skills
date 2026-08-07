@@ -25,7 +25,7 @@ This app implements an automated skill improvement loop inspired by Karpathy's a
 ### The Optimization Loop
 
 - The **Executor** agent runs the skill against all test scenarios
-- The **Executor** then scores each output against binary yes/no evaluation criteria (optionally dimension-weighted)
+- The **Executor** then scores each output against binary yes/no evaluation criteria (optionally dimension-weighted; machine-checkable criteria carrying `check_type` — keyword / regex / yaml_or_json / length — are judged by Python rules without an LLM call)
 - The **Analyst** agent diagnoses failure patterns and picks a strategy from the configurable pool (`add_example`, `add_constraint`, `restructure`, `add_edge_case`, `add_reference`, `rewrite_section`, `fix_format`)
 - The **Mutator** agent applies ONE surgical fix to the skill prompt; with parallel mutations enabled, multiple candidates are generated per round
 - A **regression guard** checks structural integrity (frontmatter / headings / size) before re-scoring, skipping rejected candidates
@@ -161,7 +161,7 @@ The **Executor** agent runs the skill against all scenarios and scores each outp
 ### 3. Optimization Loop
 For each round, the three agents collaborate:
 1. **Executor** runs the skill against all test scenarios and scores the outputs (optionally dimension-weighted)
-2. **Analyst** examines failures, identifies root cause, and selects a mutation strategy from the configurable pool (returns structured JSON validated against a Pydantic schema)
+2. **Analyst** examines failures, identifies root cause, and selects a mutation strategy from the configurable pool (returns structured JSON validated against a Pydantic schema); it also sees recent round memory, with tried-without-improvement strategies flagged `blocked` and rejected edit summaries injected to avoid repeating them
 3. **Mutator** applies ONE specific change to improve the skill (returns structured JSON validated against a Pydantic schema); with parallel mutations enabled, multiple candidates are generated per round
 4. **Regression guard** checks structural integrity (frontmatter / headings / size) for each candidate, rejecting and skipping re-scoring on failure
 5. **Executor** re-runs and re-scores the modified skill (best candidate wins when parallel)
@@ -221,6 +221,16 @@ SkillForge exposes a set of **optional** optimization knobs, all defaulting to c
 | `improvement_threshold` | request field / `IMPROVEMENT_THRESHOLD` | 0.0 | New score must be strictly above "baseline + threshold" to keep |
 | Dimension weights | `ANALYST_DIMENSION_WEIGHTS` (JSON) | none (equals old pass-rate) | Weight scoring by eval `dimension` field |
 | `REGRESSION_CHECK` | env var | 1 (on) | Structural integrity guard before re-scoring; 0 disables |
+| `NOISE_FLOOR` | env var | 0.0 | Candidate must beat "baseline + threshold + noise floor" to keep, so scoring jitter is not mistaken for real gains |
+| `EDIT_LIMIT` | env var | 0.0 | Max relative size change for a single mutation; oversized edits are rejected (`edit_limit_exceeded`) before re-scoring; 0 disables |
+| `QWEN_ENABLE_THINKING` | env var | 0 (off) | Enable model thinking mode; some models (e.g. `qwen3.7-max-2026-05-17`) require it |
+| `MEMORY_ROUNDS` | env var | 3 | How many recent rounds of attempt memory are injected into the Analyst (avoids re-fixing the same root cause) |
+| `PATIENCE` | env var | 0 (off) | Stop early after N consecutive rounds with no improvement |
+| `SATURATION_EXIT` | env var | 0 (off) | Skip all rounds when the baseline has no headroom (100% or 0% with all evals failed) |
+| `FINAL_CONFIRM` | env var | 0 (off) | Independently re-score the final version before completion; roll back if it does not beat the baseline (guards against lucky wins) |
+| `SKILL_LESSONS_FILE` | env var | none (off) | Cross-session lesson store path (jsonl): kept fixes are persisted and injected as few-shot into Analyst/Mutator on later runs |
+| `LESSON_N` | env var | 5 | How many recent lessons are read per optimization run |
+| `LESSON_RETRIEVAL` | env var | off | Lesson injection mode: `off` (recent N) / `tag` (same-skill hard filter) / `semantic` (embedding retrieval) / `hybrid` (dense+sparse fusion). `semantic`/`hybrid` require a `.db`-suffixed SQLite lesson store and call DashScope text-embedding-v3 |
 
 > **Security & invariants**: the credential field is always `qwen_api_key`; the key lives only in component memory and the request body — never in logs, sessions, zips, or git. A mutation still changes exactly one spot in SKILL.md; only strictly-improving mutations are kept, and the regression guard is strictly protective — it can never let a skill degrade.
 

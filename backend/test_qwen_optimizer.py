@@ -17,8 +17,10 @@ Uses only the standard library (unittest) plus mock/fake agents, so no real
 DashScope API key or network access is required.
 """
 
+import asyncio
 import json
 import os
+import tempfile
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -58,9 +60,9 @@ class FakeAgent:
             yield batch
 
 
-def make_optimizer(api_key="sk-test-1234"):
+def make_optimizer(api_key="sk-test-1234", **kwargs):
     # 构造测试用的 SkillOptimizer；默认使用假密钥，绝不触碰真实凭据。
-    return SkillOptimizer(api_key=api_key)
+    return SkillOptimizer(api_key=api_key, **kwargs)
 
 
 class TestSyncExtraction(unittest.TestCase):
@@ -597,6 +599,673 @@ class TestImprovementThreshold(unittest.IsolatedAsyncioTestCase):
         ):
             result = await opt.optimize({"SKILL.md": "# S"}, [], [], max_rounds=1)
         self.assertFalse(any(m.get("kept") for m in result["mutation_log"]))
+
+
+class TestImprovementThresholdWiring(unittest.IsolatedAsyncioTestCase):
+    """P0: /api/start passes improvement_threshold through to SkillOptimizer.
+
+    修复断链：此前构造 SkillOptimizer 只传 api_key，前端配置的阈值从未生效。
+    """
+
+    async def _run_start(self, threshold):
+        import app as app_module
+
+        sid = "wiring-session"
+        app_module.sessions[sid] = {
+            "skill_files": {"SKILL.md": "# S"},
+            "scenarios": [{"id": 1, "input": "x"}],
+            "evals": [{"id": 1, "criterion": "c"}],
+            "original_skill_md": "# S",
+        }
+        fake = AsyncMock()
+        fake.optimize = AsyncMock(return_value={
+            "baseline_score": 50.0,
+            "final_score": 50.0,
+            "improved_skill_md": "# S",
+            "score_history": [50.0],
+            "mutation_log": [],
+        })
+        try:
+            with patch.object(app_module, "SkillOptimizer", return_value=fake) as cls_mock:
+                req = StartRequest(qwen_api_key="sk-test-1", improvement_threshold=threshold)
+                await app_module.start_optimization(sid, req)
+                # 后台任务在 create_task 中异步运行，让出事件循环使其跑到构造处。
+                for _ in range(5):
+                    await asyncio.sleep(0)
+            return cls_mock
+        finally:
+            del app_module.sessions[sid]
+
+    async def test_threshold_passed_to_optimizer_constructor(self):
+        cls_mock = await self._run_start(5.0)
+        self.assertEqual(cls_mock.call_args.kwargs["api_key"], "sk-test-1")
+        self.assertEqual(cls_mock.call_args.kwargs["improvement_threshold"], 5.0)
+
+    async def test_threshold_none_is_preserved(self):
+        cls_mock = await self._run_start(None)
+        self.assertIsNone(cls_mock.call_args.kwargs["improvement_threshold"])
+
+
+class TestAnalyzeSkillDimensions(unittest.IsolatedAsyncioTestCase):
+    """P0: analyze_skill fills missing eval dimension so weighted scoring works."""
+
+    async def test_missing_dimension_filled_with_correctness(self):
+        opt = make_optimizer()
+        raw = {
+            "scenarios": [{"id": 1, "name": "s", "description": "s", "input": "u"}],
+            "evals": [{"id": 1, "name": "n", "criterion": "c"}],
+        }
+        with patch.object(opt, "_ask_json", new=AsyncMock(return_value=raw)):
+            result = await opt.analyze_skill({"SKILL.md": "# S"})
+        self.assertEqual(result["evals"][0]["dimension"], "correctness")
+
+    async def test_existing_dimension_kept(self):
+        opt = make_optimizer()
+        raw = {"scenarios": [], "evals": [{"id": 1, "dimension": "clarity"}]}
+        with patch.object(opt, "_ask_json", new=AsyncMock(return_value=raw)):
+            result = await opt.analyze_skill({"SKILL.md": "# S"})
+        self.assertEqual(result["evals"][0]["dimension"], "clarity")
+
+    async def test_prompt_instructs_dimension_field(self):
+        opt = make_optimizer()
+        captured = {}
+
+        async def fake_ask(agent, prompt):
+            captured["prompt"] = prompt
+            return {"scenarios": [], "evals": []}
+
+        with patch.object(opt, "_ask_json", new=fake_ask):
+            await opt.analyze_skill({"SKILL.md": "# S"})
+        self.assertIn("dimension", captured["prompt"])
+
+
+class TestRuleBasedScoring(unittest.IsolatedAsyncioTestCase):
+    """P1: check_type evals are judged by Python rules, not the LLM."""
+
+    def test_keyword_rule(self):
+        self.assertEqual(
+            SkillOptimizer._rule_check({"check_type": "keyword", "keywords": ["TODO", "abc"]}, "has TODO and abc"),
+            (True, "keyword:ok"),
+        )
+        self.assertEqual(
+            SkillOptimizer._rule_check({"check_type": "keyword", "keywords": ["xyz"]}, "has TODO"),
+            (False, "keyword:missing"),
+        )
+
+    def test_regex_rule(self):
+        self.assertEqual(
+            SkillOptimizer._rule_check(
+                {"check_type": "regex", "pattern": r"[Vv]ersion\s+\d+\.\d+", "flags": "i"},
+                "Version 1.2 here",
+            ),
+            (True, "regex:match"),
+        )
+        self.assertEqual(
+            SkillOptimizer._rule_check({"check_type": "regex", "pattern": r"^\d+$"}, "abc"),
+            (False, "regex:no_match"),
+        )
+        # 非法正则保守判失败，不抛异常。
+        self.assertEqual(
+            SkillOptimizer._rule_check({"check_type": "regex", "pattern": "("}, "x"),
+            (False, "regex:no_match"),
+        )
+
+    def test_yaml_or_json_rule(self):
+        self.assertEqual(
+            SkillOptimizer._rule_check({"check_type": "yaml_or_json", "required_key": "name"}, '{"name": "x"}'),
+            (True, "format:valid"),
+        )
+        self.assertEqual(
+            SkillOptimizer._rule_check({"check_type": "yaml_or_json", "required_key": "name"}, "not json"),
+            (False, "format:invalid"),
+        )
+
+    def test_length_rule(self):
+        self.assertEqual(
+            SkillOptimizer._rule_check({"check_type": "length", "min_length": 3, "max_length": 5}, "abcd"),
+            (True, "length:4"),
+        )
+        self.assertEqual(
+            SkillOptimizer._rule_check({"check_type": "length", "min_length": 10}, "abcd"),
+            (False, "length:4"),
+        )
+
+    def test_unknown_check_type_is_conservative(self):
+        self.assertEqual(
+            SkillOptimizer._rule_check({"check_type": "bogus"}, "x"),
+            (False, "unknown_check_type:bogus"),
+        )
+
+    async def test_score_skill_mixes_rule_and_llm_evals(self):
+        opt = make_optimizer()
+        evals = [
+            {"id": 1, "check_type": "keyword", "keywords": ["TODO"], "dimension": "correctness"},
+            {"id": 2, "question": "q2", "dimension": "clarity"},
+        ]
+        scenarios = [{"id": 1, "input": "x"}]
+        # 分别 mock 执行与打分：规则型 eval 不进 LLM 打分调用。
+        with (
+            patch.object(opt, "_ask", new=AsyncMock(return_value="output has TODO")),
+            patch.object(opt, "_ask_json", new=AsyncMock(return_value={
+                "results": [{"eval_id": 2, "passed": True}],
+            })) as mock_json,
+        ):
+            result = await opt._score_skill("# S", scenarios, evals)
+        self.assertEqual(result["passed"], 2)  # 规则型 1 + LLM 型 1
+        self.assertEqual(result["total"], 2)
+        # 规则型的 reason 是机器文本，Analyst 也能读到。
+        rule_detail = [d for d in result["details"] if d["eval_id"] == 1][0]
+        self.assertEqual(rule_detail["reason"], "keyword:ok")
+        # LLM 打分调用只收到 LLM 型 eval（规则型不占调用）。
+        prompt = mock_json.call_args[0][1]
+        self.assertIn('"id": 2', prompt)
+        self.assertNotIn("check_type", prompt)  # 规则型 eval 不出现在 Criteria 里
+
+    async def test_no_check_type_keeps_old_call_sequence(self):
+        opt = make_optimizer()
+        evals = [
+            {"id": 1, "question": "q1", "dimension": "correctness"},
+            {"id": 2, "question": "q2", "dimension": "clarity"},
+        ]
+        scenarios = [{"id": 1, "input": "x"}]
+        agent = FakeAgent([
+            [{"role": "assistant", "content": "some output"}],
+            [{"role": "assistant", "content": json.dumps({"results": [
+                {"eval_id": 1, "passed": True},
+                {"eval_id": 2, "passed": False},
+            ]})}],
+        ])
+        result = await opt._score_skill("# S", scenarios, evals, agent=agent)
+        # 与旧行为一致：全走 LLM 打分，passed 来自 FakeAgent 返回的完整结果。
+        self.assertEqual(result["passed"], 1)
+        self.assertEqual(result["total"], 2)
+
+
+class TestNoiseFloor(unittest.IsolatedAsyncioTestCase):
+    """P1: noise_floor raises the bar beyond plain strict improvement."""
+
+    async def test_noise_floor_blocks_small_gain(self):
+        opt = make_optimizer()
+        opt.noise_floor = 20.0
+        baseline = {"passed": 4, "total": 8, "per_eval": [], "details": []}       # 50%
+        improved = {"passed": 5, "total": 8, "per_eval": [], "details": []}       # 62.5%，提升 12.5 < 20
+        analysis = {"diagnosis": "d", "mutation_strategy": "add_example",
+                    "target_section": "s", "suggested_change": "c"}
+        mutation = {"description": "m", "reasoning": "r", "new_skill_md": "# New"}
+        with (
+            patch.object(opt, "_score_skill", new=AsyncMock(side_effect=[baseline, improved])),
+            patch.object(opt, "_analyze_failures", new=AsyncMock(return_value=analysis)),
+            patch.object(opt, "_mutate_skill", new=AsyncMock(return_value=mutation)),
+        ):
+            result = await opt.optimize({"SKILL.md": "# S"}, [], [], max_rounds=1)
+        self.assertFalse(any(m.get("kept") for m in result["mutation_log"]))
+
+    async def test_noise_floor_allows_big_gain(self):
+        opt = make_optimizer()
+        opt.noise_floor = 10.0
+        baseline = {"passed": 4, "total": 8, "per_eval": [], "details": []}       # 50%
+        improved = {"passed": 6, "total": 8, "per_eval": [], "details": []}       # 75%，提升 25 > 10
+        analysis = {"diagnosis": "d", "mutation_strategy": "add_example",
+                    "target_section": "s", "suggested_change": "c"}
+        mutation = {"description": "m", "reasoning": "r", "new_skill_md": "# New"}
+        with (
+            patch.object(opt, "_score_skill", new=AsyncMock(side_effect=[baseline, improved])),
+            patch.object(opt, "_analyze_failures", new=AsyncMock(return_value=analysis)),
+            patch.object(opt, "_mutate_skill", new=AsyncMock(return_value=mutation)),
+        ):
+            result = await opt.optimize({"SKILL.md": "# S"}, [], [], max_rounds=1)
+        self.assertTrue(any(m.get("kept") for m in result["mutation_log"]))
+
+
+class TestEditLimit(unittest.IsolatedAsyncioTestCase):
+    """P1: edit_limit rejects oversized single mutations before re-scoring."""
+
+    async def test_oversized_edit_rejected_before_rescore(self):
+        opt = make_optimizer()
+        opt.edit_limit = 0.5
+        current_md = "# S\n" + "a" * 100
+        big_md = current_md + "b" * 100  # 变化 ~99% > 50%
+        baseline = {"passed": 2, "total": 4, "per_eval": [], "details": []}
+        analysis = {"diagnosis": "d", "mutation_strategy": "add_example",
+                    "target_section": "s", "suggested_change": "c"}
+        mutation = {"description": "m", "reasoning": "r", "new_skill_md": big_md}
+        with (
+            patch.object(opt, "_score_skill", new=AsyncMock(side_effect=[baseline])) as mock_score,
+            patch.object(opt, "_analyze_failures", new=AsyncMock(return_value=analysis)),
+            patch.object(opt, "_mutate_skill", new=AsyncMock(return_value=mutation)),
+        ):
+            result = await opt.optimize({"SKILL.md": current_md}, [], [], max_rounds=1)
+        log = result["mutation_log"]
+        self.assertEqual(log[0]["reason"], "edit_limit_exceeded")
+        self.assertFalse(log[0]["kept"])
+        # 只评了基线，候选被拒后没有复评（省 token）。
+        self.assertEqual(mock_score.await_count, 1)
+
+    async def test_modest_edit_passes_when_limit_roomy(self):
+        opt = make_optimizer()
+        opt.edit_limit = 2.0
+        current_md = "# S\n" + "a" * 100
+        modest_md = current_md + "b" * 50  # 变化 ~50% < 200%
+        baseline = {"passed": 2, "total": 4, "per_eval": [], "details": []}
+        improved = {"passed": 3, "total": 4, "per_eval": [], "details": []}
+        analysis = {"diagnosis": "d", "mutation_strategy": "add_example",
+                    "target_section": "s", "suggested_change": "c"}
+        mutation = {"description": "m", "reasoning": "r", "new_skill_md": modest_md}
+        with (
+            patch.object(opt, "_score_skill", new=AsyncMock(side_effect=[baseline, improved])),
+            patch.object(opt, "_analyze_failures", new=AsyncMock(return_value=analysis)),
+            patch.object(opt, "_mutate_skill", new=AsyncMock(return_value=mutation)),
+        ):
+            result = await opt.optimize({"SKILL.md": current_md}, [], [], max_rounds=1)
+        self.assertTrue(any(m.get("kept") for m in result["mutation_log"]))
+
+
+class TestRoundMemoryAndBlacklist(unittest.IsolatedAsyncioTestCase):
+    """P2: round memory + strategy blacklist + rejected-edit buffer injection."""
+
+    async def test_analyze_injects_memory_blacklist_and_rejected_edits(self):
+        opt = make_optimizer()
+        captured = {}
+
+        async def fake_ask(agent, prompt, **kwargs):
+            captured["prompt"] = prompt
+            return {"diagnosis": "d", "mutation_strategy": "add_example",
+                    "target_section": "s", "suggested_change": "c"}
+
+        details = [{"eval_id": 1, "passed": False, "scenario_id": 1}]
+        round_memory = [{
+            "round": 1, "strategy": "add_example", "diagnosis": "x", "target": "s",
+            "outcome": "discarded", "score_before": 50.0, "score_after": 50.0, "reason": "not_best",
+        }]
+        mutation_log = [
+            {"strategy_type": "add_example", "kept": False, "reason": "not_best",
+             "description": "add an example about dates"},
+            {"strategy_type": "add_example", "kept": False, "reason": "regression:content_shrunk",
+             "description": "shrink"},
+        ]
+        with patch.object(opt, "_ask_json", new=fake_ask):
+            await opt._analyze_failures(
+                "# S", [], [], details,
+                round_memory=round_memory, mutation_log=mutation_log,
+            )
+        p = captured["prompt"]
+        self.assertIn("Recent attempts (previous rounds)", p)
+        self.assertIn("(blocked: tried without improvement)", p)
+        self.assertIn("Avoid repeating these rejected edits", p)
+        self.assertIn("original purpose", p)
+
+    async def test_optimize_injects_round_memory_across_rounds(self):
+        opt = make_optimizer()
+        baseline = {"passed": 2, "total": 4, "per_eval": [], "details": []}
+        improved = {"passed": 3, "total": 4, "per_eval": [], "details": []}
+        analysis = {"diagnosis": "d", "mutation_strategy": "add_example",
+                    "target_section": "s", "suggested_change": "c"}
+        mutation = {"description": "m", "reasoning": "r", "new_skill_md": "# New"}
+        captured = []
+
+        async def fake_analyze(skill_md, scenarios, evals, details, strategy_pool=None,
+                               round_memory=None, mutation_log=None, lessons=None):
+            # 快照拷贝：避免后续轮次 append 改动影响已捕获的引用。
+            captured.append({
+                "round_memory": list(round_memory or []),
+                "mutation_log": list(mutation_log or []),
+            })
+            return analysis
+
+        with (
+            patch.object(opt, "_score_skill", new=AsyncMock(side_effect=[baseline, improved, improved])),
+            patch.object(opt, "_analyze_failures", new=fake_analyze),
+            patch.object(opt, "_mutate_skill", new=AsyncMock(return_value=mutation)),
+        ):
+            await opt.optimize({"SKILL.md": "# S"}, [], [], max_rounds=2)
+        # 第 1 轮无记忆；第 2 轮携带第 1 轮的记录。
+        self.assertEqual(len(captured[0]["round_memory"]), 0)
+        self.assertEqual(len(captured[1]["round_memory"]), 1)
+        self.assertEqual(captured[1]["round_memory"][0]["round"], 1)
+        self.assertIn("add_example", captured[1]["round_memory"][0]["strategy"])
+
+
+class TestRegressionTooLarge(unittest.TestCase):
+    """P2: oversized SKILL.md is rejected by the regression guard."""
+
+    def test_oversized_md_rejected(self):
+        ok, reason = SkillOptimizer._regression_check("# S", "# S\n" + "x" * 16000)
+        self.assertFalse(ok)
+        self.assertEqual(reason, "regression:too_large")
+
+    def test_normal_sized_md_passes(self):
+        ok, reason = SkillOptimizer._regression_check("# S", "# S\n" + "x" * 100)
+        self.assertTrue(ok)
+
+
+class TestPatienceEarlyStop(unittest.IsolatedAsyncioTestCase):
+    """P3: patience stops the loop after N consecutive non-improving rounds."""
+
+    async def test_patience_stops_after_stagnant_rounds(self):
+        opt = make_optimizer()
+        opt.patience = 2
+        baseline = {"passed": 2, "total": 4, "per_eval": [], "details": []}   # 50%
+        same = {"passed": 2, "total": 4, "per_eval": [], "details": []}       # 50%
+        analysis = {"diagnosis": "d", "mutation_strategy": "add_example",
+                    "target_section": "s", "suggested_change": "c"}
+        mutation = {"description": "m", "reasoning": "r", "new_skill_md": "# Same"}
+        with (
+            patch.object(opt, "_score_skill", new=AsyncMock(side_effect=[baseline, same, same])) as mock_score,
+            patch.object(opt, "_analyze_failures", new=AsyncMock(return_value=analysis)),
+            patch.object(opt, "_mutate_skill", new=AsyncMock(return_value=mutation)),
+        ):
+            result = await opt.optimize({"SKILL.md": "# S"}, [], [], max_rounds=5)
+        # 连续 2 轮未提升后停：基线 + 2 轮复评。
+        self.assertEqual(mock_score.await_count, 3)
+        self.assertEqual(len(result["score_history"]), 3)
+
+    async def test_patience_zero_keeps_old_behavior(self):
+        opt = make_optimizer()
+        opt.patience = 0  # 默认关闭
+        baseline = {"passed": 2, "total": 4, "per_eval": [], "details": []}
+        same = {"passed": 2, "total": 4, "per_eval": [], "details": []}
+        analysis = {"diagnosis": "d", "mutation_strategy": "add_example",
+                    "target_section": "s", "suggested_change": "c"}
+        mutation = {"description": "m", "reasoning": "r", "new_skill_md": "# Same"}
+        with (
+            patch.object(opt, "_score_skill", new=AsyncMock(side_effect=[baseline, same, same, same])) as mock_score,
+            patch.object(opt, "_analyze_failures", new=AsyncMock(return_value=analysis)),
+            patch.object(opt, "_mutate_skill", new=AsyncMock(return_value=mutation)),
+        ):
+            result = await opt.optimize({"SKILL.md": "# S"}, [], [], max_rounds=3)
+        # 3 轮全跑：基线 + 3 轮复评。
+        self.assertEqual(mock_score.await_count, 4)
+
+
+class TestSaturationExit(unittest.IsolatedAsyncioTestCase):
+    """P3: saturation pre-flight skips all rounds with no headroom."""
+
+    async def test_zero_score_all_failed_skips_rounds(self):
+        opt = make_optimizer()
+        opt.saturation_exit = True
+        baseline = {"passed": 0, "total": 4, "per_eval": [], "details": []}   # 0%，全失败
+        with (
+            patch.object(opt, "_score_skill", new=AsyncMock(return_value=baseline)) as mock_score,
+        ):
+            result = await opt.optimize({"SKILL.md": "# S"}, [], [], max_rounds=5)
+        self.assertEqual(mock_score.await_count, 1)  # 只评基线，零轮
+        self.assertEqual(result["final_score"], 0.0)
+
+    async def test_saturation_off_runs_rounds(self):
+        opt = make_optimizer()
+        baseline = {"passed": 0, "total": 4, "per_eval": [], "details": []}
+        same = {"passed": 0, "total": 4, "per_eval": [], "details": []}
+        analysis = {"diagnosis": "d", "mutation_strategy": "add_example",
+                    "target_section": "s", "suggested_change": "c"}
+        mutation = {"description": "m", "reasoning": "r", "new_skill_md": "# Same"}
+        with (
+            patch.object(opt, "_score_skill", new=AsyncMock(side_effect=[baseline, same])) as mock_score,
+            patch.object(opt, "_analyze_failures", new=AsyncMock(return_value=analysis)),
+            patch.object(opt, "_mutate_skill", new=AsyncMock(return_value=mutation)),
+        ):
+            result = await opt.optimize({"SKILL.md": "# S"}, [], [], max_rounds=1)
+        self.assertEqual(mock_score.await_count, 2)  # 默认关闭：正常跑 1 轮
+
+
+class TestFinalConfirm(unittest.IsolatedAsyncioTestCase):
+    """P3: final confirm re-scores the winner and rolls back on luck."""
+
+    async def test_confirm_low_rolls_back_to_original(self):
+        opt = make_optimizer()
+        opt.final_confirm = True
+        baseline = {"passed": 2, "total": 4, "per_eval": [], "details": []}   # 50%
+        improved = {"passed": 3, "total": 4, "per_eval": [], "details": []}   # 75%
+        confirm_low = {"passed": 2, "total": 4, "per_eval": [], "details": []}  # 50% 复核不达标
+        analysis = {"diagnosis": "d", "mutation_strategy": "add_example",
+                    "target_section": "s", "suggested_change": "c"}
+        mutation = {"description": "m", "reasoning": "r", "new_skill_md": "# New"}
+        with (
+            patch.object(opt, "_score_skill", new=AsyncMock(side_effect=[baseline, improved, confirm_low])),
+            patch.object(opt, "_analyze_failures", new=AsyncMock(return_value=analysis)),
+            patch.object(opt, "_mutate_skill", new=AsyncMock(return_value=mutation)),
+        ):
+            result = await opt.optimize({"SKILL.md": "# S"}, [], [], max_rounds=1)
+        self.assertEqual(result["improved_skill_md"], "# S")  # 回退为原始
+        self.assertEqual(result["final_score"], 50.0)
+
+    async def test_confirm_ok_keeps_improvement(self):
+        opt = make_optimizer()
+        opt.final_confirm = True
+        baseline = {"passed": 2, "total": 4, "per_eval": [], "details": []}
+        improved = {"passed": 3, "total": 4, "per_eval": [], "details": []}
+        confirm_ok = {"passed": 3, "total": 4, "per_eval": [], "details": []}  # 75% 复核达标
+        analysis = {"diagnosis": "d", "mutation_strategy": "add_example",
+                    "target_section": "s", "suggested_change": "c"}
+        mutation = {"description": "m", "reasoning": "r", "new_skill_md": "# New"}
+        with (
+            patch.object(opt, "_score_skill", new=AsyncMock(side_effect=[baseline, improved, confirm_ok])),
+            patch.object(opt, "_analyze_failures", new=AsyncMock(return_value=analysis)),
+            patch.object(opt, "_mutate_skill", new=AsyncMock(return_value=mutation)),
+        ):
+            result = await opt.optimize({"SKILL.md": "# S"}, [], [], max_rounds=1)
+        self.assertEqual(result["improved_skill_md"], "# New")
+        self.assertEqual(result["final_score"], 75.0)
+
+
+class TestLessonStore(unittest.IsolatedAsyncioTestCase):
+    """P4: cross-session lesson store persists kept fixes as jsonl."""
+
+    def test_append_and_load_roundtrip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "lessons.jsonl")
+            SkillOptimizer._append_lesson(path, {"strategy": "add_example", "summary": "s1"})
+            SkillOptimizer._append_lesson(path, {"strategy": "add_constraint", "summary": "s2"})
+            lessons = SkillOptimizer._load_lessons(path)
+        self.assertEqual(len(lessons), 2)
+        self.assertEqual(lessons[0]["strategy"], "add_example")
+        self.assertEqual(lessons[1]["summary"], "s2")
+
+    def test_load_limited_to_recent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "lessons.jsonl")
+            for i in range(7):
+                SkillOptimizer._append_lesson(path, {"i": i})
+            lessons = SkillOptimizer._load_lessons(path, limit=5)
+        self.assertEqual([l["i"] for l in lessons], [2, 3, 4, 5, 6])
+
+    def test_truncate_at_1000_lines(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "lessons.jsonl")
+            for i in range(1005):
+                SkillOptimizer._append_lesson(path, {"i": i})
+            with open(path, encoding="utf-8") as f:
+                lines = [l for l in f.read().splitlines() if l.strip()]
+            lessons = SkillOptimizer._load_lessons(path, limit=1000)
+        self.assertEqual(len(lines), 1000)
+        self.assertEqual(lessons[0]["i"], 5)  # 保留最近的 1000 条
+
+    def test_missing_file_returns_empty(self):
+        self.assertEqual(SkillOptimizer._load_lessons("/nonexistent/lessons.jsonl"), [])
+
+    def test_disabled_when_no_path(self):
+        self.assertEqual(SkillOptimizer._load_lessons(None), [])
+        SkillOptimizer._append_lesson(None, {"strategy": "x"})  # 不抛异常
+
+    async def test_analyze_injects_lessons(self):
+        opt = make_optimizer()
+        captured = {}
+
+        async def fake_ask(agent, prompt, **kwargs):
+            captured["prompt"] = prompt
+            return {"diagnosis": "d", "mutation_strategy": "add_example",
+                    "target_section": "s", "suggested_change": "c"}
+
+        details = [{"eval_id": 1, "passed": False, "scenario_id": 1}]
+        lessons = [{"strategy": "add_example", "summary": "worked before"}]
+        with patch.object(opt, "_ask_json", new=fake_ask):
+            await opt._analyze_failures("# S", [], [], details, lessons=lessons)
+        self.assertIn("Lessons from past successful fixes", captured["prompt"])
+
+    async def test_optimize_persists_kept_fix(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "lessons.jsonl")
+            opt = make_optimizer()
+            opt.lesson_file = path
+            baseline = {"passed": 2, "total": 4, "per_eval": [], "details": []}
+            improved = {"passed": 3, "total": 4, "per_eval": [], "details": []}
+            analysis = {"diagnosis": "d", "mutation_strategy": "add_example",
+                        "target_section": "s", "suggested_change": "c"}
+            mutation = {"description": "m", "reasoning": "r", "new_skill_md": "# New"}
+            with (
+                patch.object(opt, "_score_skill", new=AsyncMock(side_effect=[baseline, improved])),
+                patch.object(opt, "_analyze_failures", new=AsyncMock(return_value=analysis)),
+                patch.object(opt, "_mutate_skill", new=AsyncMock(return_value=mutation)),
+            ):
+                await opt.optimize({"SKILL.md": "# S"}, [], [], max_rounds=1)
+            lessons = SkillOptimizer._load_lessons(path)
+        self.assertEqual(len(lessons), 1)
+        self.assertEqual(lessons[0]["strategy"], "add_example")
+        self.assertEqual(lessons[0]["score_after"], 75.0)
+        self.assertNotIn("skill_md", lessons[0])  # 只记模型生成内容
+
+
+class TestLessonStoreSqlite(unittest.IsolatedAsyncioTestCase):
+    """RAG: SQLite-backed lesson store (embedding BLOB, 1000 cap)."""
+
+    def test_sqlite_append_load_roundtrip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "lessons.db")
+            SkillOptimizer._append_lesson(path, {
+                "skill_name": "writer", "strategy": "add_example",
+                "summary": "s1", "score_before": 50.0, "score_after": 75.0,
+                "created_at": "2026-08-07T14:00:00",
+            })
+            SkillOptimizer._append_lesson(path, {
+                "skill_name": "coder", "strategy": "add_constraint", "summary": "s2",
+            })
+            lessons = SkillOptimizer._load_lessons(path)
+        self.assertEqual(len(lessons), 2)
+        self.assertEqual(lessons[0]["skill_name"], "writer")
+        self.assertEqual(lessons[0]["score_after"], 75.0)
+        self.assertEqual(lessons[1]["skill_name"], "coder")
+
+    def test_sqlite_embedding_blob_roundtrip(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "lessons.db")
+            SkillOptimizer._append_lesson(path, {
+                "strategy": "a", "summary": "x",
+                "embedding": [1.0, 0.0, 0.0],
+            })
+            lessons = SkillOptimizer._load_lessons(path)
+        import numpy as np
+        emb = lessons[0]["embedding"]
+        self.assertIsNotNone(emb)
+        self.assertEqual(np.asarray(emb, dtype=np.float32).shape, (3,))
+
+    def test_sqlite_truncate_at_1000(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "lessons.db")
+            for i in range(1005):
+                SkillOptimizer._append_lesson(path, {"strategy": str(i)})
+            lessons = SkillOptimizer._load_lessons(path, limit=1000)
+        self.assertEqual(len(lessons), 1000)
+        self.assertEqual(lessons[0]["strategy"], "5")  # 保留最近的 1000 条
+
+    def test_jsonl_extension_still_used(self):
+        # 无 .db 后缀 → 走 jsonl 兼容路径。
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "lessons.jsonl")
+            SkillOptimizer._append_lesson(path, {"strategy": "a"})
+            lessons = SkillOptimizer._load_lessons(path)
+        self.assertEqual(len(lessons), 1)
+        self.assertEqual(lessons[0]["strategy"], "a")
+
+    async def test_lazy_embedding_persisted_back_to_sqlite(self):
+        # semantic 首次检索惰性算 embedding 后应写回 DB，跨会话复用。
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "lessons.db")
+            SkillOptimizer._append_lesson(path, {"strategy": "a", "summary": "add example"})
+            opt = make_optimizer()
+            opt.lesson_file = path
+            opt.lesson_retrieval = "semantic"
+            with patch.object(opt, "_embed", new=AsyncMock(return_value=[1.0, 0.0, 0.0])):
+                lessons = await opt._prepare_lessons(
+                    "---\nname: writer\n---", [], [], [],
+                )
+            self.assertEqual(lessons[0]["strategy"], "a")
+            self.assertNotIn("_id", lessons[0])  # 内部 id 不进入注入内容
+            # 重新加载：embedding 已持久化（不再需要惰性计算）。
+            reloaded = SkillOptimizer._load_lessons(path)
+        self.assertIsNotNone(reloaded[0].get("embedding"))
+
+
+class TestRetrievalModes(unittest.IsolatedAsyncioTestCase):
+    """RAG: LESSON_RETRIEVAL off/tag/semantic/hybrid + degradation chain."""
+
+    def test_invalid_mode_falls_back_to_off(self):
+        opt = make_optimizer(lesson_retrieval="bogus")
+        self.assertEqual(opt.lesson_retrieval, "off")
+
+    def test_skill_name_extracted_from_frontmatter(self):
+        md = "---\nname: my-skill\ndescription: x\n---\n# Title"
+        self.assertEqual(SkillOptimizer._skill_name_from_md(md), "my-skill")
+        self.assertEqual(SkillOptimizer._skill_name_from_md("# no frontmatter"), "")
+
+    async def test_off_mode_returns_recent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "lessons.jsonl")
+            for i in range(3):
+                SkillOptimizer._append_lesson(path, {"i": i})
+            opt = make_optimizer()
+            opt.lesson_file = path
+            opt.lesson_retrieval = "off"
+            with patch.dict(os.environ, {"LESSON_N": "2"}, clear=False):
+                lessons = await opt._prepare_lessons("# S", [], [], [])
+        self.assertEqual([l["i"] for l in lessons], [1, 2])  # 最近 2 条（旧行为）
+
+    async def test_tag_mode_prefers_same_skill_then_generic(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "lessons.db")
+            SkillOptimizer._append_lesson(path, {"skill_name": "writer", "summary": "w1"})
+            SkillOptimizer._append_lesson(path, {"skill_name": "coder", "summary": "c2"})
+            SkillOptimizer._append_lesson(path, {"summary": "g3"})  # 通用（无绑定）
+            opt = make_optimizer()
+            opt.lesson_file = path
+            opt.lesson_retrieval = "tag"
+            lessons = await opt._prepare_lessons("---\nname: writer\n---", [], [], [])
+        self.assertEqual([l["summary"] for l in lessons], ["w1", "g3"])  # 同技能优先 + 通用兜底
+
+    async def test_semantic_topk_with_threshold(self):
+        opt = make_optimizer()
+        opt.lesson_retrieval = "semantic"
+        lessons = [
+            {"strategy": "a", "summary": "x", "embedding": [1.0, 0.0]},
+            {"strategy": "b", "summary": "y", "embedding": [0.0, 1.0]},
+        ]
+        with patch.object(opt, "_embed", new=AsyncMock(return_value=[1.0, 0.0])):
+            top = await opt._retrieve_lessons(lessons, "q", "semantic", 5)
+        # 与 query 余弦=1 的保留；余弦=0 的被 0.3 阈值滤掉。
+        self.assertEqual([l["strategy"] for l in top], ["a"])
+
+    async def test_semantic_degrades_to_tag_on_embed_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "lessons.db")
+            SkillOptimizer._append_lesson(path, {"skill_name": "writer", "summary": "w1"})
+            SkillOptimizer._append_lesson(path, {"summary": "g2"})
+            opt = make_optimizer()
+            opt.lesson_file = path
+            opt.lesson_retrieval = "semantic"
+            with patch.object(opt, "_embed", new=AsyncMock(side_effect=RuntimeError("no key"))):
+                lessons = await opt._prepare_lessons("---\nname: writer\n---", [], [], [])
+        self.assertEqual([l["summary"] for l in lessons], ["w1", "g2"])  # 降级到 tag
+
+    async def test_hybrid_uses_rrf_fusion(self):
+        opt = make_optimizer()
+        opt.lesson_retrieval = "hybrid"
+        lessons = [
+            {"strategy": "a", "summary": "add example", "embedding": [1.0, 0.0]},
+            {"strategy": "b", "summary": "other thing", "embedding": [0.0, 1.0]},
+        ]
+        # query 与 a 语义相近（dense 排 a 第一），但词面更贴近 b（sparse 排 b 第一）。
+        with patch.object(opt, "_embed", new=AsyncMock(side_effect=[[1.0, 0.0], [1.0, 0.0], [0.0, 1.0]])):
+            top = await opt._retrieve_lessons(lessons, "other thing", "hybrid", 5)
+        self.assertEqual(len(top), 2)  # RRF 融合两者都在
+
 
 
 class TestStopRequested(unittest.IsolatedAsyncioTestCase):

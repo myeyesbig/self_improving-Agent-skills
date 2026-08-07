@@ -1,0 +1,93 @@
+%% ============================================================
+%% SkillForge 端到端流程图
+%% 覆盖：四步向导主流程 + 后端校验 + 三Agent优化循环 + 条件分支
+%% 维护：改此 .mmd 后重新渲染即可（mermaid.ink 或 mermaid CLI）
+%% ============================================================
+flowchart TD
+    S([开始]) --> U1[打开前端页面 localhost:3000]
+
+    subgraph STEP1 [第一步：上传技能 Upload]
+        U1 --> U2{选择上传方式}
+        U2 -->|拖拽/选择 .zip| U3[上传 zip]
+        U2 -->|选择文件夹| U4[上传文件夹]
+        U2 -->|点击示例技能| U5[GET /api/examples<br/>列出 skill-examples/*.zip]
+        U5 --> U6["POST /api/examples/{name}/load"]
+        U3 --> V1{后端校验<br/>大小≤10MB / 单文件≤1MB<br/>扩展名白名单 / 路径穿越}
+        U4 --> V1
+        V1 -->|不通过| E1[返回 4xx 错误<br/>前端 alert 提示]
+        V1 -->|通过| V2[解析 SKILL.md frontmatter<br/>创建 session_id<br/>存入内存 sessions]
+        U6 --> V2
+        E1 --> S
+    end
+
+    subgraph STEP2 [第二步：配置 Configure]
+        V2 --> K1[输入 DashScope API Key<br/>仅存组件内存]
+        K1 --> A1[POST /api/analyze<br/>携带 qwen_api_key]
+        A1 --> A2{Executor 分析技能}
+        A2 --> A3[生成 3-4 个测试场景<br/>生成 4-6 条评估标准]
+        A3 --> C1[展示 scenarios / evals]
+        C1 --> C2{用户操作}
+        C2 -->|编辑/勾选/增删| C3[修改配置]
+        C2 -->|重新生成| C4[POST /api/regenerate]
+        C4 --> A2
+        C3 --> C5[POST /api/update-config<br/>保存勾选结果]
+        C5 --> C6{已选场景与标准<br/>都不为空?}
+        C6 -->|否| C1
+        C6 -->|是| D1
+    end
+
+    subgraph STEP3 [第三步：运行优化 Optimize]
+        D1([进入优化页]) --> D2["POST /api/start/{session_id}<br/>max_rounds + 可选优化旋钮"]
+        D2 --> D3{会话已配置?<br/>状态非 running?}
+        D3 -->|否| E2[返回 400 错误]
+        E2 --> D1
+        D3 -->|是| D4[创建后台任务<br/>asyncio.create_task]
+        D4 --> D5["前端每 3 秒轮询<br/>GET /api/status/{session_id}"]
+        D5 --> D6{状态=complete?}
+        D5 --> D7{状态=error?}
+        D5 --> D8{状态=stopped?}
+        D6 -->|是| R1
+        D7 -->|是| E3[alert 错误信息]
+        E3 --> D1
+        D8 -->|是| D9[静默退出]
+        D9 --> S
+        D6 -->|否| D5
+        D7 -->|否| D5
+        D8 -->|否| D5
+    end
+
+    subgraph LOOP ["三 Agent 优化循环 optimize()"]
+        D4 --> L1["Executor 执行基线评分<br/>baseline_pct"]
+        L1 --> L2{baseline ≥ 100%?}
+        L2 -->|是| R1
+        L2 -->|否| L3[Analyst 诊断失败项<br/>从策略池选择 mutation_strategy]
+        L3 --> L4{并行变异开启?<br/>parallel_mutations > 1}
+        L4 -->|否| L5[Mutator 单候选<br/>恰好一处修改]
+        L4 -->|是| L6[asyncio.gather 并行<br/>N 个候选 × 独立 Assistant]
+        L5 --> L7[回归守卫检查<br/>frontmatter/标题/体积]
+        L6 --> L7
+        L7 -->|命中拒绝| L8[跳过复评<br/>标记 regression 原因]
+        L7 -->|通过| L9[Executor 并行复评<br/>逐场景打分]
+        L9 --> L10["计算 weighted_pct<br/>维度加权 / 通过率"]
+        L8 --> L11[选出最优候选<br/>best score]
+        L10 --> L11
+        L11 --> L12{best > baseline + 阈值?}
+        L12 -->|否| L13[全部丢弃<br/>记 mutation_log]
+        L12 -->|是| L14[保留最优候选<br/>更新 current_md 与基线]
+        L13 --> L15{轮数 < max_rounds<br/>且未达 100%?}
+        L14 --> L15
+        L15 -->|是| L2
+        L15 -->|否| L16[推送 complete 事件<br/>写入 final_result]
+        L13 --> D6
+        L14 --> D6
+        L16 --> R1
+    end
+
+    subgraph STEP4 [第四步：结果 Results]
+        R1([展示结果]) --> R2[Baseline vs Final 分数<br/>Top Changes + 策略徽章<br/>逐维度得分趋势]
+        R2 --> R3["GET /api/download/{session_id}<br/>下载 improved_skill.zip<br/>含 CHANGELOG.json"]
+        R3 --> R4{继续使用?}
+        R4 -->|否| E([结束])
+        R4 -->|是| R5[重新开始<br/>清空状态回第一步]
+        R5 --> U1
+    end

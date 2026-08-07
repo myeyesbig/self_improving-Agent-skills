@@ -46,6 +46,7 @@ Keep provider-specific code inside `backend/qwen_optimizer.py`. Do not spread Qw
 - Prefer the smallest change that satisfies the requested behavior.
 - Do not rewrite the optimization algorithm during provider or branding changes.
 - Do not add tools, RAG, MCP, databases, queues, authentication, or deployment infrastructure without explicit scope.
+  - **Approved exception (2026-08-07, user-explicit)**: the cross-session lesson store (`SKILL_LESSONS_FILE`) may use a lightweight SQLite DB (`.db`/`.sqlite` path suffix, Python built-in `sqlite3`) and retrieval-augmented selection (`LESSON_RETRIEVAL` = `tag`/`semantic`/`hybrid`) backed by DashScope `text-embedding-v3` / `gte-rerank` (Qwen ecosystem only). Hard constraints: default is `off` (unchanged behavior); only model-generated lesson metadata is persisted (never skill content, scenarios, outputs, or API keys); any embedding/rerank failure silently degrades to tag filtering; scope is limited to the lesson store — no other RAG/DB usage is implied.
 - Keep the existing English UI and documentation unless localization is requested.
 - `next/font/google` is a font import and is allowed; Google AI SDKs and Gemini branding are not.
 - Update README examples whenever an API field, model default, command, or environment variable changes.

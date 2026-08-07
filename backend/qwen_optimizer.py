@@ -21,6 +21,7 @@
 """
 
 import asyncio
+import datetime
 import json
 import os
 import re
@@ -185,6 +186,13 @@ class SkillOptimizer:
         dimension_weights: Optional[Dict[str, float]] = None,
         improvement_threshold: Optional[float] = None,
         regression_check: Optional[bool] = None,
+        noise_floor: Optional[float] = None,
+        edit_limit: Optional[float] = None,
+        patience: Optional[int] = None,
+        saturation_exit: Optional[bool] = None,
+        final_confirm: Optional[bool] = None,
+        lesson_file: Optional[str] = None,
+        lesson_retrieval: Optional[str] = None,
     ):
         # The key is passed directly into the LLM configuration; it is never
         # written to the process environment, stored in sessions, or logged.
@@ -205,6 +213,67 @@ class SkillOptimizer:
             except ValueError:
                 improvement_threshold = 0.0
         self.improvement_threshold = max(0.0, float(improvement_threshold))
+
+        # 【P1 噪声地板】候选提升必须超过"基线 + 阈值 + 噪声地板"才保留，
+        # 防止评分波动被当成真进步；默认 0.0 即保持原"严格高于"语义。
+        # 可用 NOISE_FLOOR 环境变量覆盖。
+        if noise_floor is None:
+            try:
+                noise_floor = float(os.getenv("NOISE_FLOOR", "0.0"))
+            except ValueError:
+                noise_floor = 0.0
+        self.noise_floor = max(0.0, float(noise_floor))
+
+        # 【P1 编辑幅度】单次变异相对原文本的变化比例上限，超过即拒绝，
+        # 防止大改漂移；默认 0.0 表示关闭。可用 EDIT_LIMIT 环境变量覆盖。
+        if edit_limit is None:
+            try:
+                edit_limit = float(os.getenv("EDIT_LIMIT", "0.0"))
+            except ValueError:
+                edit_limit = 0.0
+        self.edit_limit = max(0.0, float(edit_limit))
+
+        # 【P3 耐心早停】连续 N 轮未提升提前终止；默认 0 表示关闭（只保留
+        # 原 100% 早停）。可用 PATIENCE 环境变量覆盖。
+        if patience is None:
+            try:
+                patience = int(os.getenv("PATIENCE", "0"))
+            except ValueError:
+                patience = 0
+        self.patience = max(0, int(patience))
+
+        # 【P3 饱和快速退出】基线无可提升带（100% 或 0 分全失败）时跳过全部
+        # 轮次；默认 0 关闭（100% 的旧早停始终生效）。可用 SATURATION_EXIT。
+        if saturation_exit is None:
+            saturation_exit = os.getenv("SATURATION_EXIT", "0") != "0"
+        self.saturation_exit = saturation_exit
+
+        # 【P3 胜出候选复核】complete 前对最终版本独立再评一次，若复核分未
+        # 超过基线则回退为不采纳（防单点幸运）；默认 0 关闭。FINAL_CONFIRM。
+        if final_confirm is None:
+            final_confirm = os.getenv("FINAL_CONFIRM", "0") != "0"
+        self.final_confirm = final_confirm
+
+        # 【P4 跨会话经验库】SKILL_LESSONS_FILE 指向 jsonl/db 文件路径；不设=
+        # 关闭。保留的修改会被沉淀为经验，下次优化时注入 Analyst/Mutator。
+        if lesson_file is None:
+            lesson_file = os.getenv("SKILL_LESSONS_FILE") or None
+        self.lesson_file = lesson_file
+
+        # 【RAG 检索模式】LESSON_RETRIEVAL：off（默认，最近 N 条旧行为）/
+        # tag（同技能硬过滤）/ semantic（embedding 语义检索）/
+        # hybrid（dense+sparse 混合）。非法值回退 off。
+        if lesson_retrieval is None:
+            lesson_retrieval = os.getenv("LESSON_RETRIEVAL", "off")
+        if lesson_retrieval not in ("off", "tag", "semantic", "hybrid"):
+            lesson_retrieval = "off"
+        self.lesson_retrieval = lesson_retrieval
+
+        # 【安全】仅内存持有 key 引用，用于 embedding/rerank 的 DashScope 调用；
+        # 绝不打印、不落日志、不写环境变量、不序列化进任何返回结构。
+        self._api_key = api_key
+        # 内存 embedding 缓存（同文本不重复调用）。
+        self._embed_cache = {}
 
         # 【C2】维度权重：评分按 eval.dimension 分组后加权；无权重时与旧
         # 通过率完全一致。可用 ANALYST_DIMENSION_WEIGHTS（JSON）环境变量覆盖。
@@ -227,13 +296,17 @@ class SkillOptimizer:
         self.parallelism = max(1, min(int(parallelism), 3))
 
         # 三个助手共用同一份 LLM 配置：模型类型固定为 qwen_dashscope（阿里云
-        # 百炼），关闭思考模式并压低 temperature，让输出更稳定、便于解析。
+        # 百炼），默认关闭思考模式并压低 temperature，让输出更稳定、便于解析。
+        # 【模型兼容】部分模型（如 qwen3.7-max-2026-05-17 日期快照）强制要求
+        # enable_thinking=True，可用 QWEN_ENABLE_THINKING=1 打开；默认 0 保持
+        # 旧行为（关闭）。thinking 输出含 reasoning_content，_extract_text
+        # 只取 content，解析路径不受影响。
         llm_config = {
             "model": self.model,
             "model_type": "qwen_dashscope",
             "api_key": api_key,
             "generate_cfg": {
-                "enable_thinking": False,
+                "enable_thinking": os.getenv("QWEN_ENABLE_THINKING", "0") != "0",
                 "temperature": 0.2,
             },
         }
@@ -393,14 +466,27 @@ class SkillOptimizer:
             f"Generate:\n"
             f"1. 3-4 diverse test scenarios (realistic user inputs)\n"
             f"2. 4-6 binary yes/no evaluation criteria\n\n"
+            f"If a criterion is machine-checkable (keyword presence, exact format, "
+            f"length), set check_type to one of keyword|regex|yaml_or_json|length "
+            f"with its required fields; otherwise omit check_type.\n\n"
             f"Return JSON:\n"
             f'{{"scenarios": [{{"id": 1, "name": "short name", "description": "short name", '
             f'"input": "the user request to test"}}], '
             f'"evals": [{{"id": 1, "name": "what to check", "criterion": "what to check", '
             f'"question": "yes/no question about the output", '
-            f'"pass_condition": "what yes looks like", "fail_condition": "what no looks like"}}]}}'
+            f'"pass_condition": "what yes looks like", "fail_condition": "what no looks like", '
+            f'"dimension": "one of correctness|clarity|executability|maintainability|quality|semantic_preservation"}}]}}'
         )
-        return await self._ask_json(self.executor, prompt)
+        result = await self._ask_json(self.executor, prompt)
+        # 【P0 修复】归一化 evals：模型可能漏填 dimension，代码兜底补
+        # correctness，保证 C2 维度加权评分始终有维度可依（_score_skill 的
+        # .get("dimension", "correctness") 兜底保留，双重保护）。
+        evals = result.get("evals") if isinstance(result, dict) else None
+        if isinstance(evals, list):
+            for e in evals:
+                if isinstance(e, dict) and not e.get("dimension"):
+                    e["dimension"] = "correctness"
+        return result
 
     async def optimize(
         self,
@@ -411,14 +497,16 @@ class SkillOptimizer:
         callback: Optional[Callable] = None,
         parallel_mutations: Optional[int] = None,
         strategy_pool: Optional[List[str]] = None,
+        patience: Optional[int] = None,
     ) -> dict:
         """Run the optimization loop with 3 Qwen-Agent assistants.
 
-        【C2/C3/C4/C5】新增可选参数均为"默认即旧行为"：
+        【C2/C3/C4/C5/P1-P3】新增可选参数均为"默认即旧行为"：
         - parallel_mutations：并行变异数（None → 用构造时的 parallelism）
         - strategy_pool：Analyst 可用策略白名单（None → 环境变量/全量）
+        - patience：耐心早停轮数（None → 用构造时的 PATIENCE，默认 0 关闭）
         核心不变量不变：每个候选只改一处；仅当分数严格高于
-        当前最佳 + improvement_threshold 时才保留。
+        当前最佳 + improvement_threshold（+ noise_floor）时才保留。
         """
 
         # 【主流程】callback 是"事件出口"：每次评估/每轮结束都向它推送事件，
@@ -433,6 +521,8 @@ class SkillOptimizer:
         current_md = skill_md
         score_history = []
         mutation_log = []
+        # 【P2 轮间记忆】每轮结束后追加一条"诊断+结果"，供下一轮 Analyst 参考。
+        round_memory = []
         # 生效的并行数：请求参数优先，否则用构造时的 parallelism（默认 1）。
         n_candidates = parallel_mutations or self.parallelism
         n_candidates = max(1, min(int(n_candidates), 3))
@@ -466,22 +556,43 @@ class SkillOptimizer:
             },
         })
 
+        # 【P4/RAG】按 LESSON_RETRIEVAL 模式准备注入的经验（off/tag/semantic/
+        # hybrid）；依赖基线失败明细构建检索查询，故放在 baseline 之后。
+        lessons = await self._prepare_lessons(skill_md, scenarios, evals, current_details)
+
         # -- Rounds -----------------------------------------------------------
+        # 【P3 饱和快速退出】基线无可提升带（100%，或 0 分且所有评估全失败）
+        # 时跳过全部轮次，避免空耗；默认关闭，开启后与 100% 早停同源。
+        saturated = (
+            self.saturation_exit
+            and (baseline_pct >= 100.0 or (baseline_pct <= 0.0 and baseline.get("total", 0) > 0))
+        )
+        # 【P3 耐心早停】连续 N 轮未提升即终止；0 表示关闭。
+        effective_patience = patience if patience is not None else self.patience
+        no_improve = 0
+
         # 【主流程】循环主体：诊断 → 修改 → 复评 → 决定保留/丢弃，最多 max_rounds 轮。
         for rnd in range(1, max_rounds + 1):
             # 【主流程】进度 100% 提前终止：当前最佳分数已达满分（所有评估
             # 全部通过），后续轮次不可能再提升，立即跳出循环，不再空转消耗
             # token。用 >= 100.0 判定，兼容浮点边界，避免漏判。
-            if baseline_pct >= 100.0:
+            if baseline_pct >= 100.0 or saturated:
+                break
+            # 【P3 耐心早停】连续 effective_patience 轮未提升 → 提前终止。
+            if effective_patience > 0 and no_improve >= effective_patience:
                 break
             self.check_stop()
             await emit({"type": "experiment_start", "data": {"round": rnd}})
 
             # Analyst diagnoses worst failure
             # 第 1 个 Agent（Analyst）：分析当前失败项，给出根因与修改策略。
+            # 【P2/P4】把轮间记忆、被拒编辑历史与跨会话经验一并交给 Analyst。
             analysis = await self._analyze_failures(
                 current_md, scenarios, evals, current_details,
                 strategy_pool=pool,
+                round_memory=round_memory,
+                mutation_log=mutation_log,
+                lessons=lessons,
             )
 
             # 【C3 并行变异】同一次诊断产出 N 个候选：每个槽位用独立的 Mutator
@@ -497,11 +608,12 @@ class SkillOptimizer:
                             STRATEGY_TEMPLATES[pool[i % len(pool)]].get("mutator_hint")
                             if pool else None
                         ),
+                        lessons=lessons,
                     )
                     for i in range(n_candidates)
                 ])
             else:
-                mutations = [await self._mutate_skill(current_md, analysis)]
+                mutations = [await self._mutate_skill(current_md, analysis, lessons=lessons)]
 
             # 【C4 回归守卫】先对每个候选做结构完整性检查，命中即拒绝并跳过
             # 复评（省 token）；随后并行复评通过检查的候选。
@@ -517,6 +629,20 @@ class SkillOptimizer:
                             "description": mutation.get("description", ""),
                             "reasoning": mutation.get("reasoning", ""),
                             "rejected": reason,
+                            "score_after": baseline_pct,
+                        })
+                        continue
+                # 【P1 编辑幅度】开启时单次变异相对原文本变化比例超限即拒绝，
+                # 复用回归拒绝管道（只更严，不改变结构守卫的判定）。
+                if self.edit_limit > 0 and current_md:
+                    change_ratio = abs(len(new_md) - len(current_md)) / max(len(current_md), 1)
+                    if change_ratio > self.edit_limit:
+                        candidates.append({
+                            "candidate_id": i,
+                            "new_md": None,
+                            "description": mutation.get("description", ""),
+                            "reasoning": mutation.get("reasoning", ""),
+                            "rejected": "edit_limit_exceeded",
                             "score_after": baseline_pct,
                         })
                         continue
@@ -549,10 +675,14 @@ class SkillOptimizer:
             scored = [c for c in candidates if c["rejected"] is None and c["new_md"] is not None]
             best = max(scored, key=lambda c: c["score_after"], default=None)
 
-            # 【主流程】保留条件：最优候选的分必须严格高于"当前基线 + 阈值"
-            # （kept = True 才采纳）；等于或低于基线的 mutation 都会被丢弃。
-            # 这是本项目的核心行为不变量，避免模型乱改导致技能退化。
-            kept = best is not None and best["score_after"] > baseline_pct + self.improvement_threshold
+            # 【主流程】保留条件：最优候选的分必须严格高于"当前基线 + 阈值
+            # + 噪声地板"（kept = True 才采纳）；等于或低于基线的 mutation
+            # 都会被丢弃。这是本项目的核心行为不变量，避免模型乱改导致技能
+            # 退化；noise_floor 默认 0.0，仅在显式开启时抬高门槛（更严格）。
+            kept = (
+                best is not None
+                and best["score_after"] > baseline_pct + self.improvement_threshold + self.noise_floor
+            )
             new_pct = best["score_after"] if best else baseline_pct
 
             # 【C3】每个候选各记一条 mutation_log（含 candidate_id / reason）；
@@ -572,10 +702,44 @@ class SkillOptimizer:
                 }
                 mutation_log.append(entry)
 
+            # 【P2 轮间记忆】压缩本轮"诊断+结果"为一条记录，供下一轮 Analyst 参考。
+            if best is not None:
+                outcome = "rejected" if best["rejected"] else ("kept" if kept else "discarded")
+                mem_reason = best["rejected"] or ("best" if kept else "not_best")
+            else:
+                outcome, mem_reason = "discarded", "no_candidate"
+            round_memory.append({
+                "round": rnd,
+                "strategy": analysis.get("mutation_strategy", "unknown"),
+                "diagnosis": (analysis.get("diagnosis") or "")[:200],
+                "target": analysis.get("target_section", ""),
+                "outcome": outcome,
+                "score_before": baseline_pct,
+                "score_after": new_pct,
+                "reason": mem_reason,
+            })
+
             if kept and best is not None:
+                # 【P4】保留的修改沉淀为跨会话经验（只记模型生成内容，不落
+                # skill_md / scenario / output / api_key，安全）。skill_name 供
+                # tag/semantic 检索模式按技能过滤，created_at 记录时间。
+                self._append_lesson(self.lesson_file, {
+                    "skill_name": self._skill_name_from_md(skill_md),
+                    "domain": "",
+                    "skill_description": "",
+                    "strategy": analysis.get("mutation_strategy", "unknown"),
+                    "diagnosis": (analysis.get("diagnosis") or "")[:200],
+                    "summary": (best.get("description") or "")[:200],
+                    "score_before": baseline_pct,
+                    "score_after": best["score_after"],
+                    "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
+                })
                 current_md = best["new_md"]
                 baseline_pct = best["score_after"]
                 current_details = best.get("details", current_details)
+
+            # 【P3 耐心早停】计数连续未提升轮数；保留即清零。
+            no_improve = 0 if kept else no_improve + 1
 
             score_history.append(baseline_pct)
 
@@ -607,6 +771,16 @@ class SkillOptimizer:
             })
 
         # -- Done -------------------------------------------------------------
+        # 【P3 胜出候选复核】开启时对最终版本独立再评一次：若复核分未超过
+        # 基线（含阈值/噪声地板），说明此前的提升可能是单点幸运，回退为原始
+        # 技能（不采纳）。默认关闭。
+        if self.final_confirm and current_md != skill_md:
+            confirm = await self._score_skill(current_md, scenarios, evals)
+            confirm_pct = pct_of(confirm)
+            if confirm_pct <= score_history[0] + self.improvement_threshold + self.noise_floor:
+                current_md = skill_md
+                baseline_pct = score_history[0]
+
         # 【主流程】全部轮次结束，推送 complete 事件并返回汇总结果。
         final_pct = baseline_pct
         await emit({
@@ -666,6 +840,13 @@ class SkillOptimizer:
         # 选择本次评分使用的 Executor 实例（并行时用对应槽位）。
         scorer = agent or self.executor
 
+        # 【P1 规则锚点】把可程序化校验的 eval（带 check_type）与需要 LLM
+        # 语义打分的 eval 分开：规则型用 Python 判定，LLM 型仍走原打分路径。
+        # 全部 eval 都无 check_type 时，llm_evals == evals，调用序列与旧行为
+        # 完全一致（每场景仍 1 次执行 + 1 次打分），旧测试不受影响。
+        rule_evals = [e for e in evals if e.get("check_type")]
+        llm_evals = [e for e in evals if not e.get("check_type")]
+
         for sc in scenarios:
             # Executor runs the skill (free-form text)
             # 【主流程】第一步：让 Executor 模拟执行技能，产出结果（自由文本）。
@@ -674,19 +855,22 @@ class SkillOptimizer:
                 f"Execute this skill:\n\n{skill_md}\n\nUser request:\n{sc['input']}",
             )
             # Executor scores the output (JSON)
-            # 【主流程】第二步：让 Executor 对照 evals 给输出逐条打分（JSON）。
+            # 【主流程】第二步：让 Executor 对照 llm_evals 给输出逐条打分（JSON）。
             # fallback 保证模型不给合法 JSON 时，这一场景按"全部未通过"处理。
-            scoring = await self._ask_json(
-                scorer,
-                (
-                    f"Evaluate this output against the criteria.\n\n"
-                    f"Input: {sc['input']}\n\n"
-                    f"Output: {output}\n\n"
-                    f"Criteria:\n{json.dumps(evals, indent=2)}\n\n"
-                    f'Return JSON: {{"results": [{{"eval_id": 1, "passed": true, "reason": "..."}}]}}'
-                ),
-                fallback={"results": []},
-            )
+            if llm_evals:
+                scoring = await self._ask_json(
+                    scorer,
+                    (
+                        f"Evaluate this output against the criteria.\n\n"
+                        f"Input: {sc['input']}\n\n"
+                        f"Output: {output}\n\n"
+                        f"Criteria:\n{json.dumps(llm_evals, indent=2)}\n\n"
+                        f'Return JSON: {{"results": [{{"eval_id": 1, "passed": true, "reason": "..."}}]}}'
+                    ),
+                    fallback={"results": []},
+                )
+            else:
+                scoring = {"results": []}
             scores = scoring.get("results", []) if isinstance(scoring, dict) else scoring
 
             # 累加每个评估项的通过与总次数，同时保留逐条明细给 Analyst 用。
@@ -706,6 +890,27 @@ class SkillOptimizer:
                         if passed:
                             dim_stats[dim]["passed"] += 1
                 all_results.append({**s, "scenario_id": sc["id"]})
+
+            # 【P1 规则锚点】规则型 eval 用 Python 判定，不进 LLM 打分。
+            for e in rule_evals:
+                passed, reason = self._rule_check(e, output)
+                eid = e["id"]
+                if passed:
+                    total_passed += 1
+                total_checks += 1
+                if eid in per_eval:
+                    per_eval[eid]["total"] += 1
+                    if passed:
+                        per_eval[eid]["passed"] += 1
+                    dim = per_eval[eid]["dimension"]
+                    if dim in dim_stats:
+                        dim_stats[dim]["total"] += 1
+                        if passed:
+                            dim_stats[dim]["passed"] += 1
+                all_results.append({
+                    "eval_id": eid, "passed": passed, "reason": reason,
+                    "scenario_id": sc["id"],
+                })
 
         # 【C2】派生维度分数：按 dimension 分组，保留每个维度的通过率。
         dimension_scores = {
@@ -747,6 +952,49 @@ class SkillOptimizer:
         }
 
     @staticmethod
+    def _rule_check(eval_def: dict, output: str):
+        """【P1 规则锚点】用 Python 规则判定可程序化校验的 eval。
+
+        Returns ``(passed, reason)``。支持 4 种 check_type：
+        keyword（输出须包含全部关键词）/ regex（正则匹配）/
+        yaml_or_json（可解析且含 required_key）/ length（长度区间）。
+        未知或字段缺失的 check_type 按未通过处理（保守）。
+        """
+        ct = eval_def.get("check_type")
+        if ct == "keyword":
+            kws = eval_def.get("keywords") or []
+            passed = all(k in output for k in kws)
+            return passed, ("keyword:ok" if passed else "keyword:missing")
+        if ct == "regex":
+            try:
+                pattern = eval_def.get("pattern") or ""
+                flags = re.IGNORECASE if "i" in (eval_def.get("flags") or "") else 0
+                passed = re.search(pattern, output, flags) is not None
+            except re.error:
+                passed = False
+            return passed, ("regex:match" if passed else "regex:no_match")
+        if ct == "yaml_or_json":
+            parsed = None
+            try:
+                parsed = json.loads(output)
+            except Exception:
+                try:
+                    import yaml
+                    parsed = yaml.safe_load(output)
+                except Exception:
+                    parsed = None
+            key = eval_def.get("required_key")
+            passed = parsed is not None and (key is None or key in parsed)
+            return passed, ("format:valid" if passed else "format:invalid")
+        if ct == "length":
+            lo = eval_def.get("min_length")
+            hi = eval_def.get("max_length")
+            n = len(output)
+            passed = (lo is None or n >= lo) and (hi is None or n <= hi)
+            return passed, f"length:{n}"
+        return False, f"unknown_check_type:{ct}"
+
+    @staticmethod
     def _regression_check(original_md: str, new_md: str):
         """【C4】纯 Python 回归守卫：变异后先做结构完整性检查。
 
@@ -772,6 +1020,9 @@ class SkillOptimizer:
         # 体积缩减超过 40%，视为大改或截断。
         if len(new_md) < 0.6 * len(original_md):
             return False, "regression:content_shrunk"
+        # 【P2 大小上限】体积膨胀超过 15KB 拒绝（GEPA size limits），防技能无限膨胀。
+        if len(new_md) > 15000:
+            return False, "regression:too_large"
         return True, ""
 
     def check_stop(self):
@@ -779,11 +1030,15 @@ class SkillOptimizer:
         if getattr(self, "stop_requested", False):
             raise StopOptimizationError("Optimization stopped by user request")
 
-    async def _analyze_failures(self, skill_md, scenarios, evals, details, strategy_pool=None):
+    async def _analyze_failures(self, skill_md, scenarios, evals, details, strategy_pool=None,
+                                round_memory=None, mutation_log=None, lessons=None):
         """Analyst agent diagnoses the worst failures.
 
         【C1】strategy_pool 白名单：只把允许的策略模板及其描述拼进提示词，
         让 Analyst 只能在可用的策略里选择；未指定时用环境变量/全量模板。
+        【P2】round_memory：注入最近几轮的"诊断+结果"，避免反复修同一根因；
+        mutation_log：把已尝试未提升的策略标注 blocked，并列出被拒编辑摘要，
+        防止重复提出相同修改（SkillOpt rejected-edit buffer 思想）。
         """
         # 没有失败项时无需诊断，直接返回"无操作"占位，让 Mutator 拿到安全默认值。
         failed = [d for d in details if not d.get("passed")]
@@ -797,23 +1052,66 @@ class SkillOptimizer:
 
         # 解析生效的策略池，并生成"策略 → 描述"的提示片段。
         pool = _active_strategy_pool(strategy_pool)
+        # 【P2 策略黑名单】复评过但未提升（非回归拒绝）的策略标注 blocked，
+        # 只标注不移除，保底 pool[0]，防止策略枯竭。
+        blocked = {
+            m.get("strategy_type") for m in (mutation_log or [])
+            if not m.get("kept") and not (m.get("reason") or "").startswith("regression")
+            and not (m.get("reason") or "") == "edit_limit_exceeded"
+        }
         strategy_desc = "\n".join(
             f"- {s}: {STRATEGY_TEMPLATES[s]['description']} ({STRATEGY_TEMPLATES[s]['when']})"
+            + (" (blocked: tried without improvement)" if s in blocked else "")
             for s in pool
         )
+
+        prompt = (
+            f"Diagnose these failures and suggest ONE fix.\n\n"
+            f"Skill:\n{skill_md[:2000]}\n\n"
+            f"Scenarios:\n{json.dumps(scenarios, indent=2)}\n\n"
+            f"Criteria:\n{json.dumps(evals, indent=2)}\n\n"
+            f"Failures:\n{json.dumps(failed[:5], indent=2)}\n\n"
+            f"Allowed mutation strategies (pick exactly one):\n{strategy_desc}"
+        )
+
+        # 【P2 轮间记忆】最近 MEMORY_ROUNDS 条历史注入，默认 3。
+        if round_memory:
+            try:
+                memory_rounds = int(os.getenv("MEMORY_ROUNDS", "3"))
+            except ValueError:
+                memory_rounds = 3
+            memory_slice = round_memory[-max(1, memory_rounds):]
+            prompt += (
+                f"\n\nRecent attempts (previous rounds):\n"
+                f"{json.dumps(memory_slice, ensure_ascii=False)}"
+            )
+
+        # 【P2 被拒编辑缓冲】被拒候选的编辑摘要注入，避免重复提出相同修改。
+        rejected_edits = [
+            (m.get("description") or "")[:100] for m in (mutation_log or [])
+            if not m.get("kept") and m.get("description")
+        ]
+        if rejected_edits:
+            prompt += (
+                f"\n\nAvoid repeating these rejected edits:\n"
+                f"{json.dumps(rejected_edits, ensure_ascii=False)}"
+            )
+
+        # 【P2 语义保持】建议的修改不得偏离技能原始用途。
+        prompt += "\n\nKeep the skill's original purpose intact; do not drift from its intent."
+
+        # 【P4 跨会话经验】历史成功修复作为 few-shot 示例注入。
+        if lessons:
+            prompt += (
+                f"\n\nLessons from past successful fixes:\n"
+                f"{json.dumps(lessons, ensure_ascii=False)}"
+            )
 
         # 【主流程】把技能内容与最近的失败明细喂给 Analyst，并要求返回符合
         # FailureAnalysis schema 的 JSON；schema 校验失败会走 fallback。
         return await self._ask_json(
             self.analyst,
-            (
-                f"Diagnose these failures and suggest ONE fix.\n\n"
-                f"Skill:\n{skill_md[:2000]}\n\n"
-                f"Scenarios:\n{json.dumps(scenarios, indent=2)}\n\n"
-                f"Criteria:\n{json.dumps(evals, indent=2)}\n\n"
-                f"Failures:\n{json.dumps(failed[:5], indent=2)}\n\n"
-                f"Allowed mutation strategies (pick exactly one):\n{strategy_desc}"
-            ),
+            prompt,
             fallback={
                 "diagnosis": "Unable to determine root cause from failures",
                 "mutation_strategy": pool[0] if pool else "add_constraint",
@@ -823,12 +1121,13 @@ class SkillOptimizer:
             schema=FailureAnalysis,
         )
 
-    async def _mutate_skill(self, skill_md, analysis, agent=None, strategy_hint=None):
+    async def _mutate_skill(self, skill_md, analysis, agent=None, strategy_hint=None, lessons=None):
         """Mutator agent makes one targeted change.
 
         【C1】strategy_hint：把选中策略的 mutator_hint 追加进提示词，引导
         Mutator 按该策略做"恰好一处"修改。
         【C3】agent：并行时传入对应槽位的 Mutator 实例；默认用主实例。
+        【P4】lessons：跨会话成功经验作为 few-shot 注入。
         """
         mutator = agent or self.mutator
         strategy = analysis.get("mutation_strategy", "")
@@ -838,7 +1137,8 @@ class SkillOptimizer:
             else ""
         )
         prompt = (
-            f"Apply this fix to the skill. Make ONE change only.\n\n"
+            f"Apply this fix to the skill. Make ONE change only.\n"
+            f"Preserve the skill's original purpose and overall structure.\n\n"
             f"SKILL.md:\n{skill_md}\n\n"
             f"Diagnosis: {analysis.get('diagnosis')}\n"
             f"Strategy: {strategy}\n"
@@ -847,6 +1147,11 @@ class SkillOptimizer:
         )
         if hint:
             prompt += f"\nStrategy guidance: {hint}"
+        if lessons:
+            prompt += (
+                f"\n\nLessons from past successful fixes:\n"
+                f"{json.dumps(lessons, ensure_ascii=False)}"
+            )
         # 【主流程】把诊断结论作为修改指令交给 Mutator；prompt 明确要求"只改
         # 一处"，返回完整的新 SKILL.md。失败时兜底返回原内容（等于不改）。
         return await self._ask_json(
@@ -872,3 +1177,317 @@ class SkillOptimizer:
             if m.get("kept"):
                 stats[s]["kept"] += 1
         return stats
+
+    # -- P4 跨会话经验库（SQLite / jsonl 双存储）--------------------------------
+    # 【P4】经验库只记录模型生成的策略/诊断/摘要与分数，绝不落 skill_md /
+    # scenario / output / api_key（与已返回前端的 mutation_log 同级，安全）。
+    # 读写一律 try/except 静默失败，绝不因经验库问题中断优化。
+    # 【RAG】.db/.sqlite 后缀走 SQLite（可存 embedding，上限 1000）；其他后缀
+    # 保持 jsonl 兼容（上限 1000）。SQLite 由 Python 内置 sqlite3 提供，零依赖。
+
+    @staticmethod
+    def _lesson_is_sqlite(path):
+        return bool(path and path.lower().endswith((".db", ".sqlite", ".sqlite3")))
+
+    @staticmethod
+    def _embedding_to_blob(embedding):
+        """numpy 向量 → float32 bytes（SQLite BLOB）；None 原样返回。"""
+        if embedding is None:
+            return None
+        import numpy as np
+        return np.asarray(embedding, dtype=np.float32).tobytes()
+
+    @staticmethod
+    def _load_lessons(path, limit=5):
+        """读取最近 ``limit`` 条经验；按后缀选 SQLite 或 jsonl；异常返回 []。"""
+        if not path:
+            return []
+        if SkillOptimizer._lesson_is_sqlite(path):
+            return SkillOptimizer._load_lessons_sqlite(path, limit)
+        return SkillOptimizer._load_lessons_jsonl(path, limit)
+
+    @staticmethod
+    def _load_lessons_jsonl(path, limit=5):
+        lessons = []
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        lessons.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+        except OSError:
+            return []
+        return lessons[-max(1, limit):]
+
+    @staticmethod
+    def _load_lessons_sqlite(path, limit=5):
+        try:
+            import sqlite3
+            conn = sqlite3.connect(path)
+            try:
+                rows = conn.execute(
+                    "SELECT id, skill_name, domain, skill_description, strategy, diagnosis, "
+                    "summary, score_before, score_after, created_at, embedding "
+                    "FROM lessons ORDER BY id DESC LIMIT ?",
+                    (max(1, limit),),
+                ).fetchall()
+                lessons = []
+                for r in reversed(rows):  # 反序恢复"旧→新"
+                    lesson = {
+                        # 【RAG】_id 用于惰性 embedding 写回；注入前会被剥离。
+                        "_id": r[0],
+                        "skill_name": r[1], "domain": r[2], "skill_description": r[3],
+                        "strategy": r[4], "diagnosis": r[5], "summary": r[6],
+                        "score_before": r[7], "score_after": r[8], "created_at": r[9],
+                    }
+                    if r[10]:
+                        import numpy as np
+                        lesson["embedding"] = np.frombuffer(r[10], dtype=np.float32)
+                    lessons.append(lesson)
+                return lessons
+            finally:
+                conn.close()
+        except Exception:
+            return []
+
+    @staticmethod
+    def _append_lesson(path, lesson):
+        """追加一条经验（SQLite 或 jsonl）；上限 1000；异常静默。"""
+        if not path:
+            return
+        if SkillOptimizer._lesson_is_sqlite(path):
+            SkillOptimizer._append_lesson_sqlite(path, lesson)
+        else:
+            SkillOptimizer._append_lesson_jsonl(path, lesson)
+
+    @staticmethod
+    def _append_lesson_jsonl(path, lesson):
+        try:
+            lines = []
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line:
+                            lines.append(line)
+            lines.append(json.dumps(lesson, ensure_ascii=False))
+            if len(lines) > 1000:
+                lines = lines[-1000:]
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+        except OSError:
+            pass
+
+    @staticmethod
+    def _append_lesson_sqlite(path, lesson):
+        try:
+            import sqlite3
+            conn = sqlite3.connect(path)
+            try:
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS lessons ("
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                    "skill_name TEXT, domain TEXT, skill_description TEXT,"
+                    "strategy TEXT, diagnosis TEXT, summary TEXT,"
+                    "score_before REAL, score_after REAL, created_at TEXT,"
+                    "embedding BLOB)"
+                )
+                conn.execute(
+                    "INSERT INTO lessons (skill_name, domain, skill_description, strategy, "
+                    "diagnosis, summary, score_before, score_after, created_at, embedding) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        lesson.get("skill_name"), lesson.get("domain"),
+                        lesson.get("skill_description"), lesson.get("strategy"),
+                        lesson.get("diagnosis"), lesson.get("summary"),
+                        lesson.get("score_before"), lesson.get("score_after"),
+                        lesson.get("created_at"),
+                        SkillOptimizer._embedding_to_blob(lesson.get("embedding")),
+                    ),
+                )
+                # 上限 1000：删除最旧的超量行。
+                conn.execute(
+                    "DELETE FROM lessons WHERE id NOT IN "
+                    "(SELECT id FROM lessons ORDER BY id DESC LIMIT 1000)"
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception:
+            pass
+
+    # -- P4 检索模式（RAG）-----------------------------------------------------
+    # 【RAG】LESSON_RETRIEVAL 决定经验如何注入：off=最近 N 条（旧行为）；
+    # tag=同技能硬过滤+通用兜底（零依赖）；semantic=embedding 语义检索；
+    # hybrid=dense+sparse 混合（RRF 融合）。embedding 用 DashScope
+    # text-embedding-v3（Qwen 生态），失败静默降级到 tag，绝不中断优化。
+
+    @staticmethod
+    def _update_lesson_embedding(path, row_id, embedding):
+        """惰性算出的 embedding 写回 SQLite（跨会话复用，避免重复调用）。"""
+        if not path or row_id is None or not SkillOptimizer._lesson_is_sqlite(path):
+            return
+        try:
+            import sqlite3
+            conn = sqlite3.connect(path)
+            try:
+                conn.execute(
+                    "UPDATE lessons SET embedding=? WHERE id=?",
+                    (SkillOptimizer._embedding_to_blob(embedding), row_id),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _skill_name_from_md(skill_md):
+        """从 SKILL.md frontmatter 提取 name（无则空串）。"""
+        m = re.search(r"(?m)^name\s*:\s*(.+?)\s*$", skill_md or "")
+        return m.group(1).strip() if m else ""
+
+    @staticmethod
+    def _lesson_index_text(lesson):
+        """经验 → 检索文本（strategy + diagnosis + summary 拼接）。"""
+        parts = [
+            lesson.get("strategy", ""),
+            lesson.get("diagnosis", ""),
+            lesson.get("summary", ""),
+        ]
+        return " ".join(str(p) for p in parts if p)
+
+    @staticmethod
+    def _build_query(skill_name, scenarios, evals, current_details):
+        """检索查询：技能名 + 最近失败原因 + 场景输入摘要（规则拼接）。"""
+        parts = [f"skill: {skill_name}"] if skill_name else []
+        failed = [d for d in (current_details or []) if not d.get("passed")]
+        for d in failed[:3]:
+            parts.append(str(d.get("reason") or ""))
+        for s in (scenarios or [])[:2]:
+            parts.append(str(s.get("input", ""))[:80])
+        return " ".join(p for p in parts if p)
+
+    @staticmethod
+    def _tag_filter(lessons, skill_name, limit):
+        """同技能经验优先，不足补通用（无 skill_name 绑定）经验；各自取最近。"""
+        same = [l for l in lessons if l.get("skill_name") == skill_name]
+        generic = [l for l in lessons if not l.get("skill_name")]
+        pool = (same + generic)
+        return pool[-max(1, limit):]
+
+    @staticmethod
+    def _cosine(a, b):
+        import numpy as np
+        a = np.asarray(a, dtype=np.float32)
+        b = np.asarray(b, dtype=np.float32)
+        na, nb = np.linalg.norm(a), np.linalg.norm(b)
+        if na == 0 or nb == 0:
+            return 0.0
+        return float(np.dot(a, b) / (na * nb))
+
+    @staticmethod
+    def _sparse_jaccard(query, text):
+        """极简稀疏分：查询与文本的词集合 Jaccard（术语精确匹配兜底）。"""
+        q = set(re.findall(r"[a-z0-9]+", (query or "").lower()))
+        t = set(re.findall(r"[a-z0-9]+", (text or "").lower()))
+        if not q or not t:
+            return 0.0
+        return len(q & t) / len(q | t)
+
+    @staticmethod
+    def _rrf_fuse(rank_lists, k=60):
+        """RRF 融合多个排序：score = Σ 1/(k+rank)。返回 (item, score)。"""
+        scores = {}
+        for ranks in rank_lists:
+            for rank, item in enumerate(ranks):
+                key = id(item)
+                scores[key] = scores.get(key, 0.0) + 1.0 / (k + rank + 1)
+        ordered = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+        by_id = {id(it): it for ranks in rank_lists for it in ranks}
+        return [(by_id[k], s) for k, s in ordered]
+
+    def _embed_sync(self, text):
+        """DashScope text-embedding-v3（同步；在 _embed 的线程桥接里执行）。"""
+        import dashscope
+        resp = dashscope.TextEmbedding.call(
+            model="text-embedding-v3", input=text,
+            api_key=self._api_key, dimensions=512,
+        )
+        if getattr(resp, "status_code", 500) != 200:
+            raise RuntimeError(
+                f"embedding failed: {getattr(resp, 'code', '')} {getattr(resp, 'message', '')}"
+            )
+        return resp.output["embeddings"][0]["embedding"]
+
+    async def _embed(self, text):
+        """embedding（内存缓存 + 线程桥接，不阻塞事件循环）。"""
+        if text not in self._embed_cache:
+            self._embed_cache[text] = await asyncio.to_thread(self._embed_sync, text)
+        return self._embed_cache[text]
+
+    async def _retrieve_lessons(self, lessons, query, mode, limit):
+        """semantic/hybrid 检索：embedding 余弦（+sparse/RRF），异常向上抛由调用方降级。"""
+        qvec = await self._embed(query)
+        scored = []
+        for l in lessons:
+            vec = l.get("embedding")
+            if vec is None:
+                vec = await self._embed(self._lesson_index_text(l))
+                l["embedding"] = vec
+                # 【RAG】惰性 embedding 写回 SQLite，下次会话直接复用。
+                if l.get("_id") is not None:
+                    self._update_lesson_embedding(self.lesson_file, l["_id"], vec)
+            scored.append((l, self._cosine(qvec, vec)))
+        if mode == "hybrid":
+            dense_rank = [l for l, _ in sorted(scored, key=lambda x: x[1], reverse=True)]
+            sparse_rank = sorted(
+                lessons,
+                key=lambda l: self._sparse_jaccard(query, self._lesson_index_text(l)),
+                reverse=True,
+            )
+            fused = self._rrf_fuse([dense_rank, sparse_rank])
+            return [l for l, _ in fused[:max(1, limit)]]
+        # semantic：余弦 >= 阈值(0.3) 的前 limit 条；无达标返回空（触发降级）。
+        top = [l for l, s in sorted(scored, key=lambda x: x[1], reverse=True) if s >= 0.3]
+        return top[:max(1, limit)]
+
+    def _lesson_n(self):
+        try:
+            return max(1, int(os.getenv("LESSON_N", "5")))
+        except ValueError:
+            return 5
+
+    async def _prepare_lessons(self, skill_md, scenarios, evals, current_details):
+        """按 LESSON_RETRIEVAL 模式准备注入的经验；任何检索失败降级不中断。"""
+        if not self.lesson_file:
+            return []
+        mode = self.lesson_retrieval
+        n = self._lesson_n()
+        if mode == "off":
+            lessons = self._load_lessons(self.lesson_file, limit=n)
+        else:
+            all_lessons = self._load_lessons(self.lesson_file, limit=1000)
+            if not all_lessons:
+                return []
+            skill_name = self._skill_name_from_md(skill_md)
+            if mode == "tag":
+                lessons = self._tag_filter(all_lessons, skill_name, n)
+            else:
+                query = self._build_query(skill_name, scenarios, evals, current_details)
+                if not query:
+                    lessons = self._tag_filter(all_lessons, skill_name, n)
+                else:
+                    try:
+                        lessons = await self._retrieve_lessons(all_lessons, query, mode, n)
+                    except Exception:
+                        # 降级链：semantic/hybrid 失败 → tag 过滤（尽力而为）。
+                        lessons = self._tag_filter(all_lessons, skill_name, n)
+        # 【RAG】剥离内部 _id（仅用于 embedding 写回），不让其进入注入内容。
+        for l in lessons:
+            l.pop("_id", None)
+        return lessons
