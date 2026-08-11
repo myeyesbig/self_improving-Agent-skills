@@ -110,3 +110,34 @@ P4 跨会话经验库（harvest 雏形）                               [已计�
 - Darwin Gödel Machine: https://github.com/jennyzzt/dgm
 - SIA: https://github.com/hexo-ai/sia
 - GPTSwarm: https://github.com/metauto-ai/GPTSwarm
+
+## 八、2026-08-12 补充调研：从单一贪心到自适应策略组合
+
+本轮通过 GitHub 连接器复核了几条更贴近当前问题的主线：
+
+- [GEPA](https://github.com/gepa-ai/gepa) 使用执行轨迹反思、并行 proposal 与 Pareto-aware selection；可借鉴的是“利用诊断信号制造有目的的候选多样性”，而不是直接复制其依赖或允许劣化版本进入 SkillForge 主链。
+- [DSPy MIPROv2](https://github.com/stanfordnlp/dspy/blob/main/dspy/teleprompt/mipro_optimizer_v2.py) 将候选生成与指标驱动的搜索分开；可借鉴的是用历史试验结果指导下一批提案。
+- [EvoPrompt](https://github.com/beeevita/EvoPrompt) 维护 prompt population，并用不同演化算子产生候选；可借鉴的是“不同候选必须来自真正不同的算子”，而非只改变一句提示。
+- [PromptWizard](https://github.com/microsoft/PromptWizard) 组合多种 mutation style、critique/refine 与 top-N 选择；再次支持“候选多样性 + 反馈闭环”的方向。
+
+SkillForge 选择轻量的 `OPTIMIZATION_SEARCH=adaptive`：保持当前最优版本作为唯一父节点，每个候选仍只做一处修改，严格提升门槛完全不变；仅在候选生成前，用确定性的 UCB 策略组合分配不同 mutation strategy。未尝试策略优先探索，已有策略按平均正增益与探索奖励排序。默认 `classic`，因此不开开关时调用路径逐字保持旧行为。
+
+在多维评分上，采用两个比“保存第二名全文”更安全的补充：`TIE_DIMENSION_LESSONS` 只提炼并列候选相对胜者的维度增益元数据；`WEAK_DIMENSION_FOCUS` 把最低维度、相关失败项和适配的单点策略显式交给 Analyst/Mutator。前者保留 Pareto 信号但不保留候选，后者把反馈变成可执行的专项修改；两者都默认关闭，也都不能绕过总分严格提升门槛。
+
+## 九、目标 5：成功经验 RAG 从“召回”升级为“可用上下文”
+
+本轮复核了三个可直接映射到 SkillForge、且无需引入框架的主来源：
+
+- [FlagEmbedding](https://github.com/FlagOpen/FlagEmbedding) 的 BGE-M3 路线把 dense、sparse 与 multi-vector 视为互补信号，并建议在初筛后使用 cross-encoder reranker。SkillForge 保留现有 DashScope embedding / `gte-rerank`，但把“词面与语义互补”落实为轻量多信号排序。
+- [Qdrant](https://github.com/qdrant/qdrant) 同时提供 dense+sparse hybrid、RRF/DBSF、payload filtering、MMR 与 relevance feedback。SkillForge 借鉴 metadata soft boost、候选融合和 MMR 多样性，不引入向量数据库，也不持久化用户内容或反馈。
+- [Haystack](https://github.com/deepset-ai/haystack) 的多检索器路径会并行汇总、去重并用 RRF 融合。SkillForge 对应地在一个本地函数内完成候选池、近重复删除与确定性归并，避免引入新依赖。
+
+此前管线的主要问题不是“没有 embedding”，而是排序目标太单薄：同技能、同领域、弱维度、历史收益与经验重复度都没有进入最终选择；中文词面又会被 ASCII-only tokenizer 忽略；SQLite embedding 还可能被一起注入 prompt。新版 `LESSON_RAG_PIPELINE=quality_diverse` 因此采用：
+
+1. embedding 语义、中文/英文词面、技能、领域、弱维度、历史质量和时序七信号加权；
+2. `gte-rerank` 仍为可选的候选级交叉编码器，并与确定性质量分融合；
+3. 近重复过滤后用 MMR 式贪心选择，避免 top-K 都是同一个建议的改写；
+4. 只把白名单元数据注入模型，并设置总字符预算；内部 ID 与 embedding 永不进入 prompt；
+5. 任一 embedding/rerank 异常仍静默降级 tag，默认 `classic` 完全保留旧路径。
+
+没有照搬 relevance feedback：反馈若落库会扩展数据类型与隐私边界，超出本次仅持久化模型生成 lesson 元数据的授权。评测也从“同技能或同领域即相关”改为显式 `relevant_ids`，同时报告 Top-1、MRR、nDCG、Recall、Precision、误注入率和多样性，避免用偏乐观的单一指标证明自己。

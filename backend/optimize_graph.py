@@ -10,7 +10,7 @@
 # 事件：节点把要 emit 的事件写进 pending_events，optimize() 消费 astream 时
 #       逐个回调，事件顺序与手写版逐字一致（baseline → experiment_start →
 #       experiment_result ×N → complete）。
-# 【注意】本文件不 import 任何 langchain 命名空间（仅 langgraph）。
+# 【注意】本文件只使用 LangGraph，不导入禁止的上层编排命名空间。
 # =============================================================================
 
 """LangGraph StateGraph for the SkillForge optimization loop.
@@ -23,6 +23,7 @@ stop) are declared as conditional edges instead of nested ``if`` blocks.
 
 import copy
 import datetime
+import math
 from operator import add
 from typing import Annotated, Optional, TypedDict
 
@@ -55,6 +56,8 @@ class OptimizeState(TypedDict):
     current_md: str                   # 当前最优 SKILL.md
     baseline_pct: float               # 当前最优分数
     current_details: list             # 当前版本的失败明细
+    current_dimension_scores: dict    # 当前版本各评分维度统计
+    weak_dimensions: list             # 目标 4：当前低分维度（默认空）
     score_history: Annotated[list, add]   # 每轮结束追加当前分
     mutation_log: Annotated[list, add]    # 每候选一条（含 kept/reason）
     round_memory: Annotated[list, add]    # 每轮一条"诊断+结果"（P2 轮间记忆）
@@ -124,10 +127,13 @@ def build_optimize_graph(
                 "dimension_scores": baseline.get("dimension_scores", {}),
             },
         }
+        dimension_scores = baseline.get("dimension_scores", {})
         return {
             "current_md": state["skill_md"],
             "baseline_pct": baseline_pct,
             "current_details": baseline["details"],
+            "current_dimension_scores": dimension_scores,
+            "weak_dimensions": opt._identify_weak_dimensions(dimension_scores),
             "score_history": [baseline_pct],
             "saturated": saturated,
             "pending_events": [event],
@@ -135,9 +141,12 @@ def build_optimize_graph(
 
     # -- 节点：经验准备（P4/RAG）---------------------------------------------
     async def node_prepare_lessons(state: OptimizeState) -> dict:
+        prepare_kwargs = {"domain": state["domain"] or None}
+        if state.get("weak_dimensions"):
+            prepare_kwargs["weak_dimensions"] = state["weak_dimensions"]
         lessons = await opt._prepare_lessons(
             state["skill_md"], scenarios, evals,
-            state["current_details"], domain=state["domain"] or None,
+            state["current_details"], **prepare_kwargs,
         )
         return {"lessons": lessons}
 
@@ -161,12 +170,17 @@ def build_optimize_graph(
 
     # -- 节点：Analyst 诊断 ---------------------------------------------------
     async def node_analyst(state: OptimizeState) -> dict:
+        analyze_kwargs = {
+            "strategy_pool": pool,
+            "round_memory": state.get("round_memory", []),
+            "mutation_log": state.get("mutation_log", []),
+            "lessons": state.get("lessons", []),
+        }
+        if state.get("weak_dimensions"):
+            analyze_kwargs["weak_dimensions"] = state["weak_dimensions"]
         analysis = await opt._analyze_failures(
             state["current_md"], scenarios, evals, state["current_details"],
-            strategy_pool=pool,
-            round_memory=state.get("round_memory", []),
-            mutation_log=state.get("mutation_log", []),
-            lessons=state.get("lessons", []),
+            **analyze_kwargs,
         )
         # 【隔离红线】每轮开头重置 Send 汇聚中间产物（mutations/rescored），
         # 防止上一轮残留候选混入本轮（_append_or_reset 的空列表语义）。
@@ -179,18 +193,42 @@ def build_optimize_graph(
         analysis = state["analysis"]
         current_md = state["current_md"]
         lessons = state.get("lessons", [])
+        weak_dimensions = state.get("weak_dimensions", [])
+        candidate_pool = (
+            opt._focused_strategy_pool(pool, weak_dimensions)
+            if weak_dimensions else pool
+        )
+        primary_strategy = analysis.get("mutation_strategy", pool[0] if pool else "add_constraint")
+        if opt.search_policy == "adaptive":
+            slot_strategies = opt._select_candidate_strategies(
+                candidate_pool, state.get("mutation_log", []), n, primary_strategy,
+            )
+        else:
+            # classic 完整保留旧行为：所有候选沿用同一份 Analyst 策略。
+            slot_strategies = [primary_strategy] * n
         sends = []
         for i in range(n):
-            # 【C1】并行时给不同策略角度的 mutator_hint 让候选差异化；n=1 时
-            # 不传 hint（Mutator 内部从 analysis 推断，与手写版一致）。
+            strategy = slot_strategies[i]
+            slot_analysis = copy.deepcopy(analysis)
+            # adaptive 下每个槽位得到自洽的策略字段与提示；classic 不改诊断。
+            if opt.search_policy == "adaptive":
+                slot_analysis["mutation_strategy"] = strategy
+            if weak_dimensions:
+                weak_names = {item["dimension"] for item in weak_dimensions}
+                if slot_analysis.get("target_dimension") not in weak_names:
+                    slot_analysis["target_dimension"] = weak_dimensions[0]["dimension"]
+            # 【C1】classic 并行沿用原轮换提示；adaptive 使用分配策略的提示。
             hint = None
-            if n > 1 and pool:
-                hint = STRATEGY_TEMPLATES[pool[i % len(pool)]].get("mutator_hint")
+            if opt.search_policy == "adaptive" and strategy in STRATEGY_TEMPLATES:
+                hint = STRATEGY_TEMPLATES[strategy].get("mutator_hint")
+            elif n > 1 and candidate_pool:
+                hint = STRATEGY_TEMPLATES[candidate_pool[i % len(candidate_pool)]].get("mutator_hint")
             # 【隔离红线】Send 子状态输入深拷贝，禁止共享可变对象。
             sends.append(Send("mutate_slot", {
                 "slot": i,
                 "current_md": copy.deepcopy(current_md),
-                "analysis": copy.deepcopy(analysis),
+                "analysis": slot_analysis,
+                "candidate_strategy": strategy,
                 "strategy_hint": hint,
                 "lessons": copy.deepcopy(lessons),
             }))
@@ -204,6 +242,8 @@ def build_optimize_graph(
         )
         # 带槽位号，guard 汇聚时按槽位定序聚合（保持日志顺序确定）。
         mutation["_slot"] = payload["slot"]
+        mutation["_strategy_type"] = payload["candidate_strategy"]
+        mutation["_target_dimension"] = payload["analysis"].get("target_dimension")
         return {"mutations": [mutation]}
 
     # -- 节点：回归守卫 + 编辑幅度（纯拒绝管道，只更严不放松）------------------
@@ -220,6 +260,12 @@ def build_optimize_graph(
                 "new_md": new_md,
                 "description": mutation.get("description", ""),
                 "reasoning": mutation.get("reasoning", ""),
+                "strategy_type": mutation.get(
+                    "_strategy_type", (state.get("analysis") or {}).get("mutation_strategy", "unknown")
+                ),
+                "target_dimension": mutation.get(
+                    "_target_dimension", (state.get("analysis") or {}).get("target_dimension")
+                ),
                 "rejected": None,
                 "score_after": baseline_pct,
             }
@@ -288,6 +334,26 @@ def build_optimize_graph(
         new_pct = best["score_after"] if best else baseline_pct
         rnd = state["round_idx"] + 1
 
+        # 【目标 3】总分并列不改变 winner（max 的确定性首胜规则保持不变）；
+        # 仅提取未选候选相对 winner 的维度优势，供轮间记忆/经验库学习。
+        tie_dimension_records = []
+        if opt.tie_dimension_lessons and kept and best is not None:
+            for c in scored:
+                if c["candidate_id"] == best["candidate_id"]:
+                    continue
+                if not math.isclose(c["score_after"], best["score_after"], abs_tol=1e-9):
+                    continue
+                advantages = opt._dimension_advantages(
+                    c.get("dimension_scores", {}), best.get("dimension_scores", {})
+                )
+                if advantages:
+                    tie_dimension_records.append({
+                        "candidate_id": c["candidate_id"],
+                        "strategy": c.get("strategy_type", analysis.get("mutation_strategy", "unknown")),
+                        "summary": (c.get("description") or "")[:200],
+                        "dimension_gains": advantages,
+                    })
+
         # 每候选一条 mutation_log（增量返回，经 add reducer 追加）。
         log_entries = []
         for c in candidates:
@@ -295,7 +361,7 @@ def build_optimize_graph(
             log_entries.append({
                 "round": rnd,
                 "candidate_id": c["candidate_id"],
-                "strategy_type": analysis.get("mutation_strategy", "unknown"),
+                "strategy_type": c.get("strategy_type", analysis.get("mutation_strategy", "unknown")),
                 "diagnosis": analysis.get("diagnosis", ""),
                 "description": c["description"],
                 "score_before": baseline_pct,
@@ -312,7 +378,10 @@ def build_optimize_graph(
             outcome, mem_reason = "discarded", "no_candidate"
         mem_entry = {
             "round": rnd,
-            "strategy": analysis.get("mutation_strategy", "unknown"),
+            "strategy": (
+                best.get("strategy_type", analysis.get("mutation_strategy", "unknown"))
+                if best else analysis.get("mutation_strategy", "unknown")
+            ),
             "diagnosis": (analysis.get("diagnosis") or "")[:200],
             "target": analysis.get("target_section", ""),
             "outcome": outcome,
@@ -320,27 +389,59 @@ def build_optimize_graph(
             "score_after": new_pct,
             "reason": mem_reason,
         }
+        if tie_dimension_records:
+            mem_entry["tie_dimension_lessons"] = tie_dimension_records
 
         # 保留则更新当前版本 + 经验沉淀（只记模型生成内容，安全）。
         current_md = state["current_md"]
         current_details = state["current_details"]
+        current_dimension_scores = state.get("current_dimension_scores", {})
+        weak_dimensions = state.get("weak_dimensions", [])
         if kept and best is not None:
             # 【质量门槛】提升幅度/最终水位达标才沉淀（_lesson_qualifies）。
             if opt._lesson_qualifies(baseline_pct, best["score_after"]):
-                opt._append_lesson(opt.lesson_file, {
+                lesson = {
                     "skill_name": opt._skill_name_from_md(state["skill_md"]),
                     "domain": state.get("domain") or "",
                     "skill_description": "",
-                    "strategy": analysis.get("mutation_strategy", "unknown"),
+                    "strategy": best.get(
+                        "strategy_type", analysis.get("mutation_strategy", "unknown")
+                    ),
                     "diagnosis": (analysis.get("diagnosis") or "")[:200],
                     "summary": (best.get("description") or "")[:200],
                     "score_before": baseline_pct,
                     "score_after": best["score_after"],
                     "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
-                })
+                }
+                # 【目标 5】仅新版经验管线持久化模型产出的目标维度元数据；
+                # 不保存技能正文、场景、执行输出或凭据。classic 的记录形状不变。
+                if opt.lesson_rag_pipeline == "quality_diverse" and analysis.get("target_dimension"):
+                    lesson["target_dimension"] = analysis["target_dimension"]
+                opt._append_lesson(opt.lesson_file, lesson)
+            # 平局候选只沉淀元数据，不保留其 SKILL.md，也不改变 winner。
+            if opt._lesson_qualifies(baseline_pct, best["score_after"]):
+                for tie in tie_dimension_records:
+                    tie_lesson = {
+                        "skill_name": opt._skill_name_from_md(state["skill_md"]),
+                        "domain": state.get("domain") or "",
+                        "skill_description": "",
+                        "strategy": tie["strategy"],
+                        "diagnosis": (analysis.get("diagnosis") or "")[:200],
+                        "summary": tie["summary"],
+                        "score_before": baseline_pct,
+                        "score_after": best["score_after"],
+                        "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
+                        "lesson_type": "tie_dimension",
+                        "dimension_gains": tie["dimension_gains"],
+                    }
+                    if opt.lesson_rag_pipeline == "quality_diverse" and tie["dimension_gains"]:
+                        tie_lesson["target_dimension"] = next(iter(tie["dimension_gains"]))
+                    opt._append_lesson(opt.lesson_file, tie_lesson)
             current_md = best["new_md"]
             baseline_pct = best["score_after"]
             current_details = best.get("details", current_details)
+            current_dimension_scores = best.get("dimension_scores", current_dimension_scores)
+            weak_dimensions = opt._identify_weak_dimensions(current_dimension_scores)
 
         no_improve = 0 if kept else state["no_improve"] + 1
 
@@ -352,7 +453,10 @@ def build_optimize_graph(
                 "kept": kept,
                 "status": "kept" if kept else "discarded",
                 "description": best["description"] if best else "",
-                "strategy": analysis.get("mutation_strategy", ""),
+                "strategy": (
+                    best.get("strategy_type", analysis.get("mutation_strategy", ""))
+                    if best else analysis.get("mutation_strategy", "")
+                ),
                 "per_eval": best["per_eval"] if best else [],
                 "candidates": [
                     {
@@ -377,6 +481,8 @@ def build_optimize_graph(
             "current_md": current_md,
             "baseline_pct": baseline_pct,
             "current_details": current_details,
+            "current_dimension_scores": current_dimension_scores,
+            "weak_dimensions": weak_dimensions,
             "score_history": [baseline_pct],
             "mutation_log": log_entries,
             "round_memory": [mem_entry],

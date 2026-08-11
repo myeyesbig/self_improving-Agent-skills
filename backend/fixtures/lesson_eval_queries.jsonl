@@ -1,0 +1,6 @@
+{"query":"report conclusion is buried; improve answer-first clarity and evidence order","skill_name":"report-writer","domain":"writing","target_dimension":"clarity","relevant_ids":["writing-clarity-strong","writing-example"]}
+{"query":"reject unsafe file paths and path traversal in code review","skill_name":"code-reviewer","domain":"coding","target_dimension":"correctness","relevant_ids":["coding-security"]}
+{"query":"incident recovery steps need a deterministic executable order","skill_name":"incident-runbook","domain":"ops","target_dimension":"executability","relevant_ids":["ops-execution"]}
+{"query":"CSV required columns must be validated when schema is malformed","skill_name":"csv-validator","domain":"data","target_dimension":"correctness","relevant_ids":["data-schema"]}
+{"query":"YAML frontmatter delimiter prevents skill loading","skill_name":"unknown-skill","domain":"other","target_dimension":"executability","relevant_ids":["generic-format"]}
+{"query":"make protocol guidance maintainable by pointing to the existing reference","skill_name":"api-maintainer","domain":"coding","target_dimension":"maintainability","relevant_ids":["maintainability-reference"]}

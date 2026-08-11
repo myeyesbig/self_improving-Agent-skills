@@ -108,6 +108,48 @@ class TestSyncExtraction(unittest.TestCase):
         mock_llm.sync_call.assert_called_once_with(system="", user="hi", json_mode=True)
 
 
+class TestRoleSpecificModels(unittest.TestCase):
+    """目标 1：角色模型可独立覆盖，未配置时保持单模型旧路径。"""
+
+    def test_roles_inherit_base_model_by_default(self):
+        with patch.dict(os.environ, {}, clear=True):
+            opt = make_optimizer(model="qwen-plus")
+        self.assertEqual(opt.executor_model, "qwen-plus")
+        self.assertEqual(opt.analyst_model, "qwen-plus")
+        self.assertEqual(opt.mutator_model, "qwen-plus")
+        self.assertEqual(opt._role_llms, {})
+
+    def test_role_environment_overrides_create_only_needed_clients(self):
+        env = {
+            "EXECUTOR_MODEL": "qwen-turbo",
+            "ANALYST_MODEL": "deepseek-reasoner",
+            "MUTATOR_MODEL": "qwen-plus",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            opt = make_optimizer(model="qwen-plus")
+        self.assertEqual(opt.executor_model, "qwen-turbo")
+        self.assertEqual(opt.analyst_model, "deepseek-reasoner")
+        self.assertEqual(opt.mutator_model, "qwen-plus")
+        self.assertEqual(opt._role_llms["executor"].model, "qwen-turbo")
+        self.assertEqual(opt._role_llms["analyst"].model, "deepseek-reasoner")
+        self.assertNotIn("mutator", opt._role_llms)
+
+    def test_calls_route_by_stable_role_including_parallel_slots(self):
+        with patch.dict(os.environ, {"MUTATOR_MODEL": "deepseek-chat"}, clear=True):
+            opt = make_optimizer(model="qwen-plus", parallelism=2)
+        base = MagicMock()
+        role_client = MagicMock()
+        base.sync_call.return_value = "executor"
+        role_client.sync_call.return_value = "mutator"
+        opt._llm = base
+        opt._role_llms["mutator"] = role_client
+
+        self.assertEqual(opt._run_agent_sync(opt.executor, "run"), "executor")
+        self.assertEqual(opt._run_agent_sync(opt.mutator_pool[1], "edit"), "mutator")
+        base.sync_call.assert_called_once_with(system=EXECUTOR_SYSTEM_PROMPT, user="run", json_mode=False)
+        role_client.sync_call.assert_called_once_with(system=MUTATOR_SYSTEM_PROMPT, user="edit", json_mode=False)
+
+
 class TestAskThreadBridge(unittest.IsolatedAsyncioTestCase):
     """Verify _ask() returns text through the asyncio.to_thread bridge."""
 
@@ -396,6 +438,242 @@ class TestStrategyPool(unittest.TestCase):
         with patch.dict(os.environ, {"MUTATION_STRATEGIES": "restructure,fix_format"}, clear=False):
             pool = _active_strategy_pool(None)
             self.assertEqual(pool, ["restructure", "fix_format"])
+
+
+class TestAdaptiveSearchPolicy(unittest.IsolatedAsyncioTestCase):
+    """目标 2：可选自适应策略组合；classic 默认路径不变。"""
+
+    def test_default_and_invalid_policy_are_classic(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(make_optimizer().search_policy, "classic")
+        with patch.dict(os.environ, {"OPTIMIZATION_SEARCH": "unknown"}, clear=True):
+            self.assertEqual(make_optimizer().search_policy, "classic")
+
+    def test_cold_start_honors_analyst_then_diversifies(self):
+        opt = make_optimizer(search_policy="adaptive")
+        picked = opt._select_candidate_strategies(
+            ["add_example", "add_constraint", "restructure"],
+            [], 3, "add_constraint",
+        )
+        self.assertEqual(picked, ["add_constraint", "add_example", "restructure"])
+
+    def test_observed_gain_drives_exploitation_when_exploration_zero(self):
+        opt = make_optimizer(search_policy="adaptive", search_exploration=0.0)
+        history = [
+            {"strategy_type": "add_example", "score_before": 50, "score_after": 80},
+            {"strategy_type": "add_constraint", "score_before": 50, "score_after": 55},
+        ]
+        picked = opt._select_candidate_strategies(
+            ["add_example", "add_constraint"], history, 1, "add_constraint",
+        )
+        self.assertEqual(picked, ["add_example"])
+
+    async def test_parallel_candidates_receive_distinct_consistent_strategies(self):
+        opt = make_optimizer(search_policy="adaptive")
+        baseline = {"passed": 1, "total": 2, "per_eval": [], "details": []}
+        same = {"passed": 1, "total": 2, "per_eval": [], "details": []}
+        analysis = {"diagnosis": "d", "mutation_strategy": "add_constraint",
+                    "target_section": "s", "suggested_change": "c"}
+        seen = []
+
+        async def mutate(_md, slot_analysis, **_kwargs):
+            seen.append(slot_analysis["mutation_strategy"])
+            return {"description": slot_analysis["mutation_strategy"], "reasoning": "r",
+                    "new_skill_md": "# " + slot_analysis["mutation_strategy"]}
+
+        with (
+            patch.object(opt, "_score_skill", new=AsyncMock(side_effect=[baseline, same, same])),
+            patch.object(opt, "_analyze_failures", new=AsyncMock(return_value=analysis)),
+            patch.object(opt, "_mutate_skill", new=mutate),
+        ):
+            result = await opt.optimize(
+                {"SKILL.md": "# S"}, [], [], max_rounds=1, parallel_mutations=2,
+                strategy_pool=["add_example", "add_constraint"],
+            )
+
+        self.assertEqual(seen, ["add_constraint", "add_example"])
+        self.assertEqual(
+            [m["strategy_type"] for m in result["mutation_log"]],
+            ["add_constraint", "add_example"],
+        )
+        self.assertFalse(any(m["kept"] for m in result["mutation_log"]))
+
+
+class TestTieDimensionLessons(unittest.IsolatedAsyncioTestCase):
+    """目标 3：平局候选可贡献维度经验，但绝不替换严格提升的 winner。"""
+
+    def test_disabled_by_default(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(make_optimizer().tie_dimension_lessons)
+
+    def test_dimension_advantages_apply_minimum_gain(self):
+        opt = make_optimizer(tie_dimension_min_gain=5.0)
+        gains = opt._dimension_advantages(
+            {"clarity": {"pct": 80}, "quality": {"pct": 62}},
+            {"clarity": {"pct": 60}, "quality": {"pct": 60}},
+        )
+        self.assertEqual(gains["clarity"]["gain"], 20.0)
+        self.assertNotIn("quality", gains)
+
+    async def test_tied_nonwinner_persists_only_dimension_metadata(self):
+        with tempfile.TemporaryDirectory() as td:
+            lesson_path = os.path.join(td, "lessons.jsonl")
+            opt = make_optimizer(
+                lesson_file=lesson_path,
+                search_policy="adaptive",
+                tie_dimension_lessons=True,
+            )
+            baseline = {"passed": 2, "total": 4, "per_eval": [], "details": [],
+                        "dimension_scores": {}}
+            winner = {"passed": 3, "total": 4, "per_eval": [], "details": [],
+                      "dimension_scores": {
+                          "correctness": {"pct": 100}, "clarity": {"pct": 50},
+                      }}
+            tied = {"passed": 3, "total": 4, "per_eval": [], "details": [],
+                    "dimension_scores": {
+                        "correctness": {"pct": 75}, "clarity": {"pct": 100},
+                    }}
+            analysis = {"diagnosis": "d", "mutation_strategy": "add_constraint",
+                        "target_section": "s", "suggested_change": "c"}
+
+            async def mutate(_md, slot_analysis, **_kwargs):
+                strategy = slot_analysis["mutation_strategy"]
+                new_md = "# Winner" if strategy == "add_constraint" else "# Tie"
+                return {"description": strategy, "reasoning": "r", "new_skill_md": new_md}
+
+            async def score(skill_md, *_args, **_kwargs):
+                return {"# S": baseline, "# Winner": winner, "# Tie": tied}[skill_md]
+
+            with (
+                patch.object(opt, "_score_skill", new=score),
+                patch.object(opt, "_analyze_failures", new=AsyncMock(return_value=analysis)),
+                patch.object(opt, "_mutate_skill", new=mutate),
+            ):
+                result = await opt.optimize(
+                    {"SKILL.md": "# S"}, [], [], max_rounds=1, parallel_mutations=2,
+                    strategy_pool=["add_example", "add_constraint"],
+                )
+
+            kept = [m for m in result["mutation_log"] if m["kept"]]
+            self.assertEqual(len(kept), 1)
+            self.assertEqual(kept[0]["description"], "add_constraint")
+            self.assertEqual(result["improved_skill_md"], "# Winner")
+            lessons = SkillOptimizer._load_lessons(lesson_path, limit=10)
+            tie_lessons = [l for l in lessons if l.get("lesson_type") == "tie_dimension"]
+            self.assertEqual(len(tie_lessons), 1)
+            self.assertEqual(tie_lessons[0]["dimension_gains"]["clarity"]["gain"], 50.0)
+            self.assertNotIn("skill_md", tie_lessons[0])
+            self.assertNotIn("new_skill_md", tie_lessons[0])
+
+    def test_sqlite_round_trip_preserves_tie_metadata(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "lessons.db")
+            lesson = {
+                "strategy": "add_example", "diagnosis": "d", "summary": "s",
+                "score_before": 50.0, "score_after": 75.0,
+                "lesson_type": "tie_dimension",
+                "dimension_gains": {"clarity": {"gain": 25.0}},
+            }
+            SkillOptimizer._append_lesson(path, lesson)
+            loaded = SkillOptimizer._load_lessons(path, limit=1)[0]
+            self.assertEqual(loaded["lesson_type"], "tie_dimension")
+            self.assertEqual(loaded["dimension_gains"]["clarity"]["gain"], 25.0)
+
+
+class TestWeakDimensionFocus(unittest.IsolatedAsyncioTestCase):
+    """目标 4：识别低分维度，并把它贯穿诊断、策略与单点变异。"""
+
+    def test_disabled_by_default(self):
+        with patch.dict(os.environ, {}, clear=True):
+            opt = make_optimizer()
+        self.assertFalse(opt.weak_dimension_focus)
+        self.assertEqual(opt._identify_weak_dimensions({
+            "clarity": {"passed": 0, "total": 2, "pct": 0.0},
+        }), [])
+
+    def test_identifies_lowest_measured_dimensions_only(self):
+        opt = make_optimizer(
+            weak_dimension_focus=True, weak_dimension_threshold=50, weak_dimension_max=2,
+        )
+        weak = opt._identify_weak_dimensions({
+            "clarity": {"passed": 1, "total": 4, "pct": 25.0},
+            "correctness": {"passed": 2, "total": 4, "pct": 50.0},
+            "quality": {"passed": 0, "total": 0, "pct": 0.0},
+            "executability": {"passed": 3, "total": 4, "pct": 75.0},
+        })
+        self.assertEqual([d["dimension"] for d in weak], ["clarity", "correctness"])
+
+    def test_focused_strategy_pool_respects_allowed_whitelist(self):
+        focused = SkillOptimizer._focused_strategy_pool(
+            ["add_example", "rewrite_section", "add_constraint"],
+            [{"dimension": "clarity", "pct": 20}],
+        )
+        self.assertEqual(focused, ["rewrite_section", "add_example", "add_constraint"])
+
+    async def test_analyst_and_mutator_receive_explicit_dimension_target(self):
+        opt = make_optimizer(weak_dimension_focus=True)
+        weak = [{"dimension": "clarity", "pct": 25.0, "passed": 1, "total": 4}]
+        evals = [
+            {"id": 1, "dimension": "clarity", "question": "Is it clear?"},
+            {"id": 2, "dimension": "correctness", "question": "Is it correct?"},
+        ]
+        details = [
+            {"eval_id": 1, "passed": False, "reason": "ambiguous"},
+            {"eval_id": 2, "passed": False, "reason": "wrong"},
+        ]
+        prompts = []
+        analysis = {
+            "diagnosis": "ambiguous steps", "mutation_strategy": "rewrite_section",
+            "target_section": "Workflow", "suggested_change": "clarify one step",
+            "target_dimension": "clarity",
+        }
+
+        async def fake_ask_json(_agent, prompt, **_kwargs):
+            prompts.append(prompt)
+            return analysis if "Diagnose these failures" in prompt else {
+                "description": "clarified one step", "reasoning": "r", "new_skill_md": "# S clarified",
+            }
+
+        with patch.object(opt, "_ask_json", new=fake_ask_json):
+            result = await opt._analyze_failures(
+                "# S", [], evals, details, weak_dimensions=weak,
+            )
+            await opt._mutate_skill("# S", result)
+
+        self.assertIn("Priority weak dimensions", prompts[0])
+        self.assertIn("clarity", prompts[0])
+        self.assertIn("ambiguous", prompts[0])
+        self.assertIn("Target evaluation dimension: clarity", prompts[1])
+        self.assertIn("ONE edit", prompts[1])
+
+    async def test_graph_passes_baseline_weakness_to_analyst(self):
+        opt = make_optimizer(weak_dimension_focus=True, weak_dimension_threshold=50)
+        baseline = {
+            "passed": 1, "total": 2, "per_eval": [],
+            "details": [{"eval_id": 1, "passed": False}],
+            "dimension_scores": {
+                "clarity": {"passed": 0, "total": 1, "pct": 0.0},
+                "correctness": {"passed": 1, "total": 1, "pct": 100.0},
+            },
+        }
+        same = {**baseline, "passed": 1, "total": 2}
+        captured = {}
+
+        async def analyze(*_args, **kwargs):
+            captured["weak"] = kwargs.get("weak_dimensions")
+            return {"diagnosis": "d", "mutation_strategy": "rewrite_section",
+                    "target_section": "s", "suggested_change": "c",
+                    "target_dimension": "clarity"}
+
+        mutation = {"description": "m", "reasoning": "r", "new_skill_md": "# New"}
+        with (
+            patch.object(opt, "_score_skill", new=AsyncMock(side_effect=[baseline, same])),
+            patch.object(opt, "_analyze_failures", new=analyze),
+            patch.object(opt, "_mutate_skill", new=AsyncMock(return_value=mutation)),
+        ):
+            await opt.optimize({"SKILL.md": "# S"}, [], [], max_rounds=1)
+
+        self.assertEqual(captured["weak"][0]["dimension"], "clarity")
 
 
 class TestWeightedScoring(unittest.IsolatedAsyncioTestCase):
@@ -1218,6 +1496,7 @@ class TestLessonStoreSqlite(unittest.IsolatedAsyncioTestCase):
                 )
             self.assertEqual(lessons[0]["strategy"], "a")
             self.assertNotIn("_id", lessons[0])  # 内部 id 不进入注入内容
+            self.assertNotIn("embedding", lessons[0])  # 向量不污染模型上下文
             # 重新加载：embedding 已持久化（不再需要惰性计算）。
             reloaded = SkillOptimizer._load_lessons(path)
         self.assertIsNotNone(reloaded[0].get("embedding"))
@@ -1430,6 +1709,166 @@ class TestLessonRerank(unittest.IsolatedAsyncioTestCase):
         ):
             top = await opt._retrieve_lessons(lessons, "query", "semantic", 5)
         self.assertEqual([l["strategy"] for l in top], ["a", "b"])  # 降级保持原始排序
+
+
+class TestQualityDiverseLessonRag(unittest.IsolatedAsyncioTestCase):
+    """目标 5：增强经验检索默认关闭，开启后质量/维度/去重/多样性均生效。"""
+
+    def test_defaults_preserve_classic_pipeline(self):
+        opt = make_optimizer()
+        self.assertEqual(opt.lesson_rag_pipeline, "classic")
+        self.assertEqual(opt.lesson_candidate_pool, 20)
+        self.assertEqual(opt.lesson_diversity, 0.2)
+        self.assertEqual(opt.lesson_dedup_threshold, 0.92)
+        self.assertEqual(opt.lesson_context_chars, 6000)
+
+    def test_env_knobs_and_weights(self):
+        env = {
+            "LESSON_RAG_PIPELINE": "quality_diverse",
+            "LESSON_CANDIDATE_POOL": "12",
+            "LESSON_DIVERSITY": "0.35",
+            "LESSON_DEDUP_THRESHOLD": "0.8",
+            "LESSON_CONTEXT_CHARS": "900",
+            "LESSON_SIGNAL_WEIGHTS": json.dumps({"quality": 3, "semantic": 1}),
+        }
+        with patch.dict(os.environ, env, clear=False):
+            opt = make_optimizer()
+        self.assertEqual(opt.lesson_rag_pipeline, "quality_diverse")
+        self.assertEqual(opt.lesson_candidate_pool, 12)
+        self.assertEqual(opt.lesson_diversity, 0.35)
+        self.assertEqual(opt.lesson_dedup_threshold, 0.8)
+        self.assertEqual(opt.lesson_context_chars, 900)
+        self.assertAlmostEqual(opt.lesson_signal_weights["quality"], 0.75)
+        self.assertAlmostEqual(opt.lesson_signal_weights["semantic"], 0.25)
+
+    def test_invalid_pipeline_falls_back_to_classic(self):
+        opt = make_optimizer(lesson_rag_pipeline="unknown")
+        self.assertEqual(opt.lesson_rag_pipeline, "classic")
+
+    def test_sparse_jaccard_supports_chinese_bigrams(self):
+        score = SkillOptimizer._sparse_jaccard("修复格式错误", "增加一条格式错误处理规则")
+        self.assertGreater(score, 0.0)
+
+    async def test_quality_prior_breaks_equal_relevance_tie(self):
+        opt = make_optimizer(
+            lesson_rag_pipeline="quality_diverse",
+            lesson_signal_weights={"semantic": 1, "quality": 3},
+        )
+        lessons = [
+            {
+                "strategy": "weak",
+                "summary": "same advice",
+                "score_before": 70,
+                "score_after": 71,
+                "embedding": [1.0, 0.0],
+            },
+            {
+                "strategy": "strong",
+                "summary": "same advice",
+                "score_before": 40,
+                "score_after": 90,
+                "embedding": [1.0, 0.0],
+            },
+        ]
+        with patch.object(opt, "_embed", new=AsyncMock(return_value=[1.0, 0.0])):
+            top = await opt._retrieve_lessons(lessons, "advice", "hybrid", 1)
+        self.assertEqual(top[0]["strategy"], "strong")
+        self.assertEqual(top[0]["_retrieval"]["pipeline"], "quality_diverse")
+
+    async def test_weak_dimension_metadata_is_a_retrieval_signal(self):
+        opt = make_optimizer(
+            lesson_rag_pipeline="quality_diverse",
+            lesson_signal_weights={"semantic": 1, "dimension": 4},
+        )
+        lessons = [
+            {
+                "strategy": "clarity-fix",
+                "summary": "rewrite guidance",
+                "target_dimension": "clarity",
+                "embedding": [1.0, 0.0],
+            },
+            {
+                "strategy": "correctness-fix",
+                "summary": "rewrite guidance",
+                "target_dimension": "correctness",
+                "embedding": [1.0, 0.0],
+            },
+        ]
+        context = {"weak_dimensions": [{"dimension": "clarity", "pct": 25.0}]}
+        with patch.object(opt, "_embed", new=AsyncMock(return_value=[1.0, 0.0])):
+            top = await opt._retrieve_lessons(
+                lessons, "rewrite guidance", "hybrid", 2, context=context
+            )
+        self.assertEqual(top[0]["strategy"], "clarity-fix")
+        self.assertIn("weak_dimension", top[0]["_retrieval"]["matched"])
+
+    async def test_near_duplicates_are_removed_before_diverse_selection(self):
+        opt = make_optimizer(
+            lesson_rag_pipeline="quality_diverse",
+            lesson_dedup_threshold=0.9,
+            lesson_diversity=0.5,
+        )
+        lessons = [
+            {
+                "strategy": "add_example",
+                "summary": "add exact output example",
+                "score_before": 30,
+                "score_after": 90,
+                "embedding": [1.0, 0.0],
+            },
+            {
+                "strategy": "add_example",
+                "summary": "add exact output example",
+                "score_before": 50,
+                "score_after": 60,
+                "embedding": [1.0, 0.0],
+            },
+            {
+                "strategy": "add_constraint",
+                "summary": "reject unsafe paths",
+                "score_before": 40,
+                "score_after": 80,
+                "embedding": [0.9, 0.1],
+            },
+        ]
+        with patch.object(opt, "_embed", new=AsyncMock(return_value=[1.0, 0.0])):
+            top = await opt._retrieve_lessons(lessons, "improve output", "hybrid", 3)
+        self.assertEqual(len(top), 2)
+        self.assertEqual({l["strategy"] for l in top}, {"add_example", "add_constraint"})
+
+    async def test_prepare_compacts_prompt_and_persists_target_dimension(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "lessons.db")
+            SkillOptimizer._append_lesson(path, {
+                "skill_name": "writer",
+                "domain": "writing",
+                "strategy": "rewrite_section",
+                "diagnosis": "x" * 1000,
+                "summary": "make it clear",
+                "target_dimension": "clarity",
+                "score_before": 40,
+                "score_after": 90,
+                "embedding": [1.0, 0.0],
+            })
+            opt = make_optimizer(
+                lesson_file=path,
+                lesson_retrieval="semantic",
+                lesson_rag_pipeline="quality_diverse",
+                lesson_context_chars=500,
+            )
+            with patch.object(opt, "_embed", new=AsyncMock(return_value=[1.0, 0.0])):
+                lessons = await opt._prepare_lessons(
+                    "---\nname: writer\n---", [], [], [], domain="writing",
+                    weak_dimensions=[{"dimension": "clarity", "pct": 20}],
+                )
+            reloaded = SkillOptimizer._load_lessons(path)
+        self.assertEqual(reloaded[0]["target_dimension"], "clarity")
+        self.assertEqual(lessons[0]["target_dimension"], "clarity")
+        if "diagnosis" in lessons[0]:
+            self.assertLessEqual(len(lessons[0]["diagnosis"]), 300)
+        self.assertLessEqual(len(json.dumps(lessons, ensure_ascii=False)), 500)
+        self.assertNotIn("embedding", lessons[0])
+        self.assertNotIn("_id", lessons[0])
 
 
 class TestLessonQualityGate(unittest.IsolatedAsyncioTestCase):
@@ -1696,12 +2135,15 @@ class TestFrontmatterParsing(unittest.TestCase):
 class TestExamplesListing(unittest.IsolatedAsyncioTestCase):
     """Examples endpoint reads skill-examples/*.zip (fixes dead selector)."""
 
-    async def test_list_examples_returns_four_packs(self):
+    async def test_list_examples_contains_bundled_packs(self):
         ex = await list_examples()
-        self.assertEqual(len(ex["examples"]), 4)
         paths = {e["path"] for e in ex["examples"]}
-        self.assertIn("project-graveyard", paths)
-        self.assertIn("commit-archaeologist", paths)
+        self.assertTrue({
+            "project-graveyard",
+            "commit-archaeologist",
+            "dependency-doctor",
+            "thinking-out-loud",
+        }.issubset(paths))
 
     async def test_load_example_creates_session(self):
         ex = await list_examples()

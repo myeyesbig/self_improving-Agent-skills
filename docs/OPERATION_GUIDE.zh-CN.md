@@ -317,6 +317,12 @@ improved_skill.zip
 | `LESSON_TOP_K` | `5` | semantic/hybrid 模式注入 Analyst 的经验条数 |
 | `LESSON_RERANK` | `0`（关闭） | 开启后对检索候选池用 `gte-rerank` 重排再取 top-K |
 | `LESSON_RERANK_POOL` | `20` | rerank 候选池大小 |
+| `LESSON_RAG_PIPELINE` | `classic` | `classic` 保持旧排序；`quality_diverse` 开启多信号质量排序、去重和多样性选择 |
+| `LESSON_CANDIDATE_POOL` | `20` | 新管线在去重/多样性选择前保留的候选数 |
+| `LESSON_DIVERSITY` | `0.2` | 重复惩罚（0–1） |
+| `LESSON_DEDUP_THRESHOLD` | `0.92` | 近重复经验的 Jaccard 阈值（0–1） |
+| `LESSON_CONTEXT_CHARS` | `6000` | 注入经验的总字符预算（最小 500） |
+| `LESSON_SIGNAL_WEIGHTS` | 内置权重 | 可选 JSON；键为 `semantic/sparse/skill/domain/dimension/quality/recency`，自动归一化 |
 | `LESSON_MIN_GAIN` | `0`（关闭） | 经验沉淀质量门槛（提升幅度）；推荐开启值 15 |
 | `LESSON_MIN_FINAL` | `0`（关闭） | 经验沉淀质量门槛（最终水位）；推荐开启值 85；与 `MIN_GAIN` 是 OR 语义 |
 
@@ -371,7 +377,8 @@ MUTATION_PARALLELISM=2 ./start-dev.sh
 
 ```bash
 SKILL_LESSONS_FILE=./data/skill_lessons.db \
-LESSON_RETRIEVAL=semantic \
+LESSON_RETRIEVAL=hybrid \
+LESSON_RAG_PIPELINE=quality_diverse \
 LESSON_THRESHOLD=0.3 \
 LESSON_TOP_K=5 \
 LESSON_RERANK=1 \
@@ -386,8 +393,21 @@ LESSON_MIN_FINAL=85 \
 | 优化同一个技能反复跑 | `tag`（同技能过滤，零额外依赖） |
 | 想让经验在不同技能间迁移 | `semantic` 或 `hybrid`（需 embedding） |
 | 候选很多、希望最相关的排前面 | 开 `LESSON_RERANK=1`（多一次 rerank 调用） |
+| 重复经验多、弱维度经验容易被淹没 | `LESSON_RAG_PIPELINE=quality_diverse`（推荐与 `hybrid` 配合） |
 
 `LESSON_MIN_GAIN=15` 与 `LESSON_MIN_FINAL=85` 是推荐的质量门槛（OR 语义，任一达标即沉淀），用来过滤「小幅修修补补」造成的经验库噪音。
+
+新版管线先用 embedding、中文/英文词面、技能、领域、目标弱维度、历史提升幅度/最终分和时序组成质量分；可选 `gte-rerank` 后，再删除近重复经验并做多样性选择。返回给模型的内容有字段白名单和字符预算，SQLite 中的向量不会进入 prompt。任一步失败仍自动回退到 `tag`；不设置 `LESSON_RAG_PIPELINE` 时行为与旧版一致。
+
+离线比较（不读取 key、使用固定查询标注）可运行：
+
+```bash
+cd backend
+.venv/bin/python eval_lessons.py \
+  --lessons fixtures/lesson_eval_lessons.jsonl \
+  --queries fixtures/lesson_eval_queries.jsonl \
+  --top-k 3
+```
 
 ### Q7. 会话 1 小时就过期，太短了吧
 **答**：会话过期是后端 `SESSION_TTL=3600` 控制。要保留更久：

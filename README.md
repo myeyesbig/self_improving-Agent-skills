@@ -204,7 +204,7 @@ zip -r my-skill.zip my-skill/
 
 ### 后端
 
-DashScope API Key 随每次请求由前端传入（字段 `qwen_api_key`），并直接用于 DashScope SDK 调用配置 —— 绝不写入进程级环境变量、不存入会话、不记入日志。模型默认使用 `qwen-plus`，可通过可选的 `QWEN_MODEL` 环境变量覆盖。服务运行在 **8891** 端口。
+DashScope API Key 随每次请求由前端传入（字段 `qwen_api_key`），并直接用于 DashScope SDK 调用配置 —— 绝不写入进程级环境变量、不存入会话、不记入日志。模型默认使用 `qwen-plus`，可通过可选的 `QWEN_MODEL` 环境变量覆盖；Executor、Analyst、Mutator 还可分别用 `EXECUTOR_MODEL`、`ANALYST_MODEL`、`MUTATOR_MODEL` 覆盖。服务运行在 **8891** 端口。
 
 上传限制：
 - 单次上传最大 **10MB**
@@ -232,22 +232,49 @@ SkillForge 提供一组**可选**优化旋钮，全部默认等价于经典行�
 | `REGRESSION_CHECK` | 环境变量 | 1（开启） | 变异先过结构完整性守卫，0 关闭 |
 | `NOISE_FLOOR` | 环境变量 | 0.0 | 候选提升须超过「基线 + 阈值 + 噪声地板」才保留，防止评分波动被当成真进步 |
 | `EDIT_LIMIT` | 环境变量 | 0.0 | 单次变异相对原文本的变化比例上限，超限直接拒绝（`edit_limit_exceeded`），0 关闭 |
+| `EXECUTOR_MODEL` | 环境变量 | 继承 `QWEN_MODEL` | Executor 的执行、测试生成与评分模型；适合配置为成本较低的模型 |
+| `ANALYST_MODEL` | 环境变量 | 继承 `QWEN_MODEL` | Analyst 的失败诊断模型；可配置为推理能力更强的模型 |
+| `MUTATOR_MODEL` | 环境变量 | 继承 `QWEN_MODEL` | Mutator 的单点编辑模型；可配置为指令遵循更强的模型 |
+| `OPTIMIZATION_SEARCH` | 环境变量 | classic | `classic` 保持原贪心路径；`adaptive` 为并行槽位分配不同策略，并按历史实测增益自适应探索/利用 |
+| `SEARCH_EXPLORATION` | 环境变量 | 1.0 | `adaptive` 策略的 UCB 探索系数；0 只利用历史平均增益 |
+| `TIE_DIMENSION_LESSONS` | 环境变量 | 0（关闭） | 总分与胜者并列、但某维度更优的未选候选沉淀维度经验；候选本身仍不保留 |
+| `TIE_DIMENSION_MIN_GAIN` | 环境变量 | 0.0 | 平局候选相对胜者的维度提升须严格超过该百分点才沉淀 |
+| `WEAK_DIMENSION_FOCUS` | 环境变量 | 0（关闭） | 识别低分维度并注入 Analyst/Mutator，重排策略与经验检索，仍只做一个单点修改 |
+| `WEAK_DIMENSION_THRESHOLD` | 环境变量 | 50.0 | `pct` 小于等于该值的已测量维度进入专项列表 |
+| `WEAK_DIMENSION_MAX` | 环境变量 | 2 | 每轮最多专项关注的弱维度数（按分数升序） |
 | `QWEN_ENABLE_THINKING` | 环境变量 | 0（关闭） | 打开模型思考模式；部分模型（如 `qwen3.7-max-2026-05-17`）强制要求开启 |
 | `MEMORY_ROUNDS` | 环境变量 | 3 | 注入给 Analyst 的最近轮次记忆条数（轮间经验，避免反复修同一根因） |
 | `PATIENCE` | 环境变量 | 0（关闭） | 连续 N 轮未提升即提前终止优化（耐心早停） |
 | `SATURATION_EXIT` | 环境变量 | 0（关闭） | 基线无可提升带（100% 或 0 分全失败）时跳过全部轮次 |
 | `FINAL_CONFIRM` | 环境变量 | 0（关闭） | 完成前对最终版本独立复核，未超过基线则回退（防单点幸运） |
-| `SKILL_LESSONS_FILE` | 环境变量 | 无（关闭） | 跨会话经验库路径（jsonl）：保留的修改沉淀为经验，下次优化注入 Analyst/Mutator |
+| `SKILL_LESSONS_FILE` | 环境变量 | 无（关闭） | 跨会话经验库路径（jsonl 或 SQLite）：保留的修改沉淀为经验，下次优化注入 Analyst/Mutator |
 | `LESSON_N` | 环境变量 | 5 | 每次优化读取的最近经验条数 |
 | `LESSON_RETRIEVAL` | 环境变量 | off | 经验注入方式：`off`（最近 N 条）/ `tag`（同技能硬过滤）/ `semantic`（embedding 语义检索）/ `hybrid`（dense+sparse 混合）。semantic/hybrid 需要经验库使用 `.db` 后缀（SQLite）并调用 DashScope text-embedding-v3 |
 | `LESSON_THRESHOLD` | 环境变量 | 0.3 | semantic 检索的余弦相似度阈值（0~1） |
 | `LESSON_TOP_K` | 环境变量 | 5 | semantic/hybrid 检索后注入的经验条数（与 LESSON_N 读取条数独立） |
 | `LESSON_RERANK` | 环境变量 | 0（关闭） | 开启后对检索候选池调用 DashScope gte-rerank 重排再取 top-K（失败自动降级） |
 | `LESSON_RERANK_POOL` | 环境变量 | 20 | rerank 的候选池大小 |
+| `LESSON_RAG_PIPELINE` | 环境变量 | classic | `classic` 保持原排序；`quality_diverse` 开启语义/词面/技能/领域/弱维度/历史收益/时序多信号排序，再去重并做多样性选择 |
+| `LESSON_CANDIDATE_POOL` | 环境变量 | 20 | `quality_diverse` 在去重与多样性选择前保留的候选数 |
+| `LESSON_DIVERSITY` | 环境变量 | 0.2 | `quality_diverse` 的重复惩罚（0–1；越高越偏好多样经验） |
+| `LESSON_DEDUP_THRESHOLD` | 环境变量 | 0.92 | `quality_diverse` 的近重复 Jaccard 阈值（0–1） |
+| `LESSON_CONTEXT_CHARS` | 环境变量 | 6000 | `quality_diverse` 注入经验的总字符预算（至少 500） |
+| `LESSON_SIGNAL_WEIGHTS` | 环境变量 | 内置权重 | 可选 JSON，覆盖并自动归一化 `semantic/sparse/skill/domain/dimension/quality/recency` 权重 |
 | `LESSON_MIN_GAIN` | 环境变量 | 0（关闭） | 经验沉淀质量门槛-提升幅度：score_after − score_before ≥ 该值才沉淀（OR 语义；推荐开启值 15） |
 | `LESSON_MIN_FINAL` | 环境变量 | 0（关闭） | 经验沉淀质量门槛-最终水位：score_after ≥ 该值才沉淀（OR 语义；推荐开启值 85）。任一维度达标即沉淀，过滤小修噪音 |
 
 > **安全与不变量**：凭据字段恒为 `qwen_api_key`；密钥仅存组件内存与请求体，绝不落日志/会话/zip/git。一次变异仍只改 SKILL.md 一处；只有「严格提升」的变异才会被保留，回归守卫只会更严格，绝不会让技能退化。
+
+角色模型示例（未设置三个角色变量时，行为与原来完全相同）：
+
+```bash
+EXECUTOR_MODEL=qwen-plus \
+ANALYST_MODEL=qwen-max \
+MUTATOR_MODEL=qwen-max \
+python backend/app.py
+```
+
+任一角色模型名以 `deepseek-` 开头时，仅该角色走现有 DeepSeek 显式路由；密钥仍只通过请求体直传。
 
 在 `qwen_optimizer.py` 中调整模型：
 

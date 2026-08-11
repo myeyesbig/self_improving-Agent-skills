@@ -25,6 +25,7 @@
 import asyncio
 import datetime
 import json
+import math
 import os
 import re
 from typing import Callable, Dict, List, Optional
@@ -42,9 +43,12 @@ class _RoleMessage:
     不再需要 Assistant 实例或每槽独立实例池的线程安全约定。
     """
 
-    def __init__(self, name: str, system_message: str):
+    def __init__(self, name: str, system_message: str, role: Optional[str] = None):
         self.name = name
         self.system_message = system_message
+        # ``role`` stays stable for parallel slot names such as ``mutator-1``.
+        # It is used only to select the role-specific LLM client.
+        self.role = role or name
 
 
 # -- Mutation strategy templates ----------------------------------------------
@@ -92,6 +96,17 @@ STRATEGY_TEMPLATES: Dict[str, dict] = {
 }
 
 DEFAULT_STRATEGY_POOL = list(STRATEGY_TEMPLATES.keys())
+
+# 【目标 4】弱维度 → 优先尝试的单点编辑策略。只做排序提示，仍受调用方
+# strategy_pool 白名单约束，不会创建新角色或绕过回归/严格提升门槛。
+WEAK_DIMENSION_STRATEGIES: Dict[str, List[str]] = {
+    "correctness": ["add_constraint", "add_edge_case", "add_example"],
+    "clarity": ["rewrite_section", "restructure", "add_example"],
+    "executability": ["add_example", "add_constraint", "restructure"],
+    "maintainability": ["restructure", "rewrite_section", "add_reference"],
+    "quality": ["rewrite_section", "add_example", "add_constraint"],
+    "semantic_preservation": ["add_constraint", "rewrite_section"],
+}
 
 
 def _active_strategy_pool(strategy_pool: Optional[List[str]] = None) -> List[str]:
@@ -152,6 +167,9 @@ class FailureAnalysis(BaseModel):
     )
     target_section: str = Field(description="Which part of the skill to change")
     suggested_change: str = Field(description="What specific change to make")
+    target_dimension: Optional[str] = Field(
+        default=None, description="Optional weak evaluation dimension targeted by this fix"
+    )
 
 
 class SkillMutation(BaseModel):
@@ -184,8 +202,21 @@ class SkillOptimizer:
         lesson_top_k: Optional[int] = None,
         lesson_rerank: Optional[bool] = None,
         lesson_rerank_pool: Optional[int] = None,
+        lesson_rag_pipeline: Optional[str] = None,
+        lesson_candidate_pool: Optional[int] = None,
+        lesson_diversity: Optional[float] = None,
+        lesson_dedup_threshold: Optional[float] = None,
+        lesson_context_chars: Optional[int] = None,
+        lesson_signal_weights: Optional[Dict[str, float]] = None,
         lesson_min_gain: Optional[float] = None,
         lesson_min_final: Optional[float] = None,
+        tie_dimension_lessons: Optional[bool] = None,
+        tie_dimension_min_gain: Optional[float] = None,
+        weak_dimension_focus: Optional[bool] = None,
+        weak_dimension_threshold: Optional[float] = None,
+        weak_dimension_max: Optional[int] = None,
+        search_policy: Optional[str] = None,
+        search_exploration: Optional[float] = None,
         checkpoint_file: Optional[str] = None,
         stop_provider: Optional[Callable[[], bool]] = None,
         deepseek_api_key: Optional[str] = None,
@@ -293,6 +324,79 @@ class SkillOptimizer:
                 lesson_rerank_pool = 20
         self.lesson_rerank_pool = max(2, int(lesson_rerank_pool))
 
+        # 【目标 5：经验 RAG v2】classic（默认）逐字保留原检索路径；只有显式
+        # 开启 quality_diverse 才启用多信号质量排序、去重和 MMR 式多样性选择。
+        # 所有参数仅影响 lesson store，不改变优化器的严格提升/回归守卫语义。
+        if lesson_rag_pipeline is None:
+            lesson_rag_pipeline = os.getenv("LESSON_RAG_PIPELINE", "classic")
+        if lesson_rag_pipeline not in ("classic", "quality_diverse"):
+            lesson_rag_pipeline = "classic"
+        self.lesson_rag_pipeline = lesson_rag_pipeline
+
+        if lesson_candidate_pool is None:
+            try:
+                lesson_candidate_pool = int(os.getenv("LESSON_CANDIDATE_POOL", "20"))
+            except ValueError:
+                lesson_candidate_pool = 20
+        self.lesson_candidate_pool = max(2, int(lesson_candidate_pool))
+
+        if lesson_diversity is None:
+            try:
+                lesson_diversity = float(os.getenv("LESSON_DIVERSITY", "0.2"))
+            except ValueError:
+                lesson_diversity = 0.2
+        self.lesson_diversity = max(0.0, min(float(lesson_diversity), 1.0))
+
+        if lesson_dedup_threshold is None:
+            try:
+                lesson_dedup_threshold = float(os.getenv("LESSON_DEDUP_THRESHOLD", "0.92"))
+            except ValueError:
+                lesson_dedup_threshold = 0.92
+        self.lesson_dedup_threshold = max(
+            0.0, min(float(lesson_dedup_threshold), 1.0)
+        )
+
+        if lesson_context_chars is None:
+            try:
+                lesson_context_chars = int(os.getenv("LESSON_CONTEXT_CHARS", "6000"))
+            except ValueError:
+                lesson_context_chars = 6000
+        self.lesson_context_chars = max(500, int(lesson_context_chars))
+
+        default_signal_weights = {
+            "semantic": 0.35,
+            "sparse": 0.15,
+            "skill": 0.12,
+            "domain": 0.08,
+            "dimension": 0.12,
+            "quality": 0.13,
+            "recency": 0.05,
+        }
+        if lesson_signal_weights is None:
+            env_signal_weights = os.getenv("LESSON_SIGNAL_WEIGHTS")
+            if env_signal_weights:
+                try:
+                    lesson_signal_weights = json.loads(env_signal_weights)
+                except (json.JSONDecodeError, TypeError):
+                    lesson_signal_weights = None
+        valid_signal_weights = {}
+        if isinstance(lesson_signal_weights, dict):
+            for name in default_signal_weights:
+                try:
+                    weight = float(lesson_signal_weights.get(name, 0.0))
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(weight) and weight >= 0:
+                    valid_signal_weights[name] = weight
+        weight_total = sum(valid_signal_weights.values())
+        if weight_total <= 0:
+            self.lesson_signal_weights = default_signal_weights
+        else:
+            self.lesson_signal_weights = {
+                name: valid_signal_weights.get(name, 0.0) / weight_total
+                for name in default_signal_weights
+            }
+
         # 【经验沉淀质量门槛】LESSON_MIN_GAIN（提升幅度）/ LESSON_MIN_FINAL
         # （最终水位），OR 语义：任一启用的维度达标才沉淀经验；全 0=关闭=
         # 旧行为（任何 kept 都沉淀）。只影响经验库质量，不动优化保留语义。
@@ -309,6 +413,37 @@ class SkillOptimizer:
                 lesson_min_final = 0.0
         self.lesson_min_final = max(0.0, float(lesson_min_final))
 
+        # 【目标 3：平局维度经验】默认关闭。开启后，总分与胜者相同但在至少
+        # 一个评分维度更优的未选候选会沉淀“维度优势”元数据；候选本身仍不
+        # 被保留，严格提升与单一 current_md 不变量完全不动。
+        if tie_dimension_lessons is None:
+            tie_dimension_lessons = os.getenv("TIE_DIMENSION_LESSONS", "0") != "0"
+        self.tie_dimension_lessons = tie_dimension_lessons
+        if tie_dimension_min_gain is None:
+            try:
+                tie_dimension_min_gain = float(os.getenv("TIE_DIMENSION_MIN_GAIN", "0.0"))
+            except ValueError:
+                tie_dimension_min_gain = 0.0
+        self.tie_dimension_min_gain = max(0.0, float(tie_dimension_min_gain))
+
+        # 【目标 4：弱维度专项】默认关闭。开启时，把低于阈值的维度按分数
+        # 排序并显式注入 Analyst / Mutator，同时重排候选策略与经验检索查询。
+        if weak_dimension_focus is None:
+            weak_dimension_focus = os.getenv("WEAK_DIMENSION_FOCUS", "0") != "0"
+        self.weak_dimension_focus = weak_dimension_focus
+        if weak_dimension_threshold is None:
+            try:
+                weak_dimension_threshold = float(os.getenv("WEAK_DIMENSION_THRESHOLD", "50.0"))
+            except ValueError:
+                weak_dimension_threshold = 50.0
+        self.weak_dimension_threshold = max(0.0, min(100.0, float(weak_dimension_threshold)))
+        if weak_dimension_max is None:
+            try:
+                weak_dimension_max = int(os.getenv("WEAK_DIMENSION_MAX", "2"))
+            except ValueError:
+                weak_dimension_max = 2
+        self.weak_dimension_max = max(1, int(weak_dimension_max))
+
         # 【安全】仅内存持有 key 引用，用于 embedding/rerank 的 DashScope 调用；
         # 绝不打印、不落日志、不写环境变量、不序列化进任何返回结构。
         self._api_key = api_key
@@ -320,13 +455,36 @@ class SkillOptimizer:
         # temperature=0.2、QWEN_ENABLE_THINKING（默认关闭思考）。
         # 【双 key】deepseek_api_key 是可选 DeepSeek key（前端双输入框场景）；
         # DeepSeek 分支优先用它，未传则回退 api_key / DEEPSEEK_API_KEY 环境变量。
+        enable_thinking = os.getenv("QWEN_ENABLE_THINKING", "0") != "0"
         self._llm = LLMClient(
             api_key=api_key,
             model=self.model,
             temperature=0.2,
-            enable_thinking=os.getenv("QWEN_ENABLE_THINKING", "0") != "0",
+            enable_thinking=enable_thinking,
             deepseek_api_key=deepseek_api_key,
         )
+
+        # 【目标 1：角色模型分工】三个角色可分别覆盖基础模型。所有变量均未
+        # 设置时，各角色继续复用上面的单一客户端，调用序列与旧行为一致。
+        # 路由仍由 LLMClient 的既有显式规则决定：deepseek- 前缀走 DeepSeek，
+        # 其余模型走主服务 DashScope；这里不引入通用 provider 抽象。
+        self.executor_model = os.getenv("EXECUTOR_MODEL") or self.model
+        self.analyst_model = os.getenv("ANALYST_MODEL") or self.model
+        self.mutator_model = os.getenv("MUTATOR_MODEL") or self.model
+        self._role_llms = {}
+        for role, role_model in (
+            ("executor", self.executor_model),
+            ("analyst", self.analyst_model),
+            ("mutator", self.mutator_model),
+        ):
+            if role_model != self.model:
+                self._role_llms[role] = LLMClient(
+                    api_key=api_key,
+                    model=role_model,
+                    temperature=0.2,
+                    enable_thinking=enable_thinking,
+                    deepseek_api_key=deepseek_api_key,
+                )
 
         # 【C2】维度权重：评分按 eval.dimension 分组后加权；无权重时与旧
         # 通过率完全一致。可用 ANALYST_DIMENSION_WEIGHTS（JSON）环境变量覆盖。
@@ -359,24 +517,39 @@ class SkillOptimizer:
                 parallelism = 1
         self.parallelism = max(1, min(int(parallelism), 3))
 
+        # 【目标 2：自适应策略组合】默认 classic 完整保留旧路径；adaptive
+        # 才让并行候选使用不同策略，并按历史实测增益的 UCB 分数分配槽位。
+        # 该机制只决定“尝试哪种单点编辑”，绝不改变严格提升保留门槛。
+        if search_policy is None:
+            search_policy = os.getenv("OPTIMIZATION_SEARCH", "classic")
+        if search_policy not in ("classic", "adaptive"):
+            search_policy = "classic"
+        self.search_policy = search_policy
+        if search_exploration is None:
+            try:
+                search_exploration = float(os.getenv("SEARCH_EXPLORATION", "1.0"))
+            except ValueError:
+                search_exploration = 1.0
+        self.search_exploration = max(0.0, float(search_exploration))
+
         # 三个角色只需各自的 system prompt（LLM 调用已收敛进 llm_client）；
         # 保留 executor/analyst/mutator 与并行槽位池属性，兼容既有调用点
         # 与测试引用（_ask 通过 getattr(agent, "system_message") 取提示词）。
         # Executor：三种模式 —— 执行技能 / 生成测试场景与评分标准 / 给输出打分。
-        self.executor = _RoleMessage("executor", EXECUTOR_SYSTEM_PROMPT)
+        self.executor = _RoleMessage("executor", EXECUTOR_SYSTEM_PROMPT, role="executor")
         # Analyst：根据失败的评估结果定位根因，并选择一种修改策略。
-        self.analyst = _RoleMessage("analyst", ANALYST_SYSTEM_PROMPT)
+        self.analyst = _RoleMessage("analyst", ANALYST_SYSTEM_PROMPT, role="analyst")
         # Mutator：根据诊断对 SKILL.md 做"恰好一处"针对性修改，返回完整新内容。
-        self.mutator = _RoleMessage("mutator", MUTATOR_SYSTEM_PROMPT)
+        self.mutator = _RoleMessage("mutator", MUTATOR_SYSTEM_PROMPT, role="mutator")
 
         # 【C3 并行】槽位池保留（每槽独立角色对象，语义对齐旧 Assistant 池）；
         # llm_client 无会话状态，天然支持并发，无需再担心共享实例并发问题。
         self.mutator_pool = [self.mutator] + [
-            _RoleMessage(f"mutator-{i}", MUTATOR_SYSTEM_PROMPT)
+            _RoleMessage(f"mutator-{i}", MUTATOR_SYSTEM_PROMPT, role="mutator")
             for i in range(1, self.parallelism)
         ]
         self.executor_pool = [self.executor] + [
-            _RoleMessage(f"executor-{i}", EXECUTOR_SYSTEM_PROMPT)
+            _RoleMessage(f"executor-{i}", EXECUTOR_SYSTEM_PROMPT, role="executor")
             for i in range(1, self.parallelism)
         ]
 
@@ -396,7 +569,9 @@ class SkillOptimizer:
         directly, so this is a single plain call with retry inside llm_client.
         """
         system = getattr(agent, "system_message", "") or ""
-        return self._llm.sync_call(system=system, user=prompt, json_mode=json_mode)
+        role = getattr(agent, "role", "") or ""
+        client = self._role_llms.get(role, self._llm)
+        return client.sync_call(system=system, user=prompt, json_mode=json_mode)
 
     async def _ask(self, agent, prompt: str, json_mode: bool = False) -> str:
         """Run the LLM with a prompt, return text response.
@@ -574,6 +749,8 @@ class SkillOptimizer:
             "current_md": "",
             "baseline_pct": 0.0,
             "current_details": [],
+            "current_dimension_scores": {},
+            "weak_dimensions": [],
             "score_history": [],
             "mutation_log": [],
             "round_memory": [],
@@ -886,7 +1063,8 @@ class SkillOptimizer:
                 pass  # stop_provider 自身异常视为未停止，不影响优化
 
     async def _analyze_failures(self, skill_md, scenarios, evals, details, strategy_pool=None,
-                                round_memory=None, mutation_log=None, lessons=None):
+                                round_memory=None, mutation_log=None, lessons=None,
+                                weak_dimensions=None):
         """Analyst agent diagnoses the worst failures.
 
         【C1】strategy_pool 白名单：只把允许的策略模板及其描述拼进提示词，
@@ -903,6 +1081,7 @@ class SkillOptimizer:
                 "mutation_strategy": "add_constraint",
                 "target_section": "N/A",
                 "suggested_change": "none",
+                "target_dimension": None,
             }
 
         # 解析生效的策略池，并生成"策略 → 描述"的提示片段。
@@ -928,6 +1107,25 @@ class SkillOptimizer:
             f"Failures:\n{json.dumps(failed[:5], indent=2)}\n\n"
             f"Allowed mutation strategies (pick exactly one):\n{strategy_desc}"
         )
+
+        # 【目标 4】弱维度专项诊断：只注入维度统计与相关失败标准，要求本轮
+        # 仍只提出一个、能直接改善最弱维度的修改。
+        if weak_dimensions:
+            weak_names = [d["dimension"] for d in weak_dimensions]
+            eval_dimensions = {e.get("id"): e.get("dimension", "correctness") for e in evals}
+            focused_failures = [
+                d for d in failed if eval_dimensions.get(d.get("eval_id")) in weak_names
+            ][:5]
+            preferred = self._focused_strategy_pool(pool, weak_dimensions)
+            prompt += (
+                f"\n\nPriority weak dimensions (lowest first):\n"
+                f"{json.dumps(weak_dimensions, ensure_ascii=False)}\n"
+                f"Failures in those dimensions:\n"
+                f"{json.dumps(focused_failures, ensure_ascii=False)}\n"
+                f"Preferred strategies for this weakness: {json.dumps(preferred)}\n"
+                f"Set target_dimension to one listed weak dimension. The ONE suggested "
+                f"change must directly improve it without sacrificing other dimensions."
+            )
 
         # 【P2 轮间记忆】最近 MEMORY_ROUNDS 条历史注入，默认 3。
         if round_memory:
@@ -972,6 +1170,9 @@ class SkillOptimizer:
                 "mutation_strategy": pool[0] if pool else "add_constraint",
                 "target_section": "TBD",
                 "suggested_change": f"Apply the {pool[0] if pool else 'add_constraint'} strategy to address the failing criteria",
+                "target_dimension": (
+                    weak_dimensions[0]["dimension"] if weak_dimensions else None
+                ),
             },
             schema=FailureAnalysis,
         )
@@ -1000,6 +1201,11 @@ class SkillOptimizer:
             f"Target: {analysis.get('target_section')}\n"
             f"Change: {analysis.get('suggested_change')}"
         )
+        if analysis.get("target_dimension"):
+            prompt += (
+                f"\nTarget evaluation dimension: {analysis['target_dimension']}\n"
+                f"Use the ONE edit to improve this dimension while preserving all others."
+            )
         if hint:
             prompt += f"\nStrategy guidance: {hint}"
         if lessons:
@@ -1032,6 +1238,80 @@ class SkillOptimizer:
             if m.get("kept"):
                 stats[s]["kept"] += 1
         return stats
+
+    def _select_candidate_strategies(self, strategy_pool, mutation_log, n, primary_strategy):
+        """Select a deterministic explore/exploit portfolio for one round.
+
+        Untried strategies are explored first (the Analyst's choice wins ties).
+        Once tried, strategies are ranked by normalized mean positive score gain
+        plus a UCB exploration bonus. Candidate evaluation remains unchanged;
+        only a strictly improving best candidate can update ``current_md``.
+        """
+        pool = [s for s in strategy_pool if s in STRATEGY_TEMPLATES]
+        if not pool:
+            return [primary_strategy or "add_constraint"] * max(1, n)
+
+        stats = {s: {"attempts": 0, "reward": 0.0} for s in pool}
+        for entry in mutation_log or []:
+            strategy = entry.get("strategy_type")
+            if strategy not in stats:
+                continue
+            stats[strategy]["attempts"] += 1
+            gain = max(0.0, float(entry.get("score_after", 0.0)) - float(entry.get("score_before", 0.0)))
+            stats[strategy]["reward"] += gain / 100.0
+        total_attempts = sum(s["attempts"] for s in stats.values())
+
+        def rank(item):
+            index, strategy = item
+            attempts = stats[strategy]["attempts"]
+            # Deterministic cold-start: honor the Analyst first, then pool order.
+            if attempts == 0:
+                return (1, 1 if strategy == primary_strategy else 0, 0.0, -index)
+            mean_reward = stats[strategy]["reward"] / attempts
+            bonus = self.search_exploration * math.sqrt(
+                math.log(max(total_attempts, 1) + 1) / attempts
+            )
+            analyst_bonus = 0.05 if strategy == primary_strategy else 0.0
+            return (0, 0, mean_reward + bonus + analyst_bonus, -index)
+
+        ordered = [s for _, s in sorted(enumerate(pool), key=rank, reverse=True)]
+        count = max(1, int(n))
+        return [ordered[i % len(ordered)] for i in range(count)]
+
+    def _identify_weak_dimensions(self, dimension_scores):
+        """Return scored dimensions at/below the configured weakness threshold."""
+        if not self.weak_dimension_focus:
+            return []
+        weak = []
+        for dimension, stats in (dimension_scores or {}).items():
+            if not isinstance(stats, dict):
+                continue
+            try:
+                total = int(stats.get("total", 0))
+                passed = int(stats.get("passed", 0))
+                pct = float(stats.get("pct", 0.0))
+            except (TypeError, ValueError):
+                continue
+            if total > 0 and pct <= self.weak_dimension_threshold:
+                weak.append({
+                    "dimension": dimension,
+                    "pct": pct,
+                    "passed": passed,
+                    "total": total,
+                })
+        weak.sort(key=lambda d: (d["pct"], d["dimension"]))
+        return weak[:self.weak_dimension_max]
+
+    @staticmethod
+    def _focused_strategy_pool(strategy_pool, weak_dimensions):
+        """Reorder an allowed strategy pool around the weakest dimensions."""
+        pool = [s for s in strategy_pool if s in STRATEGY_TEMPLATES]
+        preferred = []
+        for item in weak_dimensions or []:
+            for strategy in WEAK_DIMENSION_STRATEGIES.get(item.get("dimension"), []):
+                if strategy in pool and strategy not in preferred:
+                    preferred.append(strategy)
+        return preferred + [s for s in pool if s not in preferred]
 
     # -- P4 跨会话经验库（SQLite / jsonl 双存储）--------------------------------
     # 【P4】经验库只记录模型生成的策略/诊断/摘要与分数，绝不落 skill_md /
@@ -1084,9 +1364,18 @@ class SkillOptimizer:
             import sqlite3
             conn = sqlite3.connect(path)
             try:
+                columns = {
+                    row[1] for row in conn.execute("PRAGMA table_info(lessons)").fetchall()
+                }
+                lesson_type_col = "lesson_type" if "lesson_type" in columns else "NULL"
+                dimension_gains_col = "dimension_gains" if "dimension_gains" in columns else "NULL"
+                target_dimension_col = (
+                    "target_dimension" if "target_dimension" in columns else "NULL"
+                )
                 rows = conn.execute(
                     "SELECT id, skill_name, domain, skill_description, strategy, diagnosis, "
-                    "summary, score_before, score_after, created_at, embedding "
+                    "summary, score_before, score_after, created_at, embedding, "
+                    f"{lesson_type_col}, {dimension_gains_col}, {target_dimension_col} "
                     "FROM lessons ORDER BY id DESC LIMIT ?",
                     (max(1, limit),),
                 ).fetchall()
@@ -1102,6 +1391,15 @@ class SkillOptimizer:
                     if r[10]:
                         import numpy as np
                         lesson["embedding"] = np.frombuffer(r[10], dtype=np.float32)
+                    if r[11]:
+                        lesson["lesson_type"] = r[11]
+                    if r[12]:
+                        try:
+                            lesson["dimension_gains"] = json.loads(r[12])
+                        except (json.JSONDecodeError, TypeError):
+                            pass
+                    if r[13]:
+                        lesson["target_dimension"] = r[13]
                     lessons.append(lesson)
                 return lessons
             finally:
@@ -1149,12 +1447,24 @@ class SkillOptimizer:
                     "skill_name TEXT, domain TEXT, skill_description TEXT,"
                     "strategy TEXT, diagnosis TEXT, summary TEXT,"
                     "score_before REAL, score_after REAL, created_at TEXT,"
-                    "embedding BLOB)"
+                    "embedding BLOB, lesson_type TEXT, dimension_gains TEXT,"
+                    "target_dimension TEXT)"
                 )
+                # 兼容既有数据库：CREATE IF NOT EXISTS 不会补列，按需迁移。
+                columns = {
+                    row[1] for row in conn.execute("PRAGMA table_info(lessons)").fetchall()
+                }
+                if "lesson_type" not in columns:
+                    conn.execute("ALTER TABLE lessons ADD COLUMN lesson_type TEXT")
+                if "dimension_gains" not in columns:
+                    conn.execute("ALTER TABLE lessons ADD COLUMN dimension_gains TEXT")
+                if "target_dimension" not in columns:
+                    conn.execute("ALTER TABLE lessons ADD COLUMN target_dimension TEXT")
                 conn.execute(
                     "INSERT INTO lessons (skill_name, domain, skill_description, strategy, "
-                    "diagnosis, summary, score_before, score_after, created_at, embedding) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    "diagnosis, summary, score_before, score_after, created_at, embedding, "
+                    "lesson_type, dimension_gains, target_dimension) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         lesson.get("skill_name"), lesson.get("domain"),
                         lesson.get("skill_description"), lesson.get("strategy"),
@@ -1162,6 +1472,12 @@ class SkillOptimizer:
                         lesson.get("score_before"), lesson.get("score_after"),
                         lesson.get("created_at"),
                         SkillOptimizer._embedding_to_blob(lesson.get("embedding")),
+                        lesson.get("lesson_type"),
+                        (
+                            json.dumps(lesson.get("dimension_gains"), ensure_ascii=False)
+                            if lesson.get("dimension_gains") else None
+                        ),
+                        lesson.get("target_dimension"),
                     ),
                 )
                 # 上限 1000：删除最旧的超量行。
@@ -1213,17 +1529,22 @@ class SkillOptimizer:
             lesson.get("strategy", ""),
             lesson.get("diagnosis", ""),
             lesson.get("summary", ""),
+            lesson.get("target_dimension", ""),
         ]
+        if lesson.get("dimension_gains"):
+            parts.append(json.dumps(lesson["dimension_gains"], ensure_ascii=False, sort_keys=True))
         return " ".join(str(p) for p in parts if p)
 
     @staticmethod
-    def _build_query(skill_name, domain, scenarios, evals, current_details):
+    def _build_query(skill_name, domain, scenarios, evals, current_details, weak_dimensions=None):
         """检索查询：领域 + 技能名 + 最近失败原因 + 场景输入摘要（规则拼接）。"""
         parts = []
         if domain:
             parts.append(f"domain: {domain}")
         if skill_name:
             parts.append(f"skill: {skill_name}")
+        for item in weak_dimensions or []:
+            parts.append(f"weak dimension: {item.get('dimension')} {item.get('pct')} percent")
         failed = [d for d in (current_details or []) if not d.get("passed")]
         for d in failed[:3]:
             parts.append(str(d.get("reason") or ""))
@@ -1255,12 +1576,22 @@ class SkillOptimizer:
 
     @staticmethod
     def _sparse_jaccard(query, text):
-        """极简稀疏分：查询与文本的词集合 Jaccard（术语精确匹配兜底）。"""
-        q = set(re.findall(r"[a-z0-9]+", (query or "").lower()))
-        t = set(re.findall(r"[a-z0-9]+", (text or "").lower()))
+        """轻量稀疏分：ASCII 词 + CJK 单字/双字 Jaccard，无新增分词依赖。"""
+        q = SkillOptimizer._lesson_tokens(query)
+        t = SkillOptimizer._lesson_tokens(text)
         if not q or not t:
             return 0.0
         return len(q & t) / len(q | t)
+
+    @staticmethod
+    def _lesson_tokens(text):
+        """Tokenize English identifiers and Chinese text for sparse/dedup scoring."""
+        value = (text or "").lower()
+        tokens = set(re.findall(r"[a-z0-9_]+", value))
+        cjk = re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff]", value)
+        tokens.update(cjk)
+        tokens.update("".join(cjk[i:i + 2]) for i in range(len(cjk) - 1))
+        return tokens
 
     @staticmethod
     def _rrf_fuse(rank_lists, k=60):
@@ -1312,12 +1643,228 @@ class SkillOptimizer:
         """rerank（线程桥接，不阻塞事件循环）。"""
         return await asyncio.to_thread(self._rerank_sync, query, docs)
 
-    async def _retrieve_lessons(self, lessons, query, mode, limit):
+    @staticmethod
+    def _lesson_quality_score(lesson):
+        """Map historical gain/final score to a bounded quality prior."""
+        try:
+            before = float(lesson.get("score_before", 0.0))
+            after = float(lesson.get("score_after", 0.0))
+        except (TypeError, ValueError):
+            return 0.0
+        gain = max(0.0, min((after - before) / 100.0, 1.0))
+        final = max(0.0, min(after / 100.0, 1.0))
+        return 0.6 * gain + 0.4 * final
+
+    @staticmethod
+    def _lesson_metadata_signals(lesson, context):
+        """Return soft skill/domain/weak-dimension matches for RAG v2."""
+        context = context or {}
+        skill_name = context.get("skill_name") or ""
+        domain = context.get("domain") or ""
+        lesson_skill = lesson.get("skill_name") or ""
+        lesson_domain = lesson.get("domain") or ""
+
+        if skill_name:
+            skill_score = 1.0 if lesson_skill == skill_name else (0.25 if not lesson_skill else 0.0)
+        else:
+            skill_score = 0.5 if not lesson_skill else 0.0
+        if domain:
+            domain_score = 1.0 if lesson_domain == domain else (0.25 if not lesson_domain else 0.0)
+        else:
+            domain_score = 0.5 if not lesson_domain else 0.0
+
+        weak = {
+            str(item.get("dimension"))
+            for item in context.get("weak_dimensions", [])
+            if isinstance(item, dict) and item.get("dimension")
+        }
+        lesson_dimensions = set((lesson.get("dimension_gains") or {}).keys())
+        if lesson.get("target_dimension"):
+            lesson_dimensions.add(str(lesson["target_dimension"]))
+        dimension_score = 1.0 if weak and weak.intersection(lesson_dimensions) else 0.0
+        return skill_score, domain_score, dimension_score
+
+    async def _retrieve_lessons_quality_diverse(self, lessons, query, mode, limit, context):
+        """RAG v2: multi-signal ranking, optional rerank, dedup, then MMR diversity."""
+        qvec = await self._embed(query)
+        records = []
+        count = max(1, len(lessons))
+        for index, lesson in enumerate(lessons):
+            vec = lesson.get("embedding")
+            if vec is None:
+                vec = await self._embed(self._lesson_index_text(lesson))
+                lesson["embedding"] = vec
+                if lesson.get("_id") is not None:
+                    self._update_lesson_embedding(self.lesson_file, lesson["_id"], vec)
+            semantic = max(0.0, min(self._cosine(qvec, vec), 1.0))
+            if mode == "semantic" and semantic < self.lesson_threshold:
+                continue
+            sparse = self._sparse_jaccard(query, self._lesson_index_text(lesson))
+            skill, domain, dimension = self._lesson_metadata_signals(lesson, context)
+            components = {
+                "semantic": semantic,
+                "sparse": sparse,
+                "skill": skill,
+                "domain": domain,
+                "dimension": dimension,
+                "quality": self._lesson_quality_score(lesson),
+                "recency": (index + 1) / count,
+            }
+            score = sum(
+                self.lesson_signal_weights[name] * value
+                for name, value in components.items()
+            )
+            reasons = []
+            if skill >= 1.0:
+                reasons.append("same_skill")
+            if domain >= 1.0:
+                reasons.append("same_domain")
+            if dimension >= 1.0:
+                reasons.append("weak_dimension")
+            records.append({
+                "lesson": lesson,
+                "score": score,
+                "components": components,
+                "reasons": reasons,
+                "tokens": self._lesson_tokens(self._lesson_index_text(lesson)),
+                "order": index,
+            })
+        if not records:
+            return []
+
+        records.sort(key=lambda r: (-r["score"], r["order"]))
+        pool_size = max(limit, self.lesson_candidate_pool)
+        if self.lesson_rerank:
+            pool_size = max(pool_size, self.lesson_rerank_pool)
+        records = records[:pool_size]
+
+        # Cross-encoder remains optional. Its rank is blended with the deterministic
+        # metadata/quality score so a transient reranker cannot erase all safeguards.
+        if self.lesson_rerank and records:
+            try:
+                reranked = await self._rerank(
+                    query, [self._lesson_index_text(r["lesson"]) for r in records]
+                )
+                rerank_position = {
+                    int(item.get("index", -1)): rank
+                    for rank, item in enumerate(reranked)
+                    if 0 <= int(item.get("index", -1)) < len(records)
+                }
+                denom = max(1, len(records))
+                for original_index, record in enumerate(records):
+                    rank = rerank_position.get(original_index, len(records))
+                    rerank_score = max(0.0, 1.0 - rank / denom)
+                    record["score"] = 0.7 * record["score"] + 0.3 * rerank_score
+                    record["components"]["rerank"] = rerank_score
+                records.sort(key=lambda r: (-r["score"], r["order"]))
+            except Exception:
+                pass
+
+        # Remove exact/near-duplicate advice before selection. Similarity is based
+        # only on model-generated lesson metadata; no skill/scenario/output is stored.
+        deduped = []
+        for record in records:
+            if any(
+                self._token_jaccard(record["tokens"], kept["tokens"])
+                >= self.lesson_dedup_threshold
+                for kept in deduped
+            ):
+                continue
+            deduped.append(record)
+
+        # Greedy maximal-marginal-relevance selection avoids injecting five versions
+        # of the same fix while keeping the strongest item first.
+        selected = []
+        remaining = list(deduped)
+        while remaining and len(selected) < max(1, limit):
+            best_index = 0
+            best_value = -float("inf")
+            for index, record in enumerate(remaining):
+                redundancy = max(
+                    (self._token_jaccard(record["tokens"], item["tokens"]) for item in selected),
+                    default=0.0,
+                )
+                value = record["score"] - self.lesson_diversity * redundancy
+                if value > best_value:
+                    best_index, best_value = index, value
+            selected.append(remaining.pop(best_index))
+
+        output = []
+        for record in selected:
+            lesson = dict(record["lesson"])
+            lesson["_retrieval"] = {
+                "pipeline": "quality_diverse",
+                "score": round(record["score"], 4),
+                "matched": record["reasons"],
+                "signals": {
+                    name: round(value, 4)
+                    for name, value in record["components"].items()
+                },
+            }
+            output.append(lesson)
+        return output
+
+    @staticmethod
+    def _token_jaccard(left, right):
+        if not left or not right:
+            return 0.0
+        return len(left & right) / len(left | right)
+
+    def _compact_lessons_for_prompt(self, lessons):
+        """Whitelist and bound v2 lesson context; embeddings/internal ids never enter prompts."""
+        allowed = (
+            "skill_name", "domain", "strategy", "diagnosis", "summary",
+            "score_before", "score_after", "lesson_type", "target_dimension",
+            "dimension_gains", "_retrieval",
+        )
+        compact = []
+        for lesson in lessons:
+            item = {name: lesson[name] for name in allowed if lesson.get(name) is not None}
+            for text_field in ("diagnosis", "summary"):
+                if text_field in item:
+                    item[text_field] = str(item[text_field])[:300]
+            candidate = compact + [item]
+            if len(json.dumps(candidate, ensure_ascii=False)) > self.lesson_context_chars:
+                if compact:
+                    break
+                # Always try to retain one useful lesson, but shrink verbose fields
+                # until the configured budget is genuinely respected.
+                if "diagnosis" in item:
+                    item["diagnosis"] = item["diagnosis"][:120]
+                if "summary" in item:
+                    item["summary"] = item["summary"][:120]
+                retrieval = item.get("_retrieval")
+                if (
+                    len(json.dumps([item], ensure_ascii=False)) > self.lesson_context_chars
+                    and isinstance(retrieval, dict)
+                ):
+                    retrieval.pop("signals", None)
+                if len(json.dumps([item], ensure_ascii=False)) > self.lesson_context_chars:
+                    for optional_field in (
+                        "skill_name", "domain", "score_before", "score_after", "lesson_type"
+                    ):
+                        item.pop(optional_field, None)
+                if len(json.dumps([item], ensure_ascii=False)) > self.lesson_context_chars:
+                    item = {
+                        name: item[name]
+                        for name in ("strategy", "summary", "target_dimension")
+                        if name in item
+                    }
+                if len(json.dumps([item], ensure_ascii=False)) > self.lesson_context_chars:
+                    item = {"strategy": str(item.get("strategy", ""))[:120]}
+            compact.append(item)
+        return compact
+
+    async def _retrieve_lessons(self, lessons, query, mode, limit, context=None):
         """semantic/hybrid 检索：embedding 余弦（+sparse/RRF）；可选 gte-rerank 重排。
 
         【D 选项】LESSON_RERANK 开启时对候选池（前 max(limit, rerank_pool) 条）
         调用 gte-rerank 重排后取 top-K；rerank 失败静默降级到原始排序。
         """
+        if self.lesson_rag_pipeline == "quality_diverse":
+            return await self._retrieve_lessons_quality_diverse(
+                lessons, query, mode, limit, context or {}
+            )
         qvec = await self._embed(query)
         scored = []
         for l in lessons:
@@ -1377,7 +1924,29 @@ class SkillOptimizer:
             return True
         return self.lesson_min_gain <= 0 and self.lesson_min_final <= 0
 
-    async def _prepare_lessons(self, skill_md, scenarios, evals, current_details, domain=None):
+    def _dimension_advantages(self, candidate_scores, winner_scores):
+        """Return dimensions where a tied candidate beats the selected winner."""
+        advantages = {}
+        for dimension, candidate in (candidate_scores or {}).items():
+            if not isinstance(candidate, dict):
+                continue
+            winner = (winner_scores or {}).get(dimension, {})
+            try:
+                candidate_pct = float(candidate.get("pct", 0.0))
+                winner_pct = float(winner.get("pct", 0.0))
+            except (TypeError, ValueError):
+                continue
+            gain = candidate_pct - winner_pct
+            if gain > self.tie_dimension_min_gain:
+                advantages[dimension] = {
+                    "candidate_pct": candidate_pct,
+                    "winner_pct": winner_pct,
+                    "gain": round(gain, 1),
+                }
+        return advantages
+
+    async def _prepare_lessons(self, skill_md, scenarios, evals, current_details, domain=None,
+                               weak_dimensions=None):
         """按 LESSON_RETRIEVAL 模式准备注入的经验；任何检索失败降级不中断。"""
         if not self.lesson_file:
             return []
@@ -1394,16 +1963,32 @@ class SkillOptimizer:
             if mode == "tag":
                 lessons = self._tag_filter(all_lessons, skill_name, domain, read_n)
             else:
-                query = self._build_query(skill_name, domain, scenarios, evals, current_details)
+                query = self._build_query(
+                    skill_name, domain, scenarios, evals, current_details, weak_dimensions
+                )
                 if not query:
                     lessons = self._tag_filter(all_lessons, skill_name, domain, read_n)
                 else:
                     try:
-                        lessons = await self._retrieve_lessons(all_lessons, query, mode, top_k)
+                        lessons = await self._retrieve_lessons(
+                            all_lessons,
+                            query,
+                            mode,
+                            top_k,
+                            context={
+                                "skill_name": skill_name,
+                                "domain": domain or "",
+                                "weak_dimensions": weak_dimensions or [],
+                            },
+                        )
                     except Exception:
                         # 降级链：semantic/hybrid 失败 → tag 过滤（尽力而为）。
                         lessons = self._tag_filter(all_lessons, skill_name, domain, read_n)
-        # 【RAG】剥离内部 _id（仅用于 embedding 写回），不让其进入注入内容。
+        # 【RAG】剥离内部检索字段；embedding 只用于排序/SQLite 复用，绝不进入
+        # Analyst/Mutator prompt。v2 进一步白名单化并限制总字符预算。
         for l in lessons:
             l.pop("_id", None)
+            l.pop("embedding", None)
+        if self.lesson_rag_pipeline == "quality_diverse":
+            lessons = self._compact_lessons_for_prompt(lessons)
         return lessons

@@ -1,23 +1,23 @@
 #!/usr/bin/env python
-"""eval_lessons.py — 评估 RAG 经验检索质量（后续选项 C 的验收脚本）。
+"""Offline evaluation for classic vs quality-diverse lesson retrieval.
 
-用法：
-  # 无 key：用确定性 mock embedding 走通流程（粗验证）
-  python eval_lessons.py --lessons /tmp/skill_lessons.db
+Examples:
+  python eval_lessons.py \
+    --lessons fixtures/lesson_eval_lessons.jsonl \
+    --queries fixtures/lesson_eval_queries.jsonl
 
-  # 有 key：真实 DashScope text-embedding-v3 评估
-  python eval_lessons.py --lessons /tmp/skill_lessons.db --api-key sk-xxx
+  python eval_lessons.py --lessons /tmp/skill_lessons.db --pipeline quality_diverse
 
-  # 指定人工查询集（jsonl，每条 {"query": "...", "skill_name": "...", "domain": "..."}）
-  python eval_lessons.py --lessons x.db --queries queries.jsonl --api-key sk-xxx
-
-指标对照 rag-lesson-retrieval.md 目标：top-5 相关率 ≥0.8、误注入率 <20%、延迟 <50ms。
-注意：无人工查询集时默认用"经验自身的检索文本"作为查询（自相关冒烟，结果偏乐观，
-真实验收请提供 --queries 人工查询集）。
+The evaluator never reads or accepts an API key. It replaces embeddings with a
+deterministic lexical hash vector so the comparison is reproducible and cannot
+leak credentials. Production embedding/rerank calls are covered by separate API
+smoke tests where the key is sent only in the request body.
 """
 import argparse
 import asyncio
+import hashlib
 import json
+import math
 import os
 import sys
 import time
@@ -26,128 +26,232 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from qwen_optimizer import SkillOptimizer
 
 
-def mock_embed(text):
-    """确定性 mock：字符和哈希 → 8 维 one-hot（无 key 时走通流程）。"""
-    idx = sum(ord(c) for c in text) % 8
-    vec = [0.0] * 8
-    vec[idx] = 1.0
-    return vec
+def mock_embed(text, dimensions=128):
+    """Deterministic signed feature hashing over the production sparse tokens."""
+    vector = [0.0] * dimensions
+    for token in SkillOptimizer._lesson_tokens(text):
+        digest = hashlib.sha256(token.encode("utf-8")).digest()
+        index = int.from_bytes(digest[:4], "big") % dimensions
+        vector[index] += 1.0 if digest[4] % 2 else -1.0
+    norm = math.sqrt(sum(value * value for value in vector))
+    return [value / norm for value in vector] if norm else vector
 
 
-def build_queries(lessons):
-    """默认查询集：以每条经验的检索文本为查询（自相关冒烟）。"""
-    queries = []
-    for l in lessons:
-        q = SkillOptimizer._lesson_index_text(l)
-        if not q:
-            q = f"skill: {l.get('skill_name') or ''}".strip()
-        queries.append({
-            "query": q,
-            "skill_name": l.get("skill_name"),
-            "domain": l.get("domain"),
-        })
-    return queries
-
-
-def load_queries(path):
-    queries = []
-    with open(path, encoding="utf-8") as f:
-        for line in f:
+def load_jsonl(path):
+    rows = []
+    with open(path, encoding="utf-8") as stream:
+        for line in stream:
             line = line.strip()
             if not line:
                 continue
             try:
-                queries.append(json.loads(line))
+                row = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            if isinstance(row, dict):
+                rows.append(row)
+    return rows
+
+
+def lesson_id(lesson, index=None):
+    value = lesson.get("eval_id", lesson.get("_id"))
+    return str(value if value is not None else index)
+
+
+def build_queries(lessons):
+    """Self-query fallback with exact relevance labels (smoke, not benchmark)."""
+    queries = []
+    for index, lesson in enumerate(lessons):
+        query = SkillOptimizer._lesson_index_text(lesson)
+        if not query:
+            query = f"skill: {lesson.get('skill_name') or ''}".strip()
+        target = lesson.get("target_dimension")
+        queries.append({
+            "query": query,
+            "skill_name": lesson.get("skill_name"),
+            "domain": lesson.get("domain"),
+            "target_dimension": target,
+            "relevant_ids": [lesson_id(lesson, index)],
+        })
     return queries
 
 
-def relevant(lesson, q):
-    """相关判定：技能同名 或 领域相同；查询无标签时命中"无绑定"经验。"""
-    if not q.get("skill_name") and not q.get("domain"):
-        # 通用查询：期望召回无技能/领域绑定的经验。
-        return not lesson.get("skill_name") and not lesson.get("domain")
-    if q.get("skill_name") and lesson.get("skill_name") == q["skill_name"]:
+def relevant(lesson, query, index=None):
+    """Prefer explicit judgments; keep tag matching only as a fallback."""
+    explicit_ids = {str(value) for value in query.get("relevant_ids", [])}
+    if explicit_ids:
+        return lesson_id(lesson, index) in explicit_ids
+    strategies = {str(value) for value in query.get("relevant_strategies", [])}
+    if strategies:
+        return str(lesson.get("strategy")) in strategies
+    target = query.get("target_dimension")
+    if target:
+        dimensions = set((lesson.get("dimension_gains") or {}).keys())
+        if lesson.get("target_dimension"):
+            dimensions.add(lesson["target_dimension"])
+        return target in dimensions
+    if query.get("skill_name") and lesson.get("skill_name") == query["skill_name"]:
         return True
-    if q.get("domain") and lesson.get("domain") == q["domain"] and lesson.get("domain"):
-        return True
-    return False
+    return bool(
+        query.get("domain")
+        and lesson.get("domain") == query["domain"]
+        and lesson.get("domain")
+    )
+
+
+def _dcg(relevance):
+    return sum(value / math.log2(rank + 2) for rank, value in enumerate(relevance))
+
+
+def ranking_metrics(results, all_lessons, query, top_k):
+    judgments = [1 if relevant(lesson, query) else 0 for lesson in results]
+    relevant_total = sum(1 for lesson in all_lessons if relevant(lesson, query))
+    hits = sum(judgments)
+    reciprocal_rank = next(
+        (1.0 / (rank + 1) for rank, value in enumerate(judgments) if value), 0.0
+    )
+    ideal = [1] * min(relevant_total, top_k)
+    ndcg = _dcg(judgments) / _dcg(ideal) if ideal else 0.0
+    strategies = {lesson.get("strategy") for lesson in results if lesson.get("strategy")}
+    pair_scores = []
+    for left in range(len(results)):
+        left_tokens = SkillOptimizer._lesson_tokens(
+            SkillOptimizer._lesson_index_text(results[left])
+        )
+        for right in range(left + 1, len(results)):
+            right_tokens = SkillOptimizer._lesson_tokens(
+                SkillOptimizer._lesson_index_text(results[right])
+            )
+            pair_scores.append(1.0 - SkillOptimizer._token_jaccard(left_tokens, right_tokens))
+    return {
+        "top1": float(bool(judgments and judgments[0])),
+        "precision": hits / len(results) if results else 0.0,
+        "recall": hits / relevant_total if relevant_total else 0.0,
+        "mrr": reciprocal_rank,
+        "ndcg": ndcg,
+        "strategy_diversity": len(strategies) / len(results) if results else 0.0,
+        "pairwise_diversity": sum(pair_scores) / len(pair_scores) if pair_scores else 1.0,
+    }
+
+
+async def evaluate(lessons, queries, pipeline, retrieval_mode, top_k, threshold):
+    opt = SkillOptimizer(
+        api_key="offline-eval-placeholder",
+        lesson_retrieval=retrieval_mode,
+        lesson_threshold=threshold,
+        lesson_top_k=top_k,
+        lesson_rag_pipeline=pipeline,
+    )
+
+    async def fake_embed(text):
+        return mock_embed(text)
+
+    opt._embed = fake_embed
+    eval_lessons = [dict(lesson, embedding=None) for lesson in lessons]
+    totals = {
+        "top1": 0.0,
+        "precision": 0.0,
+        "recall": 0.0,
+        "mrr": 0.0,
+        "ndcg": 0.0,
+        "strategy_diversity": 0.0,
+        "pairwise_diversity": 0.0,
+    }
+    latencies = []
+    completed = 0
+    for query in queries:
+        weak_dimensions = []
+        if query.get("target_dimension"):
+            weak_dimensions.append({
+                "dimension": query["target_dimension"],
+                "pct": query.get("dimension_pct", 0.0),
+            })
+        context = {
+            "skill_name": query.get("skill_name") or "",
+            "domain": query.get("domain") or "",
+            "weak_dimensions": weak_dimensions,
+        }
+        started = time.perf_counter()
+        results = await opt._retrieve_lessons(
+            eval_lessons,
+            query.get("query", ""),
+            retrieval_mode,
+            top_k,
+            context=context,
+        )
+        latencies.append((time.perf_counter() - started) * 1000)
+        metrics = ranking_metrics(results, eval_lessons, query, top_k)
+        for name in totals:
+            totals[name] += metrics[name]
+        completed += 1
+    if not completed:
+        return None
+    report = {name: value / completed for name, value in totals.items()}
+    report["misinjection"] = 1.0 - report["precision"]
+    report["latency_ms"] = sum(latencies) / len(latencies)
+    report["queries"] = completed
+    return report
+
+
+def print_report(name, report, top_k):
+    print(f"\n[{name}]")
+    print(f"  Top-1 accuracy:       {report['top1']:.3f}")
+    print(f"  MRR:                  {report['mrr']:.3f}")
+    print(f"  nDCG@{top_k}:             {report['ndcg']:.3f}")
+    print(f"  Recall@{top_k}:           {report['recall']:.3f}")
+    print(f"  Precision@{top_k}:        {report['precision']:.3f}")
+    print(f"  Misinjection@{top_k}:     {report['misinjection']:.3f}")
+    print(f"  Strategy diversity:   {report['strategy_diversity']:.3f}")
+    print(f"  Pairwise diversity:   {report['pairwise_diversity']:.3f}")
+    print(f"  Local latency/query:  {report['latency_ms']:.2f} ms")
 
 
 async def main():
-    ap = argparse.ArgumentParser(description="RAG 经验检索质量评估")
-    ap.add_argument("--lessons", default="/tmp/skill_lessons.db", help="经验库路径（.db SQLite）")
-    ap.add_argument("--api-key", default=None,
-                    help="DashScope key；缺省读 DASHSCOPE_API_KEY 环境变量；都没有则用 mock embedding")
-    ap.add_argument("--queries", default=None, help="人工查询集 jsonl（可选）")
-    ap.add_argument("--top-k", type=int, default=5)
-    ap.add_argument("--threshold", type=float, default=0.3)
-    ap.add_argument("--rerank", action="store_true", help="开启 gte-rerank 重排（对比用）")
-    args = ap.parse_args()
-    if not args.api_key:
-        args.api_key = os.environ.get("DASHSCOPE_API_KEY")
+    parser = argparse.ArgumentParser(description="离线评估经验 RAG 排序质量")
+    parser.add_argument("--lessons", required=True, help="经验库路径（jsonl 或 SQLite）")
+    parser.add_argument("--queries", help="带 relevant_ids 等显式标注的查询集 jsonl")
+    parser.add_argument(
+        "--pipeline", choices=("classic", "quality_diverse", "compare"), default="compare"
+    )
+    parser.add_argument("--retrieval", choices=("semantic", "hybrid"), default="hybrid")
+    parser.add_argument("--top-k", type=int, default=5)
+    parser.add_argument("--threshold", type=float, default=0.3)
+    args = parser.parse_args()
 
     lessons = SkillOptimizer._load_lessons(args.lessons, limit=1000)
     if not lessons:
         print(f"[eval] 经验库为空: {args.lessons}")
         return 1
-    print(f"[eval] 经验库: {len(lessons)} 条 @ {args.lessons}")
-
-    opt = SkillOptimizer(
-        api_key=args.api_key or "sk-mock",
-        lesson_retrieval="semantic",
-        lesson_threshold=args.threshold,
-        lesson_top_k=args.top_k,
-        lesson_rerank=args.rerank,
-    )
-    if not args.api_key:
-        async def fake_embed(text):
-            return mock_embed(text)
-        opt._embed = fake_embed  # 覆盖为 mock
-        # mock 模式统一用 mock 向量：丢弃库里已有的真实 embedding，避免维度不匹配。
-        for l in lessons:
-            l["embedding"] = None
-        print("[eval] 模式: mock embedding（无 key，流程冒烟）")
-    else:
-        print("[eval] 模式: 真实 DashScope text-embedding-v3")
-
-    queries = load_queries(args.queries) if args.queries else build_queries(lessons)
+    for index, lesson in enumerate(lessons):
+        lesson.setdefault("eval_id", lesson_id(lesson, index))
+    queries = load_jsonl(args.queries) if args.queries else build_queries(lessons)
     if not queries:
         print("[eval] 查询集为空")
         return 1
-    print(f"[eval] 查询集: {len(queries)} 条"
-          + (f" @ {args.queries}" if args.queries else "（自相关冒烟）"))
 
-    hits, total, hits_at_1, latencies = 0, 0, 0, []
-    for q in queries:
-        t0 = time.perf_counter()
-        try:
-            top = await opt._retrieve_lessons(lessons, q["query"], "semantic", args.top_k)
-        except Exception as e:
-            print(f"[eval] 检索失败（{q['query'][:40]}）: {e}")
-            continue
-        latencies.append((time.perf_counter() - t0) * 1000)
-        for rank, l in enumerate(top):
-            total += 1
-            if relevant(l, q):
-                hits += 1
-                if rank == 0:
-                    hits_at_1 += 1
-    if not total:
-        print("[eval] 无检索结果（阈值过滤后为空），相关率不可计算")
-        return 1
+    print(f"[eval] lessons={len(lessons)} queries={len(queries)} mode={args.retrieval}")
+    pipelines = (
+        ("classic", "quality_diverse") if args.pipeline == "compare" else (args.pipeline,)
+    )
+    reports = {}
+    for pipeline in pipelines:
+        reports[pipeline] = await evaluate(
+            lessons, queries, pipeline, args.retrieval, max(1, args.top_k), args.threshold
+        )
+        print_report(pipeline, reports[pipeline], max(1, args.top_k))
 
-    rel = hits / total
-    rel_at_1 = hits_at_1 / len(latencies) if latencies else 0.0
-    avg_ms = sum(latencies) / len(latencies) if latencies else 0.0
-    print(f"[eval] top-1 相关率:          {rel_at_1:.3f}    (首个结果即相关；小库上最有意义)")
-    print(f"[eval] top-{args.top_k} 相关率:  {rel:.3f}    (目标 ≥0.80)")
-    print(f"[eval] 误注入率:            {1 - rel:.3f}    (目标 <0.20)")
-    print(f"[eval] 平均端到端延迟:      {avg_ms:.1f} ms  (含 embedding API；目标 <50ms 仅指本地计算)")
-    ok = rel_at_1 >= 0.8 and avg_ms < 50
-    print(f"[eval] 结论: {'✅ 达标' if ok else '⚠️ 部分达标（见指标说明）'}")
-    return 0 if ok else 1
+    if len(reports) == 2:
+        classic = reports["classic"]
+        enhanced = reports["quality_diverse"]
+        print("\n[delta quality_diverse - classic]")
+        for metric in ("mrr", "ndcg", "recall", "precision", "strategy_diversity"):
+            print(f"  {metric:20s} {enhanced[metric] - classic[metric]:+.3f}")
+        # The benchmark fails only on a material relevance regression. Diversity
+        # is reported separately because some query sets have only one valid fix.
+        ok = enhanced["mrr"] + 1e-9 >= classic["mrr"] and enhanced["ndcg"] + 1e-9 >= classic["ndcg"]
+        print(f"\n[eval] {'PASS' if ok else 'FAIL'}: enhanced relevance must not regress")
+        return 0 if ok else 1
+    return 0
 
 
 if __name__ == "__main__":

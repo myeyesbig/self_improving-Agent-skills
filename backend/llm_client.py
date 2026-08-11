@@ -10,8 +10,8 @@
 #   - 其余模型 → 阿里云百炼 DashScope（默认主服务，key 由调用方直传）
 # 安全：key 只存在于本对象/环境变量中，绝不打印、不落日志、不序列化进任何
 #       返回结构。
-# 【注意】本文件不 import 任何 langchain/langchain-community 组件；也不依赖
-#       qwen-agent。不引入通用 provider 抽象层。
+# 【注意】本文件不 import 禁止的上层编排组件，也不依赖旧 Agent SDK。
+#       不引入通用 provider 抽象层。
 # =============================================================================
 
 """Thin async wrapper around the LLM chat APIs.
