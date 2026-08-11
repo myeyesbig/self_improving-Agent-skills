@@ -196,6 +196,7 @@ class SkillOptimizer:
         patience: Optional[int] = None,
         saturation_exit: Optional[bool] = None,
         final_confirm: Optional[bool] = None,
+        candidate_confirm_runs: Optional[int] = None,
         lesson_file: Optional[str] = None,
         lesson_retrieval: Optional[str] = None,
         lesson_threshold: Optional[float] = None,
@@ -282,6 +283,16 @@ class SkillOptimizer:
         if final_confirm is None:
             final_confirm = os.getenv("FINAL_CONFIRM", "0") != "0"
         self.final_confirm = final_confirm
+
+        # 【候选配对复核】默认 0 完整保留单次评分路径。开启后，仅对初评分
+        # 已严格提升的 provisional winner 追加 incumbent/challenger 成对复评；
+        # 每一对都必须继续严格胜出，因此该门只会拒绝，不会放松接受条件。
+        if candidate_confirm_runs is None:
+            try:
+                candidate_confirm_runs = int(os.getenv("CANDIDATE_CONFIRM_RUNS", "0"))
+            except ValueError:
+                candidate_confirm_runs = 0
+        self.candidate_confirm_runs = max(0, min(int(candidate_confirm_runs), 3))
 
         # 【P4 跨会话经验库】SKILL_LESSONS_FILE 指向 jsonl/db 文件路径；不设=
         # 关闭。保留的修改会被沉淀为经验，下次优化时注入 Analyst/Mutator。
@@ -780,6 +791,7 @@ class SkillOptimizer:
             "mutations": [],
             "candidates": [],
             "rescored": [],
+            "confirmation": {},
             "kept": False,
             "final_pct": 0.0,
             "pending_events": [],

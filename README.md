@@ -247,6 +247,7 @@ SkillForge 提供一组**可选**优化旋钮，全部默认等价于经典行�
 | `PATIENCE` | 环境变量 | 0（关闭） | 连续 N 轮未提升即提前终止优化（耐心早停） |
 | `SATURATION_EXIT` | 环境变量 | 0（关闭） | 基线无可提升带（100% 或 0 分全失败）时跳过全部轮次 |
 | `FINAL_CONFIRM` | 环境变量 | 0（关闭） | 完成前对最终版本独立复核，未超过基线则回退（防单点幸运） |
+| `CANDIDATE_CONFIRM_RUNS` | 环境变量 | 0（关闭） | 初评胜者与当轮当前版本追加 1–3 次配对复评；每次都须继续严格胜出，并采用最低确认分，尤其适合并行候选 |
 | `SKILL_LESSONS_FILE` | 环境变量 | 无（关闭） | 跨会话经验库路径（jsonl 或 SQLite）：保留的修改沉淀为经验，下次优化注入 Analyst/Mutator |
 | `LESSON_N` | 环境变量 | 5 | 每次优化读取的最近经验条数 |
 | `LESSON_RETRIEVAL` | 环境变量 | off | 经验注入方式：`off`（最近 N 条）/ `tag`（同技能硬过滤）/ `semantic`（embedding 语义检索）/ `hybrid`（dense+sparse 混合）。semantic/hybrid 需要经验库使用 `.db` 后缀（SQLite）并调用 DashScope text-embedding-v3 |

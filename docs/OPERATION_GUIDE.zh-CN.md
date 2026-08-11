@@ -309,6 +309,7 @@ improved_skill.zip
 | `PATIENCE` | `0`（关闭） | 连续 N 轮未提升即提前终止 |
 | `SATURATION_EXIT` | `0`（关闭） | 基线无可提升带（100% 或 0 分全失败）时跳过全部轮次 |
 | `FINAL_CONFIRM` | `0`（关闭） | 完成前对最终版本独立复核，未超过基线则回退（防单点幸运） |
+| `CANDIDATE_CONFIRM_RUNS` | `0`（关闭） | 初评胜者与当轮 incumbent 追加 1–3 次配对复评；每一对都须严格胜出，采用最低 challenger 分 |
 | `ANALYST_DIMENSION_WEIGHTS` | 无 | JSON 字符串，如 `{"correctness":2,"clarity":1}`；无权重时等价旧通过率 |
 | `SKILL_LESSONS_FILE` | 无（关闭） | 经验库路径（jsonl 或 `.db`/`.sqlite`）；开启后保留的修改沉淀为经验 |
 | `LESSON_RETRIEVAL` | `off` | `off` / `tag` / `semantic` / `hybrid` |
@@ -351,6 +352,7 @@ improved_skill.zip
 | 基线已经 100% | 没东西可优化 | `SATURATION_EXIT=1` 会跳过无意义轮次 |
 | 反复同一种策略失败 | Mutator 没拿到有用诊断 | `MEMORY_ROUNDS` 调高到 5 |
 | 分数小幅上下抖动被误判 | 评分波动 | 打开 `NOISE_FLOOR=0.05` |
+| 并行候选偶尔出现异常高分 | 多候选赢家诅咒 | `CANDIDATE_CONFIRM_RUNS=1`；高风险任务可设 2，代价是每次初评提升额外复评双方 |
 | Mutator 改得太激进 | 单次修改幅度过大 | 打开 `EDIT_LIMIT=0.3` 限制单轮最大变化比例 |
 | 永远卡在一种失败模式 | 策略池过窄 | 传 `strategy_pool: ["add_constraint","add_example","rewrite_section"]` 缩窄反而更易聚焦 |
 

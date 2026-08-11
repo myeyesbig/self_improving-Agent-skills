@@ -147,3 +147,17 @@ SkillForge 选择轻量的 `OPTIMIZATION_SEARCH=adaptive`：保持当前最优�
 实现后复查发现，`_build_query` 虽然接收 `evals`，此前却没有读取它：检索查询只有 `keyword:missing` 等失败 reason 和固定前两个场景，可能遗漏真正失败标准及对应场景。因此新增默认关闭的 `LESSON_FAILURE_CONTEXT`，按 `current_details.eval_id/scenario_id` 精确关联失败 eval 和场景，并把 criterion、question、pass condition、dimension 作为当次查询上下文；它们不进入 lesson store。
 
 另一处瓶颈是未缓存经验逐条 embedding。阿里云百炼的[文本向量同步 API](https://help.aliyun.com/en/model-studio/text-embedding-synchronous-api)明确支持 `TextEmbedding.call(input=batch)`，并给出每批最多 10 条的示例；[RAGFlow 的 DashScope 实现](https://github.com/infiniflow/ragflow/blob/main/rag/llm/embedding_model.py)也采用分批调用并依据 `text_index` 恢复顺序。SkillForge 因此新增 `LESSON_EMBED_BATCH_SIZE`（1–10，默认 1），先对重复文本去重，再批量调用、恢复原顺序并沿用 SQLite 惰性写回；失败仍降级 tag。
+
+## 十一、优化门控补强：暂定胜者与 incumbent 配对复核
+
+RAG 完成后的主循环审计发现：并行候选各评分一次后直接取最大值，会产生典型的“赢家诅咒”——候选越多，偶然高估者越可能成为 winner。`NOISE_FLOOR` 只能过滤固定幅度，`FINAL_CONFIRM` 则到整个流程结束才与最初版本比较，二者都不能证明每轮 challenger 稳定胜过当轮 incumbent。
+
+三个主来源给出了互补依据：
+
+- [GEPA FAQ](https://github.com/gepa-ai/gepa/blob/main/docs/docs/guides/faq.md)采用 minibatch 初筛，只有候选先改善才进入完整验证，说明昂贵复核应只花在 provisional winner 上。
+- [SkillOpt](https://github.com/microsoft/SkillOpt/blob/main/README.md)用严格 validation gate 比较 candidate 与 current skill，hard gate 要求严格更高。
+- [Optuna WilcoxonPruner](https://optuna.readthedocs.io/en/stable/reference/generated/optuna.pruners.WilcoxonPruner.html)强调按相同 step 配对候选观测；这里借鉴“同任务集成对比较”的证据结构，但不在 3–4 个小场景上冒充统计显著性检验。
+
+SkillForge 新增 `CANDIDATE_CONFIRM_RUNS=0..3`，默认 0 保持原调用路径。开启后仅当初评分已经越过 `improvement_threshold + noise_floor` 时，才将暂定胜者与当轮当前版本在同一 scenarios/evals 上成对复评；每一对都必须继续严格胜出，最终状态分取初评和所有 challenger 复评分中的最低值。任何一对打平或失败都将本轮标记为 `confirmation_failed`，候选不保留、不沉淀经验。该门不会接受原本不合格的候选，也不改变单点变异、回归守卫或轮间停止语义。
+
+本轮没有直接引入 held-out split：当前分析阶段默认只生成 3–4 个场景，自动切分会让训练或验证侧只剩 1–2 条，且现有 API 没有独立选择集。配对复核先解决评分噪声；真正的 held-out gate 应在未来同时扩充场景数量并显式区分 train/selection 数据后再做，避免用过小验证集制造虚假的安全感。

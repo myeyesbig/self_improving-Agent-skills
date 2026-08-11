@@ -1354,6 +1354,115 @@ class TestFinalConfirm(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["final_score"], 75.0)
 
 
+class TestCandidateConfirmGate(unittest.IsolatedAsyncioTestCase):
+    """候选配对复核：只确认初评胜者，每一对都须严格胜过当轮 incumbent。"""
+
+    @staticmethod
+    def _score(passed, total=4):
+        return {"passed": passed, "total": total, "per_eval": [], "details": []}
+
+    @staticmethod
+    def _analysis():
+        return {
+            "diagnosis": "d", "mutation_strategy": "add_example",
+            "target_section": "s", "suggested_change": "c",
+        }
+
+    @staticmethod
+    def _mutation():
+        return {"description": "m", "reasoning": "r", "new_skill_md": "# New"}
+
+    def test_default_disabled_and_constructor_clamped(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(make_optimizer().candidate_confirm_runs, 0)
+        with patch.dict(os.environ, {"CANDIDATE_CONFIRM_RUNS": "2"}, clear=True):
+            self.assertEqual(make_optimizer().candidate_confirm_runs, 2)
+        self.assertEqual(make_optimizer(candidate_confirm_runs=99).candidate_confirm_runs, 3)
+        self.assertEqual(make_optimizer(candidate_confirm_runs=-2).candidate_confirm_runs, 0)
+
+    async def test_stable_paired_win_is_kept(self):
+        opt = make_optimizer(candidate_confirm_runs=1)
+        scores = [
+            self._score(2),  # 初始 incumbent 50
+            self._score(3),  # 候选初评 75
+            self._score(2),  # incumbent 确认 50
+            self._score(3),  # challenger 确认 75
+        ]
+        with (
+            patch.object(opt, "_score_skill", new=AsyncMock(side_effect=scores)) as mock_score,
+            patch.object(opt, "_analyze_failures", new=AsyncMock(return_value=self._analysis())),
+            patch.object(opt, "_mutate_skill", new=AsyncMock(return_value=self._mutation())),
+        ):
+            result = await opt.optimize({"SKILL.md": "# S"}, [], [], max_rounds=1)
+        self.assertEqual(mock_score.await_count, 4)
+        self.assertEqual(result["improved_skill_md"], "# New")
+        self.assertEqual(result["final_score"], 75.0)
+        self.assertTrue(result["mutation_log"][0]["kept"])
+
+    async def test_confirmation_tie_rejects_lucky_initial_winner(self):
+        opt = make_optimizer(candidate_confirm_runs=1)
+        scores = [
+            self._score(2),  # baseline 50
+            self._score(3),  # lucky initial challenger 75
+            self._score(2),  # fresh incumbent 50
+            self._score(2),  # fresh challenger ties 50 -> reject
+        ]
+        with (
+            patch.object(opt, "_score_skill", new=AsyncMock(side_effect=scores)),
+            patch.object(opt, "_analyze_failures", new=AsyncMock(return_value=self._analysis())),
+            patch.object(opt, "_mutate_skill", new=AsyncMock(return_value=self._mutation())),
+        ):
+            result = await opt.optimize({"SKILL.md": "# S"}, [], [], max_rounds=1)
+        self.assertEqual(result["improved_skill_md"], "# S")
+        self.assertEqual(result["final_score"], 50.0)
+        self.assertFalse(result["mutation_log"][0]["kept"])
+        self.assertEqual(result["mutation_log"][0]["reason"], "confirmation_failed")
+
+    async def test_every_confirmation_pair_must_win(self):
+        opt = make_optimizer(candidate_confirm_runs=2)
+        scores = [
+            self._score(2), self._score(3),  # baseline / initial challenger
+            self._score(2), self._score(3),  # pair 1: 75 > 50
+            self._score(2), self._score(2),  # pair 2: tie -> reject
+        ]
+        with (
+            patch.object(opt, "_score_skill", new=AsyncMock(side_effect=scores)) as mock_score,
+            patch.object(opt, "_analyze_failures", new=AsyncMock(return_value=self._analysis())),
+            patch.object(opt, "_mutate_skill", new=AsyncMock(return_value=self._mutation())),
+        ):
+            result = await opt.optimize({"SKILL.md": "# S"}, [], [], max_rounds=1)
+        self.assertEqual(mock_score.await_count, 6)
+        self.assertEqual(result["mutation_log"][0]["reason"], "confirmation_failed")
+
+    async def test_non_improving_candidate_skips_confirmation_cost(self):
+        opt = make_optimizer(candidate_confirm_runs=3)
+        scores = [self._score(2), self._score(2)]
+        with (
+            patch.object(opt, "_score_skill", new=AsyncMock(side_effect=scores)) as mock_score,
+            patch.object(opt, "_analyze_failures", new=AsyncMock(return_value=self._analysis())),
+            patch.object(opt, "_mutate_skill", new=AsyncMock(return_value=self._mutation())),
+        ):
+            result = await opt.optimize({"SKILL.md": "# S"}, [], [], max_rounds=1)
+        self.assertEqual(mock_score.await_count, 2)
+        self.assertEqual(result["final_score"], 50.0)
+
+    async def test_accepted_score_uses_most_conservative_observation(self):
+        opt = make_optimizer(candidate_confirm_runs=2)
+        scores = [
+            self._score(2), self._score(4),  # 50 -> initial 100
+            self._score(2), self._score(3),  # pair 1 confirms at 75
+            self._score(2), self._score(4),  # pair 2 confirms at 100
+        ]
+        with (
+            patch.object(opt, "_score_skill", new=AsyncMock(side_effect=scores)),
+            patch.object(opt, "_analyze_failures", new=AsyncMock(return_value=self._analysis())),
+            patch.object(opt, "_mutate_skill", new=AsyncMock(return_value=self._mutation())),
+        ):
+            result = await opt.optimize({"SKILL.md": "# S"}, [], [], max_rounds=1)
+        self.assertEqual(result["final_score"], 75.0)
+        self.assertTrue(result["mutation_log"][0]["kept"])
+
+
 class TestLessonStore(unittest.IsolatedAsyncioTestCase):
     """P4: cross-session lesson store persists kept fixes as jsonl."""
 

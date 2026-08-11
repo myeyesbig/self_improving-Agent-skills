@@ -70,6 +70,7 @@ class OptimizeState(TypedDict):
     mutations: Annotated[list, _append_or_reset]  # Send 汇聚：各槽位 raw mutation
     candidates: list                  # 回归守卫后的候选（覆盖式）
     rescored: Annotated[list, _append_or_reset]  # Send 汇聚：复评后的候选
+    confirmation: dict                 # 可选 provisional winner 配对复核结果
     kept: bool                        # 本轮是否保留最优候选
     final_pct: float                  # 本轮最优分（事件用）
     # -- 事件与结果出口 ------------------------------------------------------
@@ -184,7 +185,7 @@ def build_optimize_graph(
         )
         # 【隔离红线】每轮开头重置 Send 汇聚中间产物（mutations/rescored），
         # 防止上一轮残留候选混入本轮（_append_or_reset 的空列表语义）。
-        return {"analysis": analysis, "mutations": [], "rescored": []}
+        return {"analysis": analysis, "mutations": [], "rescored": [], "confirmation": {}}
 
     # -- 扇出路由：并行变异（Send map-reduce，LangGraph 1.x 由条件边返回）------
     def route_mutate(state: OptimizeState) -> list:
@@ -308,27 +309,83 @@ def build_optimize_graph(
         c["details"] = res["details"]
         return {"rescored": [c]}
 
+    def merged_candidates(state: OptimizeState) -> list:
+        """Merge deterministic Send results without mutating checkpoint state in place."""
+        rescored = {c["candidate_id"]: c for c in state.get("rescored", [])}
+        candidates = []
+        for original in state.get("candidates", []):
+            candidate = dict(original)
+            result = rescored.get(candidate["candidate_id"])
+            if result is not None:
+                candidate.update(result)
+            candidates.append(candidate)
+        return candidates
+
+    # -- 节点：暂定胜者与当轮 incumbent 配对复核（默认关闭）-------------------
+    async def node_confirm_candidate(state: OptimizeState) -> dict:
+        candidates = merged_candidates(state)
+        scored = [
+            candidate for candidate in candidates
+            if candidate["rejected"] is None and candidate["new_md"] is not None
+        ]
+        best = max(scored, key=lambda candidate: candidate["score_after"], default=None)
+        threshold = opt.improvement_threshold + opt.noise_floor
+        if (
+            opt.candidate_confirm_runs <= 0
+            or best is None
+            or best["score_after"] <= state["baseline_pct"] + threshold
+        ):
+            return {"confirmation": {}}
+
+        incumbent_scores = []
+        challenger_scores = []
+        passed = True
+        for _ in range(opt.candidate_confirm_runs):
+            # 同一任务集、相邻调用形成 paired comparison；协作停止仍只在
+            # 轮间 check_stop 生效，不在复核半途打断当轮。
+            incumbent = await opt._score_skill(state["current_md"], scenarios, evals)
+            challenger = await opt._score_skill(best["new_md"], scenarios, evals)
+            incumbent_pct = pct_of(incumbent)
+            challenger_pct = pct_of(challenger)
+            incumbent_scores.append(incumbent_pct)
+            challenger_scores.append(challenger_pct)
+            if challenger_pct <= incumbent_pct + threshold:
+                passed = False
+
+        # 采用初评分与所有确认评分中的最低值，避免复核本身再次引入乐观偏差。
+        confirmed_score = min([best["score_after"], *challenger_scores])
+        if confirmed_score <= state["baseline_pct"] + threshold:
+            passed = False
+        return {
+            "confirmation": {
+                "candidate_id": best["candidate_id"],
+                "passed": passed,
+                "runs": opt.candidate_confirm_runs,
+                "incumbent_scores": incumbent_scores,
+                "challenger_scores": challenger_scores,
+                "confirmed_score": confirmed_score,
+            }
+        }
+
     # -- 节点：选优 + 保留判定 + 记忆/日志/经验沉淀 + 轮结果事件 -----------------
     async def node_decide(state: OptimizeState) -> dict:
         baseline_pct = state["baseline_pct"]
-        candidates = state.get("candidates", [])
+        candidates = merged_candidates(state)
         analysis = state.get("analysis") or {}
-        # 复评结果按 candidate_id 定序聚合（等价手写版 zip(to_score, results)）。
-        rescored = {c["candidate_id"]: c for c in state.get("rescored", [])}
-        for c in candidates:
-            r = rescored.get(c["candidate_id"])
-            if r is not None:
-                c["score_after"] = r["score_after"]
-                c["per_eval"] = r["per_eval"]
-                c["dimension_scores"] = r["dimension_scores"]
-                c["details"] = r["details"]
 
         scored = [c for c in candidates if c["rejected"] is None and c["new_md"] is not None]
         best = max(scored, key=lambda c: c["score_after"], default=None)
+        confirmation = state.get("confirmation") or {}
+        confirmation_failed = False
+        if best is not None and confirmation.get("candidate_id") == best["candidate_id"]:
+            confirmation_failed = not confirmation.get("passed", False)
+            if not confirmation_failed:
+                best["score_after"] = confirmation["confirmed_score"]
 
         # 【核心不变量】严格提升才保留：score > baseline + threshold + noise_floor。
         kept = (
             best is not None
+            and not confirmation_failed
             and best["score_after"] > baseline_pct + opt.improvement_threshold + opt.noise_floor
         )
         new_pct = best["score_after"] if best else baseline_pct
@@ -358,6 +415,10 @@ def build_optimize_graph(
         log_entries = []
         for c in candidates:
             is_winner = kept and best is not None and c["candidate_id"] == best["candidate_id"]
+            confirm_rejected = (
+                confirmation_failed and best is not None
+                and c["candidate_id"] == best["candidate_id"]
+            )
             log_entries.append({
                 "round": rnd,
                 "candidate_id": c["candidate_id"],
@@ -367,13 +428,19 @@ def build_optimize_graph(
                 "score_before": baseline_pct,
                 "score_after": c["score_after"],
                 "kept": is_winner,
-                "reason": c["rejected"] or ("best" if is_winner else "not_best"),
+                "reason": c["rejected"] or (
+                    "confirmation_failed" if confirm_rejected
+                    else ("best" if is_winner else "not_best")
+                ),
             })
 
         # 每轮一条 round_memory（P2 轮间记忆）。
         if best is not None:
             outcome = "rejected" if best["rejected"] else ("kept" if kept else "discarded")
-            mem_reason = best["rejected"] or ("best" if kept else "not_best")
+            mem_reason = best["rejected"] or (
+                "confirmation_failed" if confirmation_failed
+                else ("best" if kept else "not_best")
+            )
         else:
             outcome, mem_reason = "discarded", "no_candidate"
         mem_entry = {
@@ -464,8 +531,16 @@ def build_optimize_graph(
                         "description": c["description"],
                         "score": c["score_after"],
                         "reason": c["rejected"] or (
-                            "best" if (kept and best and c["candidate_id"] == best["candidate_id"])
-                            else "not_best"
+                            "confirmation_failed"
+                            if (
+                                confirmation_failed and best
+                                and c["candidate_id"] == best["candidate_id"]
+                            )
+                            else (
+                                "best"
+                                if (kept and best and c["candidate_id"] == best["candidate_id"])
+                                else "not_best"
+                            )
                         ),
                     }
                     for c in candidates
@@ -538,6 +613,7 @@ def build_optimize_graph(
     g.add_node("mutate_slot", node_mutate_slot)
     g.add_node("guard", node_guard)
     g.add_node("reeval_slot", node_reeval_slot)
+    g.add_node("confirm_candidate", node_confirm_candidate)
     g.add_node("decide", node_decide)
     g.add_node("finalize", node_finalize)
 
@@ -554,8 +630,9 @@ def build_optimize_graph(
     g.add_edge("mutate_slot", "guard")
     # guard 后扇出复评到 reeval_slot；全被拒则直接 decide。
     g.add_conditional_edges("guard", route_reeval, {"skip": "decide"})
-    # reeval_slot 是复评汇聚点，进入 decide。
-    g.add_edge("reeval_slot", "decide")
+    # reeval_slot 是初评汇聚点；可选配对复核后再进入 decide。
+    g.add_edge("reeval_slot", "confirm_candidate")
+    g.add_edge("confirm_candidate", "decide")
     # 轮末路由：继续下一轮（check_stop）或收尾（finalize）。
     g.add_conditional_edges(
         "decide", route_check,
