@@ -60,21 +60,37 @@ export interface AnalyzePayload {
   evals: any[];
 }
 
-/** 让 Qwen 分析技能并生成测试场景与评估标准（POST /api/analyze） */
-export async function analyzeSkill(sessionId: string, apiKey: string): Promise<AnalyzePayload> {
+/** 让 Qwen/DeepSeek 分析技能并生成测试场景与评估标准（POST /api/analyze） */
+export async function analyzeSkill(
+  sessionId: string,
+  apiKey: string,
+  deepseekApiKey?: string
+): Promise<AnalyzePayload> {
   return request<AnalyzePayload>(`${API_BASE}/api/analyze`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ session_id: sessionId, qwen_api_key: apiKey }),
+    body: JSON.stringify({
+      session_id: sessionId,
+      qwen_api_key: apiKey,
+      ...(deepseekApiKey ? { deepseek_api_key: deepseekApiKey } : {}),
+    }),
   });
 }
 
 /** 重新生成 scenarios/evals（POST /api/regenerate） */
-export async function regenerateConfig(sessionId: string, apiKey: string): Promise<AnalyzePayload> {
+export async function regenerateConfig(
+  sessionId: string,
+  apiKey: string,
+  deepseekApiKey?: string
+): Promise<AnalyzePayload> {
   return request<AnalyzePayload>(`${API_BASE}/api/regenerate`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ session_id: sessionId, qwen_api_key: apiKey }),
+    body: JSON.stringify({
+      session_id: sessionId,
+      qwen_api_key: apiKey,
+      ...(deepseekApiKey ? { deepseek_api_key: deepseekApiKey } : {}),
+    }),
   });
 }
 
@@ -104,10 +120,12 @@ export interface StartOptions {
 export async function startOptimization(
   sessionId: string,
   apiKey: string,
-  options: StartOptions = {}
+  options: StartOptions = {},
+  deepseekApiKey?: string
 ): Promise<{ status: string }> {
   const body: Record<string, any> = {
     qwen_api_key: apiKey,
+    ...(deepseekApiKey ? { deepseek_api_key: deepseekApiKey } : {}),
     max_rounds: options.max_rounds ?? 20,
   };
   if (options.parallel_mutations !== undefined) body.parallel_mutations = options.parallel_mutations;

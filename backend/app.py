@@ -63,12 +63,14 @@ sessions: Dict[str, dict] = {}
 
 
 # -- 请求体模型 ---------------------------------------------------------------
-# 【注意】凭据字段固定为 qwen_api_key（阿里云百炼 DashScope），不兼容任何
-# 不兼容旧版提供商的凭据字段；密钥只随请求体传到内存，绝不持久化。
+# 【注意】主凭据字段为 qwen_api_key（阿里云百炼 DashScope）；【双 key】另加
+# 可选 deepseek_api_key（前端双输入框场景），模型名带 deepseek- 前缀时路由到
+# DeepSeek。密钥只随请求体传到内存，绝不持久化。
 
 class AnalyzeRequest(BaseModel):
     session_id: str
     qwen_api_key: str
+    deepseek_api_key: Optional[str] = None
 
 
 class SessionConfig(BaseModel):
@@ -80,10 +82,14 @@ class SessionConfig(BaseModel):
 class RegenerateRequest(BaseModel):
     session_id: str
     qwen_api_key: str
+    deepseek_api_key: Optional[str] = None
 
 
 class StartRequest(BaseModel):
     qwen_api_key: str
+    # 【双 key】可选 DeepSeek key；未传时 DeepSeek 分支回退到
+    # qwen_api_key / DEEPSEEK_API_KEY 环境变量。
+    deepseek_api_key: Optional[str] = None
     max_rounds: Optional[int] = Field(default=20, gt=0, le=50)
     # 【C3】并行变异数：可选，默认走后端配置（通常为 1）。
     parallel_mutations: Optional[int] = Field(default=None, ge=1, le=3)
@@ -283,7 +289,10 @@ async def analyze_skill(request: AnalyzeRequest):
         raise HTTPException(status_code=404, detail="Session not found")
     session = sessions[request.session_id]
     try:
-        optimizer = SkillOptimizer(api_key=request.qwen_api_key)
+        optimizer = SkillOptimizer(
+            api_key=request.qwen_api_key,
+            deepseek_api_key=request.deepseek_api_key,
+        )
         analysis = await optimizer.analyze_skill(session["skill_files"])
         session["scenarios"] = analysis["scenarios"]
         session["evals"] = analysis["evals"]
@@ -299,7 +308,11 @@ async def analyze_skill(request: AnalyzeRequest):
 async def regenerate_config(request: RegenerateRequest):
     """Regenerate scenarios/evals for a session"""
     # 复用 analyze_skill 逻辑：重新生成一份 scenarios/evals，覆盖原配置。
-    analyze_req = AnalyzeRequest(session_id=request.session_id, qwen_api_key=request.qwen_api_key)
+    analyze_req = AnalyzeRequest(
+        session_id=request.session_id,
+        qwen_api_key=request.qwen_api_key,
+        deepseek_api_key=request.deepseek_api_key,
+    )
     return await analyze_skill(analyze_req)
 
 
@@ -375,12 +388,15 @@ async def start_optimization(session_id: str, request: StartRequest):
         logger.info(f"Starting optimization for session {session_id}")
         # 【P0 修复】把请求里的提升阈值传给优化器构造参数，让前端配置真正生效；
         # None 时优化器内部仍读 IMPROVEMENT_THRESHOLD 环境变量（默认 0.0）。
+        # 【C5 停止】stop_provider 把 session 的 stop_requested 实时暴露给优化器：
+        # /api/stop 置位后，下一轮 check_stop 即抛 StopOptimizationError，
+        # 协作式停止真正生效（轮间语义不变，在途模型调用完成）。
         optimizer = SkillOptimizer(
             api_key=qwen_key,
             improvement_threshold=request.improvement_threshold,
+            stop_provider=lambda: session.get("stop_requested", False),
+            deepseek_api_key=request.deepseek_api_key,
         )
-        # 【C5 停止】把 session 的 stop_requested 交给优化器，轮间协作取消。
-        optimizer.stop_requested = False
 
         # 【主流程】闭包 callback：优化器的每次 emit 都会回到这里，把事件
         # 写入事件队列，同时把 baseline / experiment_result / complete 事件
@@ -453,6 +469,9 @@ async def start_optimization(session_id: str, request: StartRequest):
                 parallel_mutations=request.parallel_mutations,
                 strategy_pool=request.strategy_pool,
                 domain=session.get("domain"),
+                # 【阶段 5 断点续跑】thread_id=session_id：SKILL_CHECKPOINT_FILE
+                # 设置时按会话隔离 checkpoint，重启/停止后可续跑同一优化任务。
+                thread_id=session_id,
             )
             logger.info(f"Optimization complete: {result['baseline_score']}% -> {result['final_score']}%")
             # Don't overwrite final_result if callback already set it with transformed data

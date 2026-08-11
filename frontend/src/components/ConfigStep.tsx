@@ -20,6 +20,7 @@ import { regenerateConfig, updateConfig } from "@/lib/api";
 interface ConfigStepProps {
   sessionId: string;
   apiKey: string;
+  deepseekApiKey?: string;
   scenarios: any[];
   evals: any[];
   onScenariosChange: (scenarios: any[]) => void;
@@ -30,6 +31,7 @@ interface ConfigStepProps {
 export default function ConfigStep({
   sessionId,
   apiKey,
+  deepseekApiKey,
   scenarios: initialScenarios,
   evals: initialEvals,
   onScenariosChange,
@@ -122,7 +124,7 @@ export default function ConfigStep({
     setIsRegenerating(true);
 
     try {
-      const data = await regenerateConfig(sessionId, apiKey);
+      const data = await regenerateConfig(sessionId, apiKey, deepseekApiKey);
       setScenarios(data.scenarios.map((s: any) => ({ ...s, selected: true })));
       setEvals(data.evals.map((e: any) => ({ ...e, selected: true })));
     } catch (error) {

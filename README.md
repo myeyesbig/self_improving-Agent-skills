@@ -1,20 +1,20 @@
 # 🔥 SkillForge —— 自我进化型 Agent 技能锻造厂
 
-**SkillForge** 基于 **Qwen-Agent** 与 **阿里云百炼（DashScope）** 构建的多智能体系统，自动优化你的 Agent 技能。上传一个技能，让智能体生成测试场景与评估标准，然后观察三个专业化 Qwen-Agent 助手通过迭代优化协作改进你的技能 —— 每一次变异都在砧台上被锤打、评估，只保留真正更强的版本。
+**SkillForge** 基于 **LangGraph** 状态图编排与 **阿里云百炼（DashScope）** 直调构建的技能自优化系统，自动改进你的 Agent 技能。上传一个技能，让智能体生成测试场景与评估标准，然后观察三个角色（Executor / Analyst / Mutator）通过迭代优化协作改进你的技能 —— 每一次变异都在砧台上被锤打、评估，只保留真正更强的版本。
 
 > 一个受 Karpathy「自动研究」方法论启发的个人项目：与其手动调提示词，不如定义成功标准，让 AI 自我进化。
 
 
 ## 工作原理
 
-本应用实现了受 Karpathy「自动研究」（autoresearch）方法论启发的自动化技能改进循环，由一组 Qwen-Agent 助手驱动：
+本应用实现了受 Karpathy「自动研究」（autoresearch）方法论启发的自动化技能改进循环，由三个专业角色驱动：
 
 1. **上传**：拖入你的技能文件夹（遵循 [agentskills.io](https://agentskills.io) 规范）
 2. **配置**：Executor 智能体生成测试场景与评估标准，可按需编辑、添加或重新生成
-3. **优化**：三个 Qwen-Agent 助手协作 —— 一个执行并评分，一个诊断失败原因，一个应用修复
+3. **优化**：三角色协作 —— 一个执行并评分，一个诊断失败原因，一个应用修复
 4. **结果**：下载改进后的技能及详细变更日志
 
-### Qwen-Agent 智能体团队
+### 智能体团队
 
 | 智能体 | 角色 | 职责 |
 |-------|------|-------------|
@@ -36,9 +36,11 @@
 
 ```
 skillforge/
-├── backend/                 # FastAPI 服务端 + Qwen-Agent 优化引擎
+├── backend/                 # FastAPI 服务端 + LangGraph 优化引擎
 │   ├── app.py              # REST API 端点 + SSE 流式推送
-│   ├── qwen_optimizer.py   # 多智能体优化器（Executor、Analyst、Mutator）
+│   ├── qwen_optimizer.py   # 算法核心（评分/诊断/变异/回归守卫/经验库）
+│   ├── optimize_graph.py    # LangGraph 状态图编排（条件边 + Send 并行）
+│   ├── llm_client.py        # DashScope 直调薄封装（桥接/重试/JSON mode）
 │   └── requirements.txt
 ├── frontend/               # Next.js + React + Tailwind
 │   ├── src/
@@ -53,9 +55,9 @@ skillforge/
 
 ## 技术栈
 
-- **后端**：Python 3.10+、FastAPI、Qwen-Agent、Pydantic
+- **后端**：Python 3.10+、FastAPI、LangGraph、DashScope、Pydantic
 - **前端**：Next.js 15、React 19、Tailwind CSS v4、Recharts
-- **AI**：基于 Qwen-Agent 的多智能体系统，通过 DashScope 调用 Qwen（`qwen-plus`）—— Analyst 与 Mutator 智能体通过 Pydantic 校验保证结构化输出
+- **AI**：LangGraph 状态图编排的三角色循环，DashScope SDK 直调 Qwen（`qwen-plus`）；结构化输出走协议层 JSON mode + Pydantic 校验 + 宽容解析兜底
 - **实时通信**：Server-Sent Events（SSE）实时推送优化进度
 
 ## 快速开始
@@ -202,7 +204,7 @@ zip -r my-skill.zip my-skill/
 
 ### 后端
 
-DashScope API Key 随每次请求由前端传入（字段 `qwen_api_key`），并直接用于 Qwen-Agent 模型配置 —— 绝不写入进程级环境变量、不存入会话、不记入日志。模型默认使用 `qwen-plus`，可通过可选的 `QWEN_MODEL` 环境变量覆盖。服务运行在 **8891** 端口。
+DashScope API Key 随每次请求由前端传入（字段 `qwen_api_key`），并直接用于 DashScope SDK 调用配置 —— 绝不写入进程级环境变量、不存入会话、不记入日志。模型默认使用 `qwen-plus`，可通过可选的 `QWEN_MODEL` 环境变量覆盖。服务运行在 **8891** 端口。
 
 上传限制：
 - 单次上传最大 **10MB**
@@ -276,6 +278,6 @@ npm run build
 
 ## 基于 Karpathy 的自动研究（Autoresearch）
 
-本工具将 Andrej Karpathy 的自动研究方法论（利用 LLM 迭代改进自身提示词）应用于 Agent 技能。核心洞察是：与其手动调整提示词，不如定义成功标准，让 AI 自我优化 —— 现在由一组专业化 Qwen-Agent 助手驱动。
+本工具将 Andrej Karpathy 的自动研究方法论（利用 LLM 迭代改进自身提示词）应用于 Agent 技能。核心洞察是：与其手动调整提示词，不如定义成功标准，让 AI 自我优化 —— 优化循环由 LangGraph 状态图编排、DashScope 直调驱动。
 
 原始概念：[https://github.com/karpathy/autoresearch](https://github.com/karpathy/autoresearch)

@@ -1,20 +1,20 @@
 # 🔥 SkillForge — Forge Better Agent Skills
 
-**SkillForge** automatically optimizes your agent skills using a multi-agent system built with **Qwen-Agent** and **Qwen via Alibaba Cloud Model Studio (DashScope)**. Upload a skill, let the agents generate test scenarios and evaluation criteria, then watch as three specialized Qwen-Agent assistants collaborate to improve your skill through iterative optimization — every mutation is hammered on the anvil, scored, and kept only when it is genuinely stronger.
+**SkillForge** automatically optimizes your agent skills with a skill self-improvement system built on **LangGraph** state-graph orchestration and **Qwen via Alibaba Cloud Model Studio (DashScope)**. Upload a skill, let the agents generate test scenarios and evaluation criteria, then watch as three roles (Executor / Analyst / Mutator) collaborate to improve your skill through iterative optimization — every mutation is hammered on the anvil, scored, and kept only when it is genuinely stronger.
 
 > A personal project inspired by Karpathy's autoresearch methodology: instead of hand-tuning prompts, define success criteria and let the AI improve itself.
 
 
 ## How It Works
 
-This app implements an automated skill improvement loop inspired by Karpathy's autoresearch methodology, powered by a team of Qwen-Agent assistants:
+This app implements an automated skill improvement loop inspired by Karpathy's autoresearch methodology, powered by three specialized roles:
 
 1. **Upload**: Drop in your skill folder (following [agentskills.io](https://agentskills.io) spec)
 2. **Configure**: The Executor agent generates test scenarios and evaluation criteria. Edit, add, or regenerate as needed
-3. **Optimize**: Three Qwen-Agent assistants collaborate — one executes and scores, one diagnoses failures, one applies fixes
+3. **Optimize**: Three roles collaborate — one executes and scores, one diagnoses failures, one applies fixes
 4. **Results**: Download your improved skill with a detailed changelog
 
-### The Qwen-Agent Team
+### The Agent Team
 
 | Agent | Role | What It Does |
 |-------|------|-------------|
@@ -37,9 +37,11 @@ This app implements an automated skill improvement loop inspired by Karpathy's a
 
 ```
 skillforge/
-├── backend/                 # FastAPI server + Qwen-Agent optimization engine
+├── backend/                 # FastAPI server + LangGraph optimization engine
 │   ├── app.py              # REST API endpoints + SSE streaming
-│   ├── qwen_optimizer.py   # Multi-agent optimizer (Executor, Analyst, Mutator)
+│   ├── qwen_optimizer.py   # Algorithm core (scoring/diagnosis/mutation/guard/lesson store)
+│   ├── optimize_graph.py    # LangGraph state-graph orchestration (conditional edges + Send)
+│   ├── llm_client.py        # Thin DashScope wrapper (bridge/retry/JSON mode)
 │   └── requirements.txt
 ├── frontend/               # Next.js + React + Tailwind
 │   ├── src/
@@ -54,9 +56,9 @@ skillforge/
 
 ## Tech Stack
 
-- **Backend**: Python 3.10+, FastAPI, Qwen-Agent, Pydantic
+- **Backend**: Python 3.10+, FastAPI, LangGraph, DashScope, Pydantic
 - **Frontend**: Next.js 15, React 19, Tailwind CSS v4, Recharts
-- **AI**: Qwen-Agent multi-agent system with Qwen via DashScope (`qwen-plus`) — structured output via Pydantic validation on Analyst and Mutator agents
+- **AI**: LangGraph-orchestrated three-role loop with direct DashScope SDK calls to Qwen (`qwen-plus`) — structured output via protocol-level JSON mode + Pydantic validation + tolerant parsing fallback
 - **Real-time**: Server-Sent Events (SSE) for live optimization progress
 
 ## Quick Start
@@ -195,7 +197,7 @@ For each round, the three agents collaborate:
 
 ### Backend
 
-The DashScope API key is passed from the frontend with each request (field `qwen_api_key`) and used directly in the Qwen-Agent model configuration — it is never written to a process-wide environment variable, stored in sessions, or logged. The model defaults to `qwen-plus` and can be overridden with the optional `QWEN_MODEL` environment variable. Server runs on port **8891**.
+The DashScope API key is passed from the frontend with each request (field `qwen_api_key`) and used directly in DashScope SDK call configuration — it is never written to a process-wide environment variable, stored in sessions, or logged. The model defaults to `qwen-plus` and can be overridden with the optional `QWEN_MODEL` environment variable. Server runs on port **8891**.
 
 Upload limits:
 - **10MB** max total upload size
@@ -269,6 +271,6 @@ Both servers support hot reload. Edit code and see changes immediately.
 
 ## Based on Karpathy's Autoresearch
 
-This tool applies Andrej Karpathy's autoresearch methodology (using LLMs to iteratively improve their own prompts) to agent skills. The key insight: rather than manually tweaking prompts, define success criteria and let the AI optimize itself — now powered by a team of specialized Qwen-Agent assistants.
+This tool applies Andrej Karpathy's autoresearch methodology (using LLMs to iteratively improve their own prompts) to agent skills. The key insight: rather than manually tweaking prompts, define success criteria and let the AI optimize itself — the loop is orchestrated by a LangGraph state graph and driven by direct DashScope calls.
 
 Original concept: [https://github.com/karpathy/autoresearch](https://github.com/karpathy/autoresearch)

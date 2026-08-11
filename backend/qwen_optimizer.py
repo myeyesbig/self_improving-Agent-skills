@@ -1,15 +1,17 @@
 # =============================================================================
 # 【文件头】qwen_optimizer.py —— 后端优化算法的核心
-# 职责：用三个 Qwen-Agent 助手（Executor / Analyst / Mutator）协作，对一个
+# 职责：用三角色（Executor 评分 / Analyst 诊断 / Mutator 变异）协作，对一个
 #       SKILL.md 反复执行"评估 → 诊断 → 修改 → 复评"，最终给出改进后的技能文件。
+#       编排层已显式化为 LangGraph 状态图（optimize_graph.py）；本文件仍持有
+#       全部算法逻辑（评分/诊断/变异/回归守卫/经验库）与 LLM 调用薄封装。
 # 接收：技能文件内容 dict（含 SKILL.md 与 references/ 参考文件）、测试场景
 #       scenarios、评估标准 evals、最大轮数 max_rounds，以及进度回调 callback。
 # 输出：优化结果 dict（baseline_score / final_score / improved_skill_md /
 #       score_history / mutation_log），并通过 callback 逐条推送进度事件。
-# 建议先看：SkillOptimizer.optimize()（主循环）→ _score_skill()（评分）→
+# 建议先看：SkillOptimizer.optimize()（切图执行）→ _score_skill()（评分）→
 #       _run_agent_sync()（模型调用的线程桥接）。
-# 【注意】本文件所有调用都是"同步 + 线程桥接"：Qwen-Agent 的 Assistant.run()
-#       是同步生成器，必须放进工作线程，避免阻塞 FastAPI 的事件循环。
+# 【注意】本文件所有调用都是"同步 + 线程桥接"：DashScope SDK 是同步的，
+#       必须放进工作线程（llm_client 的 to_thread），避免阻塞 FastAPI 事件循环。
 # =============================================================================
 
 """Multi-Agent Skill Optimizer using Qwen-Agent and Alibaba Cloud Model Studio (DashScope).
@@ -29,7 +31,20 @@ from typing import Callable, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
-from qwen_agent.agents import Assistant
+from llm_client import LLMClient
+
+
+class _RoleMessage:
+    """三角色 system prompt 的轻量持有者（替代 Qwen-Agent Assistant）。
+
+    阶段 4 移除 qwen-agent 后，self.executor/analyst/mutator 等属性仍保留，
+    但只承载 system_message —— LLM 调用统一走 llm_client（无状态），
+    不再需要 Assistant 实例或每槽独立实例池的线程安全约定。
+    """
+
+    def __init__(self, name: str, system_message: str):
+        self.name = name
+        self.system_message = system_message
 
 
 # -- Mutation strategy templates ----------------------------------------------
@@ -145,34 +160,6 @@ class SkillMutation(BaseModel):
     new_skill_md: str = Field(description="The full updated SKILL.md content")
 
 
-# -- Text extraction helper ---------------------------------------------------
-# 【初学者提示】Qwen-Agent 的消息 content 可能是纯字符串，也可能是由多个片段
-# （dict / str）组成的列表，这里统一提取成一段纯文本。
-
-def _extract_text(content) -> str:
-    """Extract plain text from a Qwen-Agent message content.
-
-    Only the ``content`` field is read; ``reasoning_content`` is ignored.
-    """
-    if content is None:
-        return ""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts = []
-        for item in content:
-            if isinstance(item, dict):
-                for key in ("text", "content"):
-                    value = item.get(key)
-                    if isinstance(value, str):
-                        parts.append(value)
-                        break
-            elif isinstance(item, str):
-                parts.append(item)
-        return "".join(parts)
-    return str(content)
-
-
 # -- Optimizer ---------------------------------------------------------------
 # 【主流程】SkillOptimizer 持有三个助手实例和一个共享的 LLM 配置（模型 + 密钥）。
 # 密钥只存在于这个配置对象里，不写进程环境变量、不落日志、不存 session。
@@ -199,6 +186,9 @@ class SkillOptimizer:
         lesson_rerank_pool: Optional[int] = None,
         lesson_min_gain: Optional[float] = None,
         lesson_min_final: Optional[float] = None,
+        checkpoint_file: Optional[str] = None,
+        stop_provider: Optional[Callable[[], bool]] = None,
+        deepseek_api_key: Optional[str] = None,
     ):
         # The key is passed directly into the LLM configuration; it is never
         # written to the process environment, stored in sessions, or logged.
@@ -325,6 +315,19 @@ class SkillOptimizer:
         # 内存 embedding 缓存（同文本不重复调用）。
         self._embed_cache = {}
 
+        # 【阶段 1 薄封装】LLM 直调客户端：dashscope 同步 SDK + to_thread 桥接 +
+        # 指数退避重试 + 超时 + JSON mode。参数与旧 Assistant 配置逐字对齐：
+        # temperature=0.2、QWEN_ENABLE_THINKING（默认关闭思考）。
+        # 【双 key】deepseek_api_key 是可选 DeepSeek key（前端双输入框场景）；
+        # DeepSeek 分支优先用它，未传则回退 api_key / DEEPSEEK_API_KEY 环境变量。
+        self._llm = LLMClient(
+            api_key=api_key,
+            model=self.model,
+            temperature=0.2,
+            enable_thinking=os.getenv("QWEN_ENABLE_THINKING", "0") != "0",
+            deepseek_api_key=deepseek_api_key,
+        )
+
         # 【C2】维度权重：评分按 eval.dimension 分组后加权；无权重时与旧
         # 通过率完全一致。可用 ANALYST_DIMENSION_WEIGHTS（JSON）环境变量覆盖。
         if dimension_weights is None:
@@ -336,6 +339,17 @@ class SkillOptimizer:
                     dimension_weights = None
         self.dimension_weights = dimension_weights or None
 
+        # 【阶段 5 断点续跑】SKILL_CHECKPOINT_FILE 指向 langgraph SqliteSaver
+        # 数据库文件；不设=关闭（默认行为不变）。恢复按 thread_id 隔离。
+        if checkpoint_file is None:
+            checkpoint_file = os.getenv("SKILL_CHECKPOINT_FILE") or None
+        self.checkpoint_file = checkpoint_file
+
+        # 【C5 停止源】stop_provider 回调（如 app.py 的 session 标志）与
+        # self.stop_requested 任一置位即抛 StopOptimizationError；默认 None
+        # 保持旧行为（只有 self.stop_requested 生效）。
+        self.stop_provider = stop_provider
+
         # 【C3】并行变异数：默认 1（与旧行为一致）；可用 MUTATION_PARALLELISM
         # 环境变量或请求字段 parallel_mutations 开启并行，上限 3。
         if parallelism is None:
@@ -345,102 +359,56 @@ class SkillOptimizer:
                 parallelism = 1
         self.parallelism = max(1, min(int(parallelism), 3))
 
-        # 三个助手共用同一份 LLM 配置：模型类型固定为 qwen_dashscope（阿里云
-        # 百炼），默认关闭思考模式并压低 temperature，让输出更稳定、便于解析。
-        # 【模型兼容】部分模型（如 qwen3.7-max-2026-05-17 日期快照）强制要求
-        # enable_thinking=True，可用 QWEN_ENABLE_THINKING=1 打开；默认 0 保持
-        # 旧行为（关闭）。thinking 输出含 reasoning_content，_extract_text
-        # 只取 content，解析路径不受影响。
-        llm_config = {
-            "model": self.model,
-            "model_type": "qwen_dashscope",
-            "api_key": api_key,
-            "generate_cfg": {
-                "enable_thinking": os.getenv("QWEN_ENABLE_THINKING", "0") != "0",
-                "temperature": 0.2,
-            },
-        }
-
+        # 三个角色只需各自的 system prompt（LLM 调用已收敛进 llm_client）；
+        # 保留 executor/analyst/mutator 与并行槽位池属性，兼容既有调用点
+        # 与测试引用（_ask 通过 getattr(agent, "system_message") 取提示词）。
         # Executor：三种模式 —— 执行技能 / 生成测试场景与评分标准 / 给输出打分。
-        self.executor = Assistant(
-            name="executor",
-            system_message=EXECUTOR_SYSTEM_PROMPT,
-            llm=llm_config,
-        )
+        self.executor = _RoleMessage("executor", EXECUTOR_SYSTEM_PROMPT)
         # Analyst：根据失败的评估结果定位根因，并选择一种修改策略。
-        self.analyst = Assistant(
-            name="analyst",
-            system_message=ANALYST_SYSTEM_PROMPT,
-            llm=llm_config,
-        )
+        self.analyst = _RoleMessage("analyst", ANALYST_SYSTEM_PROMPT)
         # Mutator：根据诊断对 SKILL.md 做"恰好一处"针对性修改，返回完整新内容。
-        self.mutator = Assistant(
-            name="mutator",
-            system_message=MUTATOR_SYSTEM_PROMPT,
-            llm=llm_config,
-        )
+        self.mutator = _RoleMessage("mutator", MUTATOR_SYSTEM_PROMPT)
 
-        # 【C3 并行】每个变异槽位持有独立的 Mutator / Executor 实例。并行
-        # 运行时必须用各自独立的 Assistant，避免在同一实例上并发 run() 引发
-        # 线程安全问题。parallelism=1 时只建主实例（与旧行为完全一致）。
+        # 【C3 并行】槽位池保留（每槽独立角色对象，语义对齐旧 Assistant 池）；
+        # llm_client 无会话状态，天然支持并发，无需再担心共享实例并发问题。
         self.mutator_pool = [self.mutator] + [
-            Assistant(
-                name=f"mutator-{i}",
-                system_message=MUTATOR_SYSTEM_PROMPT,
-                llm=llm_config,
-            )
+            _RoleMessage(f"mutator-{i}", MUTATOR_SYSTEM_PROMPT)
             for i in range(1, self.parallelism)
         ]
         self.executor_pool = [self.executor] + [
-            Assistant(
-                name=f"executor-{i}",
-                system_message=EXECUTOR_SYSTEM_PROMPT,
-                llm=llm_config,
-            )
+            _RoleMessage(f"executor-{i}", EXECUTOR_SYSTEM_PROMPT)
             for i in range(1, self.parallelism)
         ]
 
     # -- Agent runner helpers ------------------------------------------------
     # 【异步】以下三个辅助函数是"同步调用 ↔ 异步接口"的桥接层：
-    # _run_agent_sync 在普通线程里执行同步生成器，_ask 用 asyncio.to_thread
-    # 把它交给线程池，从而不阻塞 FastAPI 事件循环（轮询/SSE 才能继续响应）。
+    # _run_agent_sync 在普通线程里执行同步 DashScope 调用，_ask 用
+    # asyncio.to_thread 把它交给线程池，从而不阻塞 FastAPI 事件循环
+    # （轮询/SSE 才能继续响应）。签名保留以兼容既有调用点与测试 mock 点。
 
-    def _run_agent_sync(self, agent: Assistant, prompt: str) -> str:
-        """Run a Qwen-Agent assistant synchronously, returning the final assistant text.
+    def _run_agent_sync(self, agent, prompt: str, json_mode: bool = False) -> str:
+        """Run the LLM synchronously via the DashScope client (thin shell).
 
-        ``Assistant.run()`` is a synchronous generator; the final batch of messages
-        holds the complete answer. Only the ``content`` of the last assistant turn
-        is kept (``reasoning_content`` is ignored).
+        ``agent`` is kept in the signature for backward compatibility: the system
+        message is read from it (real assistants carry ``system_message``; objects
+        without that attribute fall back to an empty system prompt). The old
+        Qwen-Agent sync-generator walk is gone — the SDK returns final text
+        directly, so this is a single plain call with retry inside llm_client.
         """
-        responses = None
-        # 【初学者提示】run() 是同步生成器：一边流式产出中间结果，一边 yield。
-        # 用循环把它"跑完"，最后一次迭代拿到的 responses 就是完整回答。
-        for responses in agent.run(
-            [{"role": "user", "content": prompt}],
-            stream=False,
-        ):
-            pass
-        if not responses:
-            raise RuntimeError("Qwen-Agent returned no response")
-        # 从最后一轮 assistant 消息中取文本；reasoning_content 被忽略。
-        for msg in reversed(responses):
-            if msg.get("role") == "assistant":
-                text = _extract_text(msg.get("content"))
-                if text:
-                    return text
-        raise RuntimeError("Qwen-Agent returned no text response")
+        system = getattr(agent, "system_message", "") or ""
+        return self._llm.sync_call(system=system, user=prompt, json_mode=json_mode)
 
-    async def _ask(self, agent: Assistant, prompt: str) -> str:
-        """Run a Qwen-Agent assistant with a prompt, return text response.
+    async def _ask(self, agent, prompt: str, json_mode: bool = False) -> str:
+        """Run the LLM with a prompt, return text response.
 
         The model request is bridged through a worker thread so it never blocks
         the FastAPI event loop handling status polling / SSE.
         """
         # 【异步】asyncio.to_thread 把阻塞的同步调用丢进线程池执行，返回可 await
         # 的结果；这样模型在思考时，事件循环仍能处理其他 HTTP 请求。
-        return await asyncio.to_thread(self._run_agent_sync, agent, prompt)
+        return await asyncio.to_thread(self._run_agent_sync, agent, prompt, json_mode=json_mode)
 
-    async def _ask_json(self, agent: Assistant, prompt: str, fallback=None, schema=None):
+    async def _ask_json(self, agent, prompt: str, fallback=None, schema=None):
         """Run a Qwen-Agent assistant and parse the JSON response.
 
         When a Pydantic ``schema`` is provided, it is appended to the prompt and
@@ -456,7 +424,11 @@ class SkillOptimizer:
                 f"{json.dumps(schema.model_json_schema(), ensure_ascii=False, indent=2)}\n"
                 f"不要使用 Markdown 代码块，也不要在 JSON 前后添加任何说明文字。"
             )
-        text = await self._ask(agent, prompt)
+        # 【阶段 2 可靠性】结构化输出请求开启 dashscope 原生 JSON mode
+        # （response_format={"type":"json_object"}）：从协议层约束模型输出为
+        # 合法 JSON，降低解析失败率；宽容解析链（raw_decode 截取 + Pydantic
+        # 校验 + fallback）原样保留作兜底，行为不变量不变。
+        text = await self._ask(agent, prompt, json_mode=True)
 
         # 【注意】宽容解析：模型可能把 JSON 包在代码块里或前后夹杂废话。
         # 先整体 json.loads，失败则用 raw_decode 定位第一个 { 或 [ 再截取。
@@ -555,19 +527,23 @@ class SkillOptimizer:
         strategy_pool: Optional[List[str]] = None,
         patience: Optional[int] = None,
         domain: Optional[str] = None,
+        thread_id: Optional[str] = None,
     ) -> dict:
-        """Run the optimization loop with 3 Qwen-Agent assistants.
+        """Run the optimization loop as a LangGraph state graph.
 
-        【C2/C3/C4/C5/P1-P3】新增可选参数均为"默认即旧行为"：
+        【C2/C3/C4/C5/P1-P3】可选参数均为"默认即旧行为"，与手写版一致：
         - parallel_mutations：并行变异数（None → 用构造时的 parallelism）
         - strategy_pool：Analyst 可用策略白名单（None → 环境变量/全量）
         - patience：耐心早停轮数（None → 用构造时的 PATIENCE，默认 0 关闭）
+        - thread_id：阶段 5 断点续跑的会话标识（None → 无 checkpoint 行为）
         核心不变量不变：每个候选只改一处；仅当分数严格高于
         当前最佳 + improvement_threshold（+ noise_floor）时才保留。
+        控制流已从嵌套 if 循环显式化为 optimize_graph 的条件边 + Send 扇出；
+        公共签名、返回结构、进度事件逐字不变。
         """
-
-        # 【主流程】callback 是"事件出口"：每次评估/每轮结束都向它推送事件，
-        # 由 app.py 把事件写进 session 的事件队列或 experiments 列表。
+        # 【主流程】callback 是"事件出口"：图节点把事件写进 pending_events，
+        # 这里消费 LangGraph 原生 astream 后逐个回调，由 app.py 写入 session。
+        # 事件源从闭包 callback 换为图流，前端轮询接口与事件形状零改动。
         async def emit(event):
             if callback:
                 await callback(event)
@@ -575,295 +551,99 @@ class SkillOptimizer:
         skill_md = next(
             (v for k, v in skill_files.items() if k.endswith("SKILL.md")), ""
         )
-        current_md = skill_md
-        score_history = []
-        mutation_log = []
-        # 【P2 轮间记忆】每轮结束后追加一条"诊断+结果"，供下一轮 Analyst 参考。
-        round_memory = []
         # 生效的并行数：请求参数优先，否则用构造时的 parallelism（默认 1）。
         n_candidates = parallel_mutations or self.parallelism
         n_candidates = max(1, min(int(n_candidates), 3))
         # 生效的策略池。
         pool = _active_strategy_pool(strategy_pool)
-
-        # 分数归一化辅助：有权重时用加权分，否则用通过率（与旧版一致）。
-        def pct_of(result):
-            if self.dimension_weights and result.get("weighted_pct") is not None:
-                return float(result["weighted_pct"])
-            return round(100 * result["passed"] / max(result["total"], 1), 1)
-
-        # -- Baseline ---------------------------------------------------------
-        # 【主流程】先给原始技能打分，得到基线分数（baseline）；后续每轮修改
-        # 只有分数"严格更高"才会被保留，否则丢弃。
-        self.check_stop()
-        baseline = await self._score_skill(current_md, scenarios, evals)
-        baseline_pct = pct_of(baseline)
-        # 当前版本的失败明细：每轮 Analyst 基于它诊断；保留新版本后随之更新。
-        current_details = baseline["details"]
-        score_history.append(baseline_pct)
-
-        await emit({
-            "type": "baseline",
-            "data": {
-                "score": baseline_pct,
-                "passed": baseline["passed"],
-                "total": baseline["total"],
-                "per_eval": baseline["per_eval"],
-                "dimension_scores": baseline.get("dimension_scores", {}),
-            },
-        })
-
-        # 【P4/RAG】按 LESSON_RETRIEVAL 模式准备注入的经验（off/tag/semantic/
-        # hybrid）；依赖基线失败明细构建检索查询，故放在 baseline 之后。
-        lessons = await self._prepare_lessons(
-            skill_md, scenarios, evals, current_details, domain=domain,
-        )
-
-        # -- Rounds -----------------------------------------------------------
-        # 【P3 饱和快速退出】基线无可提升带（100%，或 0 分且所有评估全失败）
-        # 时跳过全部轮次，避免空耗；默认关闭，开启后与 100% 早停同源。
-        saturated = (
-            self.saturation_exit
-            and (baseline_pct >= 100.0 or (baseline_pct <= 0.0 and baseline.get("total", 0) > 0))
-        )
         # 【P3 耐心早停】连续 N 轮未提升即终止；0 表示关闭。
         effective_patience = patience if patience is not None else self.patience
-        no_improve = 0
 
-        # 【主流程】循环主体：诊断 → 修改 → 复评 → 决定保留/丢弃，最多 max_rounds 轮。
-        for rnd in range(1, max_rounds + 1):
-            # 【主流程】进度 100% 提前终止：当前最佳分数已达满分（所有评估
-            # 全部通过），后续轮次不可能再提升，立即跳出循环，不再空转消耗
-            # token。用 >= 100.0 判定，兼容浮点边界，避免漏判。
-            if baseline_pct >= 100.0 or saturated:
-                break
-            # 【P3 耐心早停】连续 effective_patience 轮未提升 → 提前终止。
-            if effective_patience > 0 and no_improve >= effective_patience:
-                break
-            self.check_stop()
-            await emit({"type": "experiment_start", "data": {"round": rnd}})
+        # 【主流程】延迟导入避免与 optimize_graph 的循环依赖（optimize_graph
+        # 顶层 import 本模块的 STRATEGY_TEMPLATES）。建图后流式执行：事件按
+        # 节点完成顺序产出（baseline → experiment_start → experiment_result
+        # ×N → complete），与手写版一致；StopOptimizationError 由 check_stop
+        # 节点抛出并经 astream 冒泡（协作停止语义不变，不使用 interrupt）。
+        from optimize_graph import build_optimize_graph
 
-            # Analyst diagnoses worst failure
-            # 第 1 个 Agent（Analyst）：分析当前失败项，给出根因与修改策略。
-            # 【P2/P4】把轮间记忆、被拒编辑历史与跨会话经验一并交给 Analyst。
-            analysis = await self._analyze_failures(
-                current_md, scenarios, evals, current_details,
-                strategy_pool=pool,
-                round_memory=round_memory,
-                mutation_log=mutation_log,
-                lessons=lessons,
-            )
-
-            # 【C3 并行变异】同一次诊断产出 N 个候选：每个槽位用独立的 Mutator
-            # 实例，并给不同策略角度 hint，让候选彼此差异化；随后并行复评，
-            # 取分数最优的那个。n_candidates=1 时与旧版逐轮流程完全一致。
-            if n_candidates > 1:
-                mutations = await asyncio.gather(*[
-                    self._mutate_skill(
-                        current_md,
-                        analysis,
-                        agent=self.mutator_pool[i % len(self.mutator_pool)],
-                        strategy_hint=(
-                            STRATEGY_TEMPLATES[pool[i % len(pool)]].get("mutator_hint")
-                            if pool else None
-                        ),
-                        lessons=lessons,
-                    )
-                    for i in range(n_candidates)
-                ])
-            else:
-                mutations = [await self._mutate_skill(current_md, analysis, lessons=lessons)]
-
-            # 【C4 回归守卫】先对每个候选做结构完整性检查，命中即拒绝并跳过
-            # 复评（省 token）；随后并行复评通过检查的候选。
-            candidates = []
-            for i, mutation in enumerate(mutations):
-                new_md = mutation.get("new_skill_md", current_md)
-                if self.regression_check:
-                    ok, reason = self._regression_check(current_md, new_md)
-                    if not ok:
-                        candidates.append({
-                            "candidate_id": i,
-                            "new_md": None,
-                            "description": mutation.get("description", ""),
-                            "reasoning": mutation.get("reasoning", ""),
-                            "rejected": reason,
-                            "score_after": baseline_pct,
-                        })
-                        continue
-                # 【P1 编辑幅度】开启时单次变异相对原文本变化比例超限即拒绝，
-                # 复用回归拒绝管道（只更严，不改变结构守卫的判定）。
-                if self.edit_limit > 0 and current_md:
-                    change_ratio = abs(len(new_md) - len(current_md)) / max(len(current_md), 1)
-                    if change_ratio > self.edit_limit:
-                        candidates.append({
-                            "candidate_id": i,
-                            "new_md": None,
-                            "description": mutation.get("description", ""),
-                            "reasoning": mutation.get("reasoning", ""),
-                            "rejected": "edit_limit_exceeded",
-                            "score_after": baseline_pct,
-                        })
-                        continue
-                candidates.append({
-                    "candidate_id": i,
-                    "new_md": new_md,
-                    "description": mutation.get("description", ""),
-                    "reasoning": mutation.get("reasoning", ""),
-                    "rejected": None,
-                    "score_after": baseline_pct,
-                })
-
-            # 并行复评所有未拒绝的候选。
-            to_score = [c for c in candidates if c["new_md"] is not None]
-            if to_score:
-                results = await asyncio.gather(*[
-                    self._score_skill(
-                        c["new_md"], scenarios, evals,
-                        agent=self.executor_pool[c["candidate_id"] % len(self.executor_pool)],
-                    )
-                    for c in to_score
-                ])
-                for c, res in zip(to_score, results):
-                    c["score_after"] = pct_of(res)
-                    c["per_eval"] = res["per_eval"]
-                    c["dimension_scores"] = res.get("dimension_scores", {})
-                    c["details"] = res["details"]
-
-            # 【主流程】选出本轮最优候选：分数最高者；被回归拒绝的永不入选。
-            scored = [c for c in candidates if c["rejected"] is None and c["new_md"] is not None]
-            best = max(scored, key=lambda c: c["score_after"], default=None)
-
-            # 【主流程】保留条件：最优候选的分必须严格高于"当前基线 + 阈值
-            # + 噪声地板"（kept = True 才采纳）；等于或低于基线的 mutation
-            # 都会被丢弃。这是本项目的核心行为不变量，避免模型乱改导致技能
-            # 退化；noise_floor 默认 0.0，仅在显式开启时抬高门槛（更严格）。
-            kept = (
-                best is not None
-                and best["score_after"] > baseline_pct + self.improvement_threshold + self.noise_floor
-            )
-            new_pct = best["score_after"] if best else baseline_pct
-
-            # 【C3】每个候选各记一条 mutation_log（含 candidate_id / reason）；
-            # 只有最优且严格提升的候选才成为新的当前版本。
-            for c in candidates:
-                is_winner = kept and best is not None and c["candidate_id"] == best["candidate_id"]
-                entry = {
-                    "round": rnd,
-                    "candidate_id": c["candidate_id"],
-                    "strategy_type": analysis.get("mutation_strategy", "unknown"),
-                    "diagnosis": analysis.get("diagnosis", ""),
-                    "description": c["description"],
-                    "score_before": baseline_pct,
-                    "score_after": c["score_after"],
-                    "kept": is_winner,
-                    "reason": c["rejected"] or ("best" if is_winner else "not_best"),
-                }
-                mutation_log.append(entry)
-
-            # 【P2 轮间记忆】压缩本轮"诊断+结果"为一条记录，供下一轮 Analyst 参考。
-            if best is not None:
-                outcome = "rejected" if best["rejected"] else ("kept" if kept else "discarded")
-                mem_reason = best["rejected"] or ("best" if kept else "not_best")
-            else:
-                outcome, mem_reason = "discarded", "no_candidate"
-            round_memory.append({
-                "round": rnd,
-                "strategy": analysis.get("mutation_strategy", "unknown"),
-                "diagnosis": (analysis.get("diagnosis") or "")[:200],
-                "target": analysis.get("target_section", ""),
-                "outcome": outcome,
-                "score_before": baseline_pct,
-                "score_after": new_pct,
-                "reason": mem_reason,
-            })
-
-            if kept and best is not None:
-                # 【P4】保留的修改沉淀为跨会话经验（只记模型生成内容，不落
-                # skill_md / scenario / output / api_key，安全）。skill_name 供
-                # tag/semantic 检索模式按技能过滤，created_at 记录时间。
-                # 【质量门槛】仅当提升幅度或最终水位达标时才沉淀，过滤小修
-                # 噪音（_lesson_qualifies，默认关闭=任何 kept 都沉淀）。
-                if self._lesson_qualifies(baseline_pct, best["score_after"]):
-                    self._append_lesson(self.lesson_file, {
-                        "skill_name": self._skill_name_from_md(skill_md),
-                        "domain": domain or "",
-                        "skill_description": "",
-                        "strategy": analysis.get("mutation_strategy", "unknown"),
-                        "diagnosis": (analysis.get("diagnosis") or "")[:200],
-                        "summary": (best.get("description") or "")[:200],
-                        "score_before": baseline_pct,
-                        "score_after": best["score_after"],
-                        "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
-                    })
-                current_md = best["new_md"]
-                baseline_pct = best["score_after"]
-                current_details = best.get("details", current_details)
-
-            # 【P3 耐心早停】计数连续未提升轮数；保留即清零。
-            no_improve = 0 if kept else no_improve + 1
-
-            score_history.append(baseline_pct)
-
-            await emit({
-                "type": "experiment_result",
-                "data": {
-                    "round": rnd,
-                    "score": new_pct,
-                    "kept": kept,
-                    "status": "kept" if kept else "discarded",
-                    "description": best["description"] if best else "",
-                    "strategy": analysis.get("mutation_strategy", ""),
-                    "per_eval": best["per_eval"] if best else [],
-                    "candidates": [
-                        {
-                            "candidate_id": c["candidate_id"],
-                            "description": c["description"],
-                            "score": c["score_after"],
-                            "reason": c["rejected"] or ("best" if (kept and best and c["candidate_id"] == best["candidate_id"]) else "not_best"),
-                        }
-                        for c in candidates
-                    ],
-                    "dimension_scores": best["dimension_scores"] if best else {},
-                    "diff_summary": (
-                        self._diff_summary(current_md, best["new_md"])
-                        if kept and best is not None else ""
-                    ),
-                },
-            })
-
-        # -- Done -------------------------------------------------------------
-        # 【P3 胜出候选复核】开启时对最终版本独立再评一次：若复核分未超过
-        # 基线（含阈值/噪声地板），说明此前的提升可能是单点幸运，回退为原始
-        # 技能（不采纳）。默认关闭。
-        if self.final_confirm and current_md != skill_md:
-            confirm = await self._score_skill(current_md, scenarios, evals)
-            confirm_pct = pct_of(confirm)
-            if confirm_pct <= score_history[0] + self.improvement_threshold + self.noise_floor:
-                current_md = skill_md
-                baseline_pct = score_history[0]
-
-        # 【主流程】全部轮次结束，推送 complete 事件并返回汇总结果。
-        final_pct = baseline_pct
-        await emit({
-            "type": "complete",
-            "data": {
-                "baseline_score": score_history[0],
-                "final_score": final_pct,
-                "improved_skill_md": current_md,
-                "score_history": score_history,
-                "mutation_log": mutation_log,
-                "strategy_stats": self._strategy_stats(mutation_log),
-            },
-        })
-
-        return {
-            "baseline_score": score_history[0],
-            "final_score": final_pct,
-            "improved_skill_md": current_md,
-            "score_history": score_history,
-            "mutation_log": mutation_log,
+        initial_state: dict = {
+            "skill_md": skill_md,
+            "domain": domain or "",
+            "n_candidates": n_candidates,
+            "effective_patience": effective_patience,
+            "current_md": "",
+            "baseline_pct": 0.0,
+            "current_details": [],
+            "score_history": [],
+            "mutation_log": [],
+            "round_memory": [],
+            "lessons": [],
+            "round_idx": 0,
+            "no_improve": 0,
+            "saturated": False,
+            "analysis": None,
+            "mutations": [],
+            "candidates": [],
+            "rescored": [],
+            "kept": False,
+            "final_pct": 0.0,
+            "pending_events": [],
+            "final_result": {},
         }
+
+        # 【阶段 5 断点续跑】SKILL_CHECKPOINT_FILE 设置时挂载 SqliteSaver
+        # （checkpoint-sqlite 3.x 的 from_conn_string 是 context manager，
+        # 用 with 打开获得 saver）；thread_id 按会话隔离，同一 thread 再次
+        # 调用自动从上次 checkpoint 续跑（跳过已 emit 的事件，前端不重复）。
+        # 默认关闭=旧行为。
+        async def run_graph(checkpointer, config):
+            graph = build_optimize_graph(
+                self,
+                max_rounds=max_rounds,
+                n_candidates=n_candidates,
+                strategy_pool=pool,
+                effective_patience=effective_patience,
+                scenarios=scenarios,
+                evals=evals,
+                checkpointer=checkpointer,
+            )
+            # 【续跑】checkpointer 开启且该 thread 已有历史 checkpoint 时，
+            # 以 None 作为输入从上次中断点继续；否则全新开始。
+            already_emitted = 0
+            if checkpointer is not None:
+                # AsyncSqliteSaver 须用异步接口（aget_state）。
+                snapshot = await graph.aget_state(config)
+                if snapshot.values:
+                    already_emitted = len(snapshot.values.get("pending_events", []))
+                    stream = graph.astream(None, config=config, stream_mode="updates")
+                else:
+                    stream = graph.astream(initial_state, config=config, stream_mode="updates")
+            else:
+                stream = graph.astream(initial_state, stream_mode="updates")
+
+            outcome: dict = {}
+            seen = 0
+            async for updates in stream:
+                for update in updates.values():
+                    for event in update.get("pending_events", []):
+                        # 续跑模式跳过 checkpoint 之前已 emit 的事件。
+                        if seen >= already_emitted:
+                            await emit(event)
+                        seen += 1
+                    # finalize 节点返回最终结果（含 final_confirm 回退后的值）。
+                    if update.get("final_result"):
+                        outcome = update["final_result"]
+            return outcome
+
+        if self.checkpoint_file:
+            # 【阶段 5】astream 是异步执行，必须用 AsyncSqliteSaver（同步版
+            # SqliteSaver 只支持 sync API）；from_conn_string 返回 async
+            # context manager，async with 打开后获得 saver。
+            from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+            config = {"configurable": {"thread_id": thread_id or "default"}}
+            async with AsyncSqliteSaver.from_conn_string(self.checkpoint_file) as checkpointer:
+                return await run_graph(checkpointer, config)
+        return await run_graph(None, None)
 
     @staticmethod
     def _diff_summary(original_md: str, new_md: str, limit: int = 4000) -> str:
@@ -1088,9 +868,22 @@ class SkillOptimizer:
         return True, ""
 
     def check_stop(self):
-        """【C5】协作式取消检查：在轮间调用，stop_requested 置位即抛异常。"""
+        """【C5】协作式取消检查：在轮间调用，stop 置位即抛异常。
+
+        停止来源有两个（任一置位即停）：实例属性 ``self.stop_requested``
+        （兼容旧行为/测试），以及构造时传入的 ``stop_provider`` 回调
+        （如 app.py 的 session["stop_requested"]，让 /api/stop 真正生效）。
+        """
         if getattr(self, "stop_requested", False):
             raise StopOptimizationError("Optimization stopped by user request")
+        if self.stop_provider is not None:
+            try:
+                if self.stop_provider():
+                    raise StopOptimizationError("Optimization stopped by user request")
+            except StopOptimizationError:
+                raise
+            except Exception:
+                pass  # stop_provider 自身异常视为未停止，不影响优化
 
     async def _analyze_failures(self, skill_md, scenarios, evals, details, strategy_pool=None,
                                 round_memory=None, mutation_log=None, lessons=None):

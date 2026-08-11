@@ -28,15 +28,18 @@ interface UploadStepProps {
     apiKey: string,
     metadata: any,
     scenarios: any[],
-    evals: any[]
+    evals: any[],
+    deepseekApiKey?: string
   ) => void;
 }
 
 export default function UploadStep({ onComplete }: UploadStepProps) {
-  // 【初学者提示】isDragging 控制拖拽高亮；apiKey 是组件内存里的密钥；
+  // 【初学者提示】isDragging 控制拖拽高亮；apiKey / deepseekApiKey 是组件内存
+  // 里的密钥（双输入框：DashScope 主 key + 可选 DeepSeek key）；
   // isUploading / isAnalyzing 是按钮的加载态；sessionId 记录上传结果。
   const [isDragging, setIsDragging] = useState(false);
   const [apiKey, setApiKey] = useState("");
+  const [deepseekApiKey, setDeepseekApiKey] = useState("");
   const [isUploading, setIsUploading] = useState(false);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [fileList, setFileList] = useState<string[]>([]);
@@ -120,15 +123,16 @@ export default function UploadStep({ onComplete }: UploadStepProps) {
     }
   };
 
-  // 【主流程】分析请求：把 session_id 与 API Key 一起 POST 给 /api/analyze，
+  // 【主流程】分析请求：把 session_id 与两个 API Key 一起 POST 给 /api/analyze，
   // 后端返回模型生成的 scenarios（测试场景）和 evals（评估标准），
   // 最后调用 onComplete 把全部上下文上交给父组件，由父组件跳到步骤 2。
   const handleAnalyze = async () => {
-    if (!apiKey || !sessionId) return;
+    // 【双 key】DashScope 与 DeepSeek 至少填一个即可进入分析。
+    if ((!apiKey && !deepseekApiKey) || !sessionId) return;
     setIsAnalyzing(true);
     try {
-      const data = await analyzeSkill(sessionId, apiKey);
-      onComplete(sessionId, apiKey, metadata, data.scenarios, data.evals);
+      const data = await analyzeSkill(sessionId, apiKey, deepseekApiKey);
+      onComplete(sessionId, apiKey, metadata, data.scenarios, data.evals, deepseekApiKey);
     } catch (error: any) {
       alert(error.message || "Analysis failed. Check your API key.");
     } finally {
@@ -139,8 +143,8 @@ export default function UploadStep({ onComplete }: UploadStepProps) {
   // 示例技能：先 /api/examples/{path}/load 加载，再自动走一次分析，
   // 效果等同于"上传 + 分析"两步合一。
   const handleExampleSelect = async (examplePath: string) => {
-    if (!apiKey) {
-      alert("Please enter your DashScope API key first.");
+    if (!apiKey && !deepseekApiKey) {
+      alert("Please enter your DashScope or DeepSeek API key first.");
       return;
     }
     setIsUploading(true);
@@ -152,8 +156,8 @@ export default function UploadStep({ onComplete }: UploadStepProps) {
       setIsUploading(false);
       setIsAnalyzing(true);
 
-      const analyzeData = await analyzeSkill(loadData.session_id, apiKey);
-      onComplete(loadData.session_id, apiKey, loadData.metadata, analyzeData.scenarios, analyzeData.evals);
+      const analyzeData = await analyzeSkill(loadData.session_id, apiKey, deepseekApiKey);
+      onComplete(loadData.session_id, apiKey, loadData.metadata, analyzeData.scenarios, analyzeData.evals, deepseekApiKey);
     } catch (error: any) {
       alert(error.message || "Failed to load example skill.");
       setSessionId(null);
@@ -217,7 +221,7 @@ export default function UploadStep({ onComplete }: UploadStepProps) {
             </div>
           </div>
 
-          <div className="glass rounded-2xl p-6">
+          <div className="glass rounded-2xl p-6 space-y-4">
             <label className="block">
               <span className="text-sm font-medium text-zinc-400 mb-2 block">DashScope API Key</span>
               <input
@@ -229,6 +233,21 @@ export default function UploadStep({ onComplete }: UploadStepProps) {
               />
               <span className="text-xs text-zinc-500 mt-1 block">
                 Required for analysis. Stored locally, sent only to the backend.
+              </span>
+            </label>
+            <label className="block">
+              <span className="text-sm font-medium text-zinc-400 mb-2 block">
+                DeepSeek API Key <span className="text-zinc-500">(optional)</span>
+              </span>
+              <input
+                type="password"
+                value={deepseekApiKey}
+                onChange={(e) => setDeepseekApiKey(e.target.value)}
+                placeholder="Enter your DeepSeek API key (used when model starts with deepseek-)"
+                className="w-full px-4 py-3 bg-zinc-900 border border-zinc-800 rounded-lg focus:outline-none focus:border-cyan-500 transition-colors"
+              />
+              <span className="text-xs text-zinc-500 mt-1 block">
+                Optional. Only used when the backend model starts with &quot;deepseek-&quot;.
               </span>
             </label>
           </div>
@@ -247,9 +266,9 @@ export default function UploadStep({ onComplete }: UploadStepProps) {
                 <button
                   key={skill.path}
                   onClick={() => handleExampleSelect(skill.path)}
-                  disabled={isUploading || isAnalyzing || !apiKey}
+                  disabled={isUploading || isAnalyzing || (!apiKey && !deepseekApiKey)}
                   className={`glass rounded-xl p-6 text-left transition-all ${
-                    apiKey && !isUploading && !isAnalyzing
+                    (apiKey || deepseekApiKey) && !isUploading && !isAnalyzing
                       ? "hover:border-cyan-500 hover:scale-105 cursor-pointer"
                       : "opacity-50 cursor-not-allowed"
                   }`}
@@ -287,8 +306,8 @@ export default function UploadStep({ onComplete }: UploadStepProps) {
             </div>
           </div>
 
-          <div className="glass rounded-2xl p-8">
-            <label className="block mb-4">
+          <div className="glass rounded-2xl p-8 space-y-4">
+            <label className="block">
               <span className="text-sm font-medium text-zinc-400 mb-2 block">DashScope API Key</span>
               <input
                 type="password"
@@ -298,11 +317,23 @@ export default function UploadStep({ onComplete }: UploadStepProps) {
                 className="w-full px-4 py-3 bg-zinc-900 border border-zinc-800 rounded-lg focus:outline-none focus:border-cyan-500 transition-colors"
               />
             </label>
+            <label className="block">
+              <span className="text-sm font-medium text-zinc-400 mb-2 block">
+                DeepSeek API Key <span className="text-zinc-500">(optional)</span>
+              </span>
+              <input
+                type="password"
+                value={deepseekApiKey}
+                onChange={(e) => setDeepseekApiKey(e.target.value)}
+                placeholder="Enter your DeepSeek API key (used when model starts with deepseek-)"
+                className="w-full px-4 py-3 bg-zinc-900 border border-zinc-800 rounded-lg focus:outline-none focus:border-cyan-500 transition-colors"
+              />
+            </label>
             <button
               onClick={handleAnalyze}
-              disabled={!apiKey || isAnalyzing}
+              disabled={(!apiKey && !deepseekApiKey) || isAnalyzing}
               className={`w-full py-4 rounded-xl font-semibold transition-all flex items-center justify-center gap-2 ${
-                apiKey && !isAnalyzing ? "gradient-bg hover:scale-105" : "bg-zinc-800 text-zinc-500 cursor-not-allowed"
+                (apiKey || deepseekApiKey) && !isAnalyzing ? "gradient-bg hover:scale-105" : "bg-zinc-800 text-zinc-500 cursor-not-allowed"
               }`}
             >
               {isAnalyzing ? (

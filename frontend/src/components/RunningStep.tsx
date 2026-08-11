@@ -19,6 +19,7 @@ import { startOptimization as apiStartOptimization, getStatus, stopOptimization 
 interface RunningStepProps {
   sessionId: string;
   apiKey: string;
+  deepseekApiKey?: string;
   scenarios: any[];
   evals: any[];
   onComplete: (result: any) => void;
@@ -48,6 +49,7 @@ interface Experiment {
 export default function RunningStep({
   sessionId,
   apiKey,
+  deepseekApiKey,
   scenarios,
   evals,
   onComplete,
@@ -76,7 +78,7 @@ export default function RunningStep({
       // Start the optimization
       // 【主流程】POST /api/start 时把 API Key 与轮数上限交给后端；后端立即
       // 返回 {"status":"started"} 并让优化在后台任务中运行。
-      await apiStartOptimization(sessionId, apiKey, { max_rounds: 20 });
+      await apiStartOptimization(sessionId, apiKey, { max_rounds: 20 }, deepseekApiKey);
 
       // Poll for status every 3 seconds
       // 【主流程】轮询循环：每 3 秒问一次 /api/status；有新增实验就刷新界面，

@@ -26,22 +26,25 @@ export default function Home() {
   const [currentStep, setCurrentStep] = useState(1);
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [apiKey, setApiKey] = useState("");
+  const [deepseekApiKey, setDeepseekApiKey] = useState("");
   const [metadata, setMetadata] = useState<any>(null);
   const [scenarios, setScenarios] = useState<any[]>([]);
   const [evals, setEvals] = useState<any[]>([]);
   const [finalResult, setFinalResult] = useState<any>(null);
 
-  // 【主流程】回调 1：上传 + 分析完成后，把 sessionId / apiKey / 元数据 /
+  // 【主流程】回调 1：上传 + 分析完成后，把 sessionId / 两个 key / 元数据 /
   // 初始 scenarios / evals 存进父组件 state，并跳到步骤 2（配置）。
   const handleUploadComplete = (
     sid: string,
     key: string,
     meta: any,
     initialScenarios: any[],
-    initialEvals: any[]
+    initialEvals: any[],
+    deepKey?: string
   ) => {
     setSessionId(sid);
     setApiKey(key);
+    setDeepseekApiKey(deepKey || "");
     setMetadata(meta);
     setScenarios(initialScenarios);
     setEvals(initialEvals);
@@ -64,6 +67,7 @@ export default function Home() {
     setCurrentStep(1);
     setSessionId(null);
     setApiKey("");
+    setDeepseekApiKey("");
     setMetadata(null);
     setScenarios([]);
     setEvals([]);
@@ -103,6 +107,7 @@ export default function Home() {
             <ConfigStep
               sessionId={sessionId}
               apiKey={apiKey}
+              deepseekApiKey={deepseekApiKey}
               scenarios={scenarios}
               evals={evals}
               onScenariosChange={setScenarios}
@@ -115,6 +120,7 @@ export default function Home() {
             <RunningStep
               sessionId={sessionId}
               apiKey={apiKey}
+              deepseekApiKey={deepseekApiKey}
               scenarios={scenarios}
               evals={evals}
               onComplete={handleOptimizationComplete}

@@ -22,10 +22,12 @@ import json
 import os
 import tempfile
 import unittest
-from unittest.mock import AsyncMock, patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from pydantic import ValidationError
 
+from llm_client import LLMClient
 from qwen_optimizer import (
     ANALYST_SYSTEM_PROMPT,
     EXECUTOR_SYSTEM_PROMPT,
@@ -66,38 +68,44 @@ def make_optimizer(api_key="sk-test-1234", **kwargs):
 
 
 class TestSyncExtraction(unittest.TestCase):
-    """Verify the final batch of a sync Qwen response generator is extracted."""
+    """Verify the sync LLM call returns the assistant text via the thin shell.
 
-    # 同步生成器取最后一轮的 assistant 文本（前面若干批是流式中间结果）。
-    def test_final_batch_text_is_extracted(self):
-        agent = FakeAgent([
-            [{"role": "assistant", "content": "partial stream"}],
-            [{"role": "assistant", "content": ""}],
-            [{"role": "assistant", "content": "final answer"}],
-        ])
+    阶段 1 起 _run_agent_sync 不再消费 Qwen-Agent 的同步生成器，而是把
+    (system message, prompt, json_mode) 转发给 llm_client.sync_call 并返回文本。
+    agent 参数仅为兼容保留：有 system_message 就用，没有则回退空串。
+    """
+
+    def _opt_with_llm(self, return_value="final answer"):
         opt = make_optimizer()
+        mock_llm = MagicMock()
+        mock_llm.sync_call.return_value = return_value
+        opt._llm = mock_llm
+        return opt, mock_llm
+
+    def test_final_text_returned(self):
+        opt, mock_llm = self._opt_with_llm()
+        agent = FakeAgent([])
         self.assertEqual(opt._run_agent_sync(agent, "hi"), "final answer")
+        mock_llm.sync_call.assert_called_once_with(system="", user="hi", json_mode=False)
 
-    # content 是片段列表时拼接成整段文本。
-    def test_list_content_is_joined(self):
-        agent = FakeAgent([[{"role": "assistant", "content": [{"text": "a"}, {"text": "b"}]}]])
-        opt = make_optimizer()
-        self.assertEqual(opt._run_agent_sync(agent, "hi"), "ab")
+    def test_system_message_taken_from_agent(self):
+        opt, mock_llm = self._opt_with_llm()
+        agent = FakeAgent([])
+        agent.system_message = "sys prompt"
+        opt._run_agent_sync(agent, "hi")
+        mock_llm.sync_call.assert_called_once_with(system="sys prompt", user="hi", json_mode=False)
 
-    # reasoning_content（推理过程）必须被忽略，只取 content。
-    def test_reasoning_content_is_ignored(self):
-        agent = FakeAgent([
-            [{"role": "assistant", "content": "only this", "reasoning_content": "hidden"}],
-        ])
-        opt = make_optimizer()
-        self.assertEqual(opt._run_agent_sync(agent, "hi"), "only this")
+    def test_agent_without_system_message_falls_back_empty(self):
+        opt, mock_llm = self._opt_with_llm()
+        agent = FakeAgent([])
+        opt._run_agent_sync(agent, "hi")
+        mock_llm.sync_call.assert_called_once_with(system="", user="hi", json_mode=False)
 
-    # 完全没有文本时抛 RuntimeError，由上层 catch 兜底。
-    def test_no_text_raises_runtime_error(self):
-        agent = FakeAgent([[{"role": "assistant", "content": ""}]])
-        opt = make_optimizer()
-        with self.assertRaises(RuntimeError):
-            opt._run_agent_sync(agent, "hi")
+    def test_json_mode_passthrough(self):
+        opt, mock_llm = self._opt_with_llm()
+        agent = FakeAgent([])
+        opt._run_agent_sync(agent, "hi", json_mode=True)
+        mock_llm.sync_call.assert_called_once_with(system="", user="hi", json_mode=True)
 
 
 class TestAskThreadBridge(unittest.IsolatedAsyncioTestCase):
@@ -124,30 +132,34 @@ class TestAskThreadBridge(unittest.IsolatedAsyncioTestCase):
 
 
 class TestJsonParsing(unittest.IsolatedAsyncioTestCase):
-    """Verify tolerant JSON extraction (code fences / extra text)."""
+    """Verify tolerant JSON extraction (code fences / extra text).
+
+    _ask 已 mock（LLM 层在 llm_client 测试中覆盖），这里专注 _ask_json 的
+    宽容解析链：代码块包裹、前后杂文、完全非 JSON 三种情况。
+    """
 
     # 宽容解析 1：模型把 JSON 包在 ```json 代码块里也能提取。
     async def test_code_fenced_json_is_parsed(self):
         payload = json.dumps({"scenarios": [{"id": 1}], "evals": []})
         text = f"Here you go:\n```json\n{payload}\n```\nDone."
         opt = make_optimizer()
-        agent = FakeAgent([[{"role": "assistant", "content": text}]])
-        result = await opt._ask_json(agent, "prompt")
+        with patch.object(opt, "_ask", new=AsyncMock(return_value=text)):
+            result = await opt._ask_json(None, "prompt")
         self.assertEqual(result["scenarios"], [{"id": 1}])
 
     # 宽容解析 2：JSON 前后有额外文字也能定位并解析。
     async def test_extra_text_before_json_is_handled(self):
         text = 'Sure!\n{"a": 1}\nmore text'
         opt = make_optimizer()
-        agent = FakeAgent([[{"role": "assistant", "content": text}]])
-        result = await opt._ask_json(agent, "prompt")
+        with patch.object(opt, "_ask", new=AsyncMock(return_value=text)):
+            result = await opt._ask_json(None, "prompt")
         self.assertEqual(result, {"a": 1})
 
     # 完全不是 JSON 时返回 fallback（兜底值），而不是抛异常。
     async def test_non_json_uses_fallback(self):
         opt = make_optimizer()
-        agent = FakeAgent([[{"role": "assistant", "content": "I cannot do that."}]])
-        result = await opt._ask_json(agent, "prompt", fallback={"results": []})
+        with patch.object(opt, "_ask", new=AsyncMock(return_value="I cannot do that.")):
+            result = await opt._ask_json(None, "prompt", fallback={"results": []})
         self.assertEqual(result, {"results": []})
 
 
@@ -163,23 +175,23 @@ class TestSchemaValidation(unittest.IsolatedAsyncioTestCase):
             "suggested_change": "add an example",
         }
         opt = make_optimizer()
-        agent = FakeAgent([[{"role": "assistant", "content": json.dumps(valid)}]])
-        result = await opt._ask_json(
-            agent, "prompt",
-            fallback={"diagnosis": "fb", "mutation_strategy": "add_constraint",
-                      "target_section": "x", "suggested_change": "y"},
-            schema=FailureAnalysis,
-        )
+        with patch.object(opt, "_ask", new=AsyncMock(return_value=json.dumps(valid))):
+            result = await opt._ask_json(
+                None, "prompt",
+                fallback={"diagnosis": "fb", "mutation_strategy": "add_constraint",
+                          "target_section": "x", "suggested_change": "y"},
+                schema=FailureAnalysis,
+            )
         self.assertEqual(result["diagnosis"], "missing examples")
 
     # 缺少必填字段 → schema 校验失败 → 使用 fallback（结构化输出兜底）。
     async def test_analyst_schema_validation_falls_back(self):
         opt = make_optimizer()
         # Missing required fields -> schema validation must fail -> fallback
-        agent = FakeAgent([[{"role": "assistant", "content": json.dumps({"diagnosis": "only"})}]])
-        fallback = {"diagnosis": "fb", "mutation_strategy": "add_constraint",
-                    "target_section": "x", "suggested_change": "y"}
-        result = await opt._ask_json(agent, "prompt", fallback=fallback, schema=FailureAnalysis)
+        with patch.object(opt, "_ask", new=AsyncMock(return_value=json.dumps({"diagnosis": "only"}))):
+            fallback = {"diagnosis": "fb", "mutation_strategy": "add_constraint",
+                        "target_section": "x", "suggested_change": "y"}
+            result = await opt._ask_json(None, "prompt", fallback=fallback, schema=FailureAnalysis)
         self.assertEqual(result, fallback)
 
     # Mutator 返回符合 SkillMutation schema 时正常通过。
@@ -190,16 +202,16 @@ class TestSchemaValidation(unittest.IsolatedAsyncioTestCase):
             "new_skill_md": "# Updated",
         }
         opt = make_optimizer()
-        agent = FakeAgent([[{"role": "assistant", "content": json.dumps(valid)}]])
-        result = await opt._ask_json(agent, "prompt", fallback={}, schema=SkillMutation)
+        with patch.object(opt, "_ask", new=AsyncMock(return_value=json.dumps(valid))):
+            result = await opt._ask_json(None, "prompt", fallback={}, schema=SkillMutation)
         self.assertEqual(result["new_skill_md"], "# Updated")
 
     # Mutator 返回非 JSON → fallback（此时 new_skill_md 兜底为原内容）。
     async def test_mutator_schema_non_json_falls_back(self):
         opt = make_optimizer()
-        agent = FakeAgent([[{"role": "assistant", "content": "not json at all"}]])
-        fallback = {"description": "fb", "reasoning": "", "new_skill_md": "orig"}
-        result = await opt._ask_json(agent, "prompt", fallback=fallback, schema=SkillMutation)
+        with patch.object(opt, "_ask", new=AsyncMock(return_value="not json at all")):
+            fallback = {"description": "fb", "reasoning": "", "new_skill_md": "orig"}
+            result = await opt._ask_json(None, "prompt", fallback=fallback, schema=SkillMutation)
         self.assertEqual(result, fallback)
 
 
@@ -329,6 +341,23 @@ class TestFastApiRequestModels(unittest.TestCase):
         self.assertEqual(req.qwen_api_key, "k")
         self.assertEqual(req.max_rounds, 20)
 
+    # 【双 key】请求模型可选接受 deepseek_api_key（前端双输入框场景）。
+    def test_analyze_accepts_deepseek_key(self):
+        req = AnalyzeRequest(session_id="s1", qwen_api_key="qk", deepseek_api_key="dk")
+        self.assertEqual(req.deepseek_api_key, "dk")
+
+    def test_analyze_deepseek_key_optional(self):
+        req = AnalyzeRequest(session_id="s1", qwen_api_key="qk")
+        self.assertIsNone(req.deepseek_api_key)
+
+    def test_regenerate_accepts_deepseek_key(self):
+        req = RegenerateRequest(session_id="s1", qwen_api_key="qk", deepseek_api_key="dk")
+        self.assertEqual(req.deepseek_api_key, "dk")
+
+    def test_start_accepts_deepseek_key(self):
+        req = StartRequest(qwen_api_key="qk", deepseek_api_key="dk")
+        self.assertEqual(req.deepseek_api_key, "dk")
+
     def test_start_rejects_legacy_key_field(self):
         with self.assertRaises(ValidationError):
             StartRequest(**{"gemini_" + "api_key": "k"})
@@ -381,14 +410,14 @@ class TestWeightedScoring(unittest.IsolatedAsyncioTestCase):
         scenarios = [{"id": 1, "input": "x"}]
         skill_md = "# S"
         # Fake the two executor calls: execute output + scoring JSON.
-        agent = FakeAgent([
-            [{"role": "assistant", "content": "some output"}],
-            [{"role": "assistant", "content": json.dumps({"results": [
+        with (
+            patch.object(opt, "_ask", new=AsyncMock(return_value="some output")),
+            patch.object(opt, "_ask_json", new=AsyncMock(return_value={"results": [
                 {"eval_id": 1, "passed": True},
                 {"eval_id": 2, "passed": False},
-            ]})}],
-        ])
-        result = await opt._score_skill(skill_md, scenarios, evals, agent=agent)
+            ]})),
+        ):
+            result = await opt._score_skill(skill_md, scenarios, evals)
         self.assertEqual(result["passed"], 1)
         self.assertEqual(result["total"], 2)
         # 无权重：weighted_pct 与通过率完全一致。
@@ -404,14 +433,14 @@ class TestWeightedScoring(unittest.IsolatedAsyncioTestCase):
             {"id": 2, "question": "q2", "dimension": "clarity"},
         ]
         scenarios = [{"id": 1, "input": "x"}]
-        agent = FakeAgent([
-            [{"role": "assistant", "content": "some output"}],
-            [{"role": "assistant", "content": json.dumps({"results": [
+        with (
+            patch.object(opt, "_ask", new=AsyncMock(return_value="some output")),
+            patch.object(opt, "_ask_json", new=AsyncMock(return_value={"results": [
                 {"eval_id": 1, "passed": True},
                 {"eval_id": 2, "passed": False},
-            ]})}],
-        ])
-        result = await opt._score_skill("# S", scenarios, evals, agent=agent)
+            ]})),
+        ):
+            result = await opt._score_skill("# S", scenarios, evals)
         # weighted = (0.8*1.0 + 0.2*0.0) / 1.0 = 0.8 -> 80%
         self.assertEqual(result["weighted_pct"], 80.0)
 
@@ -768,15 +797,15 @@ class TestRuleBasedScoring(unittest.IsolatedAsyncioTestCase):
             {"id": 2, "question": "q2", "dimension": "clarity"},
         ]
         scenarios = [{"id": 1, "input": "x"}]
-        agent = FakeAgent([
-            [{"role": "assistant", "content": "some output"}],
-            [{"role": "assistant", "content": json.dumps({"results": [
+        with (
+            patch.object(opt, "_ask", new=AsyncMock(return_value="some output")),
+            patch.object(opt, "_ask_json", new=AsyncMock(return_value={"results": [
                 {"eval_id": 1, "passed": True},
                 {"eval_id": 2, "passed": False},
-            ]})}],
-        ])
-        result = await opt._score_skill("# S", scenarios, evals, agent=agent)
-        # 与旧行为一致：全走 LLM 打分，passed 来自 FakeAgent 返回的完整结果。
+            ]})),
+        ):
+            result = await opt._score_skill("# S", scenarios, evals)
+        # 与旧行为一致：全走 LLM 打分，passed 来自 mock 返回的完整结果。
         self.assertEqual(result["passed"], 1)
         self.assertEqual(result["total"], 2)
 
@@ -1489,6 +1518,150 @@ class TestStopRequested(unittest.IsolatedAsyncioTestCase):
                 await opt.optimize({"SKILL.md": "# S"}, [], [], max_rounds=3)
 
 
+class TestStopProvider(unittest.IsolatedAsyncioTestCase):
+    """C5 增强：stop_provider 回调让 /api/stop 真正到达优化器（轮间生效）。"""
+
+    async def test_stop_provider_true_raises(self):
+        opt = make_optimizer(stop_provider=lambda: True)
+        with self.assertRaises(StopOptimizationError):
+            opt.check_stop()
+
+    async def test_stop_provider_false_does_not_raise(self):
+        opt = make_optimizer(stop_provider=lambda: False)
+        opt.check_stop()  # 不抛
+
+    async def test_stop_provider_during_optimization(self):
+        opt = make_optimizer(stop_provider=lambda: True)
+        baseline = {"passed": 2, "total": 4, "per_eval": [], "details": []}
+        with patch.object(opt, "_score_skill", new=AsyncMock(return_value=baseline)) as mock_score:
+            with self.assertRaises(StopOptimizationError):
+                await opt.optimize({"SKILL.md": "# S"}, [], [], max_rounds=3)
+        # 停止在 baseline 评分前生效（与手写版 L598 的 check_stop 一致）。
+        mock_score.assert_not_awaited()
+
+    async def test_stop_provider_exception_ignored(self):
+        # stop_provider 自身抛异常视为未停止，不打断优化。
+        def bad_provider():
+            raise RuntimeError("provider broken")
+        opt = make_optimizer(stop_provider=bad_provider)
+        opt.check_stop()  # 不抛
+
+
+class TestCheckpointer(unittest.IsolatedAsyncioTestCase):
+    """阶段 5：SqliteSaver 断点续跑（默认关闭；thread_id 隔离；key 不入库）。"""
+
+    async def test_disabled_by_default(self):
+        opt = make_optimizer()
+        self.assertIsNone(opt.checkpoint_file)
+        # 无 checkpoint 时 optimize 正常执行（无 config）。
+        baseline = {"passed": 4, "total": 4, "per_eval": [], "details": []}
+        with patch.object(opt, "_score_skill", new=AsyncMock(return_value=baseline)):
+            result = await opt.optimize({"SKILL.md": "# S"}, [], [], max_rounds=5)
+        self.assertEqual(result["baseline_score"], 100.0)
+
+    async def test_resume_after_interruption(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cp = os.path.join(tmp, "cp.db")
+            opt = make_optimizer(checkpoint_file=cp)
+            # 恒定 50%（不提升、不早停），确保第 2 轮复评时触发中断。
+            baseline = {"passed": 2, "total": 4, "per_eval": [], "details": []}
+            analysis = {"diagnosis": "d", "mutation_strategy": "add_example",
+                        "target_section": "s", "suggested_change": "c"}
+            mutation = {"description": "m", "reasoning": "r", "new_skill_md": "# New"}
+            calls = {"n": 0}
+            interrupted = {"on": True}
+
+            async def score(*a, **kw):
+                if interrupted["on"]:
+                    calls["n"] += 1
+                    if calls["n"] == 3:  # baseline + r1 复评之后 → 第 2 轮复评中断
+                        raise RuntimeError("interrupted mid-round-2")
+                return baseline
+
+            events = []
+            async def cb(ev):
+                events.append(ev["type"])
+
+            with (
+                patch.object(opt, "_score_skill", new=AsyncMock(side_effect=score)),
+                patch.object(opt, "_analyze_failures", new=AsyncMock(return_value=analysis)),
+                patch.object(opt, "_mutate_skill", new=AsyncMock(return_value=mutation)),
+            ):
+                with self.assertRaises(RuntimeError):
+                    await opt.optimize({"SKILL.md": "# S"}, [], [], max_rounds=5, thread_id="t1", callback=cb)
+                # 中断前已产出 baseline + 第 1 轮完整事件 + 第 2 轮开始事件。
+                self.assertIn("baseline", events)
+                interrupted["on"] = False
+                events.clear()
+                # 同一 thread_id 续跑：跳过已 emit 事件，从第 2 轮复评继续。
+                result = await opt.optimize({"SKILL.md": "# S"}, [], [], max_rounds=5, thread_id="t1", callback=cb)
+
+            # 续跑不重复 baseline（只 emit 中断点之后的新事件）。
+            self.assertNotIn("baseline", events)
+            # 最终结果完整：基线 50% + 5 轮（中断点续跑后跑满 max_rounds）。
+            self.assertEqual(result["baseline_score"], 50.0)
+            self.assertEqual(result["final_score"], 50.0)
+            self.assertEqual(len(result["score_history"]), 6)
+            self.assertEqual(len(result["mutation_log"]), 5)
+
+    async def test_thread_id_isolation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cp = os.path.join(tmp, "cp.db")
+            opt = make_optimizer(checkpoint_file=cp)
+            baseline = {"passed": 2, "total": 4, "per_eval": [], "details": []}
+            analysis = {"diagnosis": "d", "mutation_strategy": "add_example",
+                        "target_section": "s", "suggested_change": "c"}
+            mutation = {"description": "m", "reasoning": "r", "new_skill_md": "# New"}
+            calls = {"n": 0}
+            interrupted = {"on": True}
+
+            async def score(*a, **kw):
+                if interrupted["on"]:
+                    calls["n"] += 1
+                    if calls["n"] == 3:
+                        raise RuntimeError("interrupted")
+                return baseline
+
+            events = []
+            async def cb(ev):
+                events.append(ev["type"])
+
+            with (
+                patch.object(opt, "_score_skill", new=AsyncMock(side_effect=score)),
+                patch.object(opt, "_analyze_failures", new=AsyncMock(return_value=analysis)),
+                patch.object(opt, "_mutate_skill", new=AsyncMock(return_value=mutation)),
+            ):
+                with self.assertRaises(RuntimeError):
+                    await opt.optimize({"SKILL.md": "# S"}, [], [], max_rounds=5, thread_id="t1")
+                interrupted["on"] = False
+                events.clear()
+                # 新 thread_id：全新开始 → baseline 事件重新产生。
+                await opt.optimize({"SKILL.md": "# S"}, [], [], max_rounds=5, thread_id="t2", callback=cb)
+            self.assertIn("baseline", events)
+
+    async def test_api_key_not_in_checkpoint_file(self):
+        # 运行一次带 key 的优化（中断后留有 checkpoint），检查库文件内容：
+        # api_key 绝不入 checkpoint（prompt/模型响应同样不入库；图状态含
+        # 正在优化的 skill_md 是执行必需，允许）。
+        with tempfile.TemporaryDirectory() as tmp:
+            cp = os.path.join(tmp, "cp.db")
+            opt = make_optimizer(api_key="sk-test-secret-xyz", checkpoint_file=cp)
+            baseline = {"passed": 2, "total": 4, "per_eval": [], "details": []}
+            analysis = {"diagnosis": "d", "mutation_strategy": "add_example",
+                        "target_section": "s", "suggested_change": "c"}
+            mutation = {"description": "m", "reasoning": "r", "new_skill_md": "# New"}
+            with (
+                patch.object(opt, "_score_skill", new=AsyncMock(return_value=baseline)),
+                patch.object(opt, "_analyze_failures", new=AsyncMock(return_value=analysis)),
+                patch.object(opt, "_mutate_skill", new=AsyncMock(side_effect=RuntimeError("stop-here"))),
+            ):
+                with self.assertRaises(RuntimeError):
+                    await opt.optimize({"SKILL.md": "# S"}, [], [], max_rounds=5, thread_id="t1")
+            with open(cp, "rb") as f:
+                content = f.read()
+            self.assertNotIn(b"sk-test-secret-xyz", content)
+
+
 class TestFrontmatterParsing(unittest.TestCase):
     """Folded YAML frontmatter parsing for example skills."""
 
@@ -1545,6 +1718,200 @@ class TestExamplesListing(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(HTTPException) as ctx:
             await load_example("..%2F..%2Fetc")
         self.assertEqual(ctx.exception.status_code, 400)
+
+
+class TestLLMClient(unittest.IsolatedAsyncioTestCase):
+    """DashScope 直调薄封装：文本提取 / 重试策略 / JSON mode / enable_thinking。"""
+
+    @staticmethod
+    def _resp(text="ok", status=200, code=None, message=None):
+        return SimpleNamespace(
+            status_code=status, code=code, message=message,
+            output={"text": text},
+        )
+
+    def test_sync_call_returns_text(self):
+        client = LLMClient(api_key="sk-test-1234", model="qwen-plus")
+        with patch("llm_client.dashscope.Generation.call", return_value=self._resp("hello")) as mock_call:
+            text = client.sync_call("sys", "hi")
+        self.assertEqual(text, "hello")
+        # 参数对齐：system/user 消息 + temperature 0.2 + api_key 直传。
+        kwargs = mock_call.call_args.kwargs
+        self.assertEqual(kwargs["model"], "qwen-plus")
+        self.assertEqual(kwargs["messages"][0], {"role": "system", "content": "sys"})
+        self.assertEqual(kwargs["messages"][1], {"role": "user", "content": "hi"})
+        self.assertEqual(kwargs["temperature"], 0.2)
+        self.assertEqual(kwargs["api_key"], "sk-test-1234")
+        self.assertNotIn("response_format", kwargs)  # 默认非 JSON mode
+
+    def test_non_200_raises_runtime_error(self):
+        client = LLMClient(api_key="sk-test-1234", model="qwen-plus", max_attempts=1)
+        with patch("llm_client.dashscope.Generation.call",
+                   return_value=self._resp(status=400, code="InvalidParam", message="bad request")):
+            with self.assertRaises(RuntimeError):
+                client.sync_call("sys", "hi")
+
+    def test_retry_on_connection_error(self):
+        client = LLMClient(api_key="sk-test-1234", model="qwen-plus", max_attempts=3)
+        with (
+            patch("llm_client.dashscope.Generation.call", side_effect=ConnectionError("connection reset")) as mock_call,
+            patch("llm_client.time.sleep"),  # 跳过真实退避等待
+        ):
+            with self.assertRaises(ConnectionError):
+                client.sync_call("sys", "hi")
+        self.assertEqual(mock_call.call_count, 3)  # 网络类异常重试到上限
+
+    def test_retry_then_success(self):
+        client = LLMClient(api_key="sk-test-1234", model="qwen-plus", max_attempts=3)
+        with (
+            patch("llm_client.dashscope.Generation.call",
+                  side_effect=[ConnectionError("temporary failure"), self._resp("ok")]) as mock_call,
+            patch("llm_client.time.sleep"),
+        ):
+            text = client.sync_call("sys", "hi")
+        self.assertEqual(text, "ok")
+        self.assertEqual(mock_call.call_count, 2)  # 第二次成功，不再重试
+
+    def test_non_retryable_error_raised_immediately(self):
+        client = LLMClient(api_key="sk-test-1234", model="qwen-plus")
+        with patch("llm_client.dashscope.Generation.call", side_effect=RuntimeError("invalid argument")) as mock_call:
+            with self.assertRaises(RuntimeError):
+                client.sync_call("sys", "hi")
+        self.assertEqual(mock_call.call_count, 1)  # 解析/业务类错误不重试
+
+    def test_json_mode_sets_response_format(self):
+        client = LLMClient(api_key="sk-test-1234", model="qwen-plus")
+        with patch("llm_client.dashscope.Generation.call", return_value=self._resp('{"a":1}')) as mock_call:
+            text = client.sync_call("sys", "hi", json_mode=True)
+        self.assertEqual(text, '{"a":1}')
+        self.assertEqual(mock_call.call_args.kwargs["response_format"], {"type": "json_object"})
+
+    def test_choices_structure_supported(self):
+        # preview 系列模型：顶层 output.text 为 None，回答在 choices[0].message.content。
+        client = LLMClient(api_key="k", model="qwen3.7-max-preview")
+        resp = SimpleNamespace(
+            status_code=200, code=None, message=None,
+            output={"text": None, "finish_reason": "stop", "choices": [
+                {"message": {"role": "assistant", "content": "hello-from-choices"}},
+            ]},
+        )
+        with patch("llm_client.dashscope.Generation.call", return_value=resp):
+            text = client.sync_call("sys", "hi")
+        self.assertEqual(text, "hello-from-choices")
+
+    def test_empty_text_raises_runtime_error(self):
+        # 200 但两种结构都取不到文本 → 视为失败（不静默返回 None）。
+        client = LLMClient(api_key="k", model="m", max_attempts=1)
+        resp = SimpleNamespace(status_code=200, code=None, message=None,
+                               output={"text": None, "choices": []})
+        with patch("llm_client.dashscope.Generation.call", return_value=resp):
+            with self.assertRaises(RuntimeError):
+                client.sync_call("sys", "hi")
+
+    def test_deepseek_model_routes_to_deepseek_api(self):
+        # deepseek- 前缀模型 → DeepSeek OpenAI 兼容 API，解析 choices[0].message.content；
+        # key 优先用实例持有的（前端直传）。
+        client = LLMClient(api_key="sk-frontend-ds", model="deepseek-chat")
+        fake_resp = SimpleNamespace(
+            status_code=200,
+            json=lambda: {"choices": [{"message": {"role": "assistant", "content": "deepseek-reply"}}]},
+            text="",
+        )
+        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "sk-env-ds"}, clear=False):
+            with patch("llm_client.requests.post", return_value=fake_resp) as mock_post:
+                text = client.sync_call("sys", "hi")
+        self.assertEqual(text, "deepseek-reply")
+        # 请求打到 DeepSeek URL，Bearer 用前端直传的 key（不打印 key）。
+        args, kwargs = mock_post.call_args
+        self.assertIn("api.deepseek.com", args[0])
+        self.assertEqual(kwargs["headers"]["Authorization"], "Bearer sk-frontend-ds")
+        self.assertEqual(kwargs["json"]["model"], "deepseek-chat")
+
+    def test_deepseek_api_key_field_takes_priority(self):
+        # 双输入框场景：deepseek_api_key 字段优先于通用 api_key 与环境变量。
+        client = LLMClient(api_key="sk-qwen", model="deepseek-chat", deepseek_api_key="sk-ds-front")
+        fake_resp = SimpleNamespace(
+            status_code=200,
+            json=lambda: {"choices": [{"message": {"role": "assistant", "content": "ok"}}]},
+            text="",
+        )
+        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "sk-ds-env"}, clear=False):
+            with patch("llm_client.requests.post", return_value=fake_resp) as mock_post:
+                client.sync_call("sys", "hi")
+        self.assertEqual(mock_post.call_args.kwargs["headers"]["Authorization"], "Bearer sk-ds-front")
+
+    def test_deepseek_env_fallback_when_no_instance_key(self):
+        # 实例无 key（前端未传/为空）时回退 DEEPSEEK_API_KEY 环境变量。
+        client = LLMClient(api_key="", model="deepseek-chat")
+        fake_resp = SimpleNamespace(
+            status_code=200,
+            json=lambda: {"choices": [{"message": {"role": "assistant", "content": "env-key-reply"}}]},
+            text="",
+        )
+        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "sk-env-ds"}, clear=False):
+            with patch("llm_client.requests.post", return_value=fake_resp) as mock_post:
+                text = client.sync_call("sys", "hi")
+        self.assertEqual(text, "env-key-reply")
+        self.assertEqual(mock_post.call_args.kwargs["headers"]["Authorization"], "Bearer sk-env-ds")
+
+    def test_deepseek_json_mode_passthrough(self):
+        client = LLMClient(api_key="k", model="deepseek-chat")
+        fake_resp = SimpleNamespace(
+            status_code=200,
+            json=lambda: {"choices": [{"message": {"role": "assistant", "content": '{"a":1}'}}]},
+            text="",
+        )
+        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "sk-ds"}, clear=False):
+            with patch("llm_client.requests.post", return_value=fake_resp) as mock_post:
+                text = client.sync_call("sys", "hi", json_mode=True)
+        self.assertEqual(text, '{"a":1}')
+        self.assertEqual(mock_post.call_args.kwargs["json"]["response_format"], {"type": "json_object"})
+
+    def test_deepseek_missing_api_key_raises(self):
+        # 实例与环境变量都没有 key → 明确报错（不静默、不走 DashScope）。
+        client = LLMClient(api_key="", model="deepseek-chat", max_attempts=1)
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(RuntimeError) as ctx:
+                client.sync_call("sys", "hi")
+        self.assertIn("API key", str(ctx.exception))
+
+    def test_deepseek_non_200_raises(self):
+        client = LLMClient(api_key="k", model="deepseek-chat", max_attempts=1)
+        fake_resp = SimpleNamespace(status_code=429, text='{"error":{"message":"rate limited"}}', json=lambda: {})
+        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "sk-ds"}, clear=False):
+            with patch("llm_client.requests.post", return_value=fake_resp):
+                with self.assertRaises(RuntimeError) as ctx:
+                    client.sync_call("sys", "hi")
+        self.assertIn("429", str(ctx.exception))
+
+    def test_non_deepseek_model_ignores_deepseek_env(self):
+        # qwen 模型不读 DEEPSEEK_API_KEY：即使设置了也走 DashScope（dashscope 被 mock）。
+        client = LLMClient(api_key="sk-qwen", model="qwen-plus")
+        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "sk-ds"}, clear=False):
+            with patch("llm_client.dashscope.Generation.call", return_value=self._resp("qwen-reply")) as mock_call:
+                text = client.sync_call("sys", "hi")
+        self.assertEqual(text, "qwen-reply")
+        self.assertEqual(mock_call.call_args.kwargs["api_key"], "sk-qwen")
+
+    def test_enable_thinking_passed_only_when_on(self):
+        on = LLMClient(api_key="k", model="m", enable_thinking=True)
+        off = LLMClient(api_key="k", model="m", enable_thinking=False)
+        with patch("llm_client.dashscope.Generation.call", return_value=self._resp()) as mock_call:
+            on.sync_call("s", "u")
+            self.assertTrue(mock_call.call_args.kwargs.get("enable_thinking"))
+        with patch("llm_client.dashscope.Generation.call", return_value=self._resp()) as mock_call:
+            off.sync_call("s", "u")
+            self.assertNotIn("enable_thinking", mock_call.call_args.kwargs)
+
+    async def test_ask_bridges_through_thread(self):
+        client = LLMClient(api_key="k", model="m")
+        with patch("llm_client.asyncio.to_thread", new=AsyncMock(return_value="hello")) as mock_bridge:
+            text = await client.ask("sys", "hi")
+        self.assertEqual(text, "hello")
+        # 线程桥接必须把 (sync_call, system, user) 传过去。
+        self.assertEqual(mock_bridge.call_args[0][0], client.sync_call)
+        self.assertEqual(mock_bridge.call_args[0][1], "sys")
+        self.assertEqual(mock_bridge.call_args[0][2], "hi")
 
 
 if __name__ == "__main__":

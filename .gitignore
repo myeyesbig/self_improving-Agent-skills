@@ -21,3 +21,10 @@ npm-debug.log*
 .env
 .env.*
 !.env.example
+
+# Build caches
+frontend/*.tsbuildinfo
+*.tsbuildinfo
+
+# Test artifacts (download outputs, not source)
+skill-examples/improved_skill.zip

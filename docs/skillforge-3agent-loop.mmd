@@ -1,0 +1,30 @@
+%%{init: {"theme": "base", "themeVariables": {"fontFamily": "'PingFang SC','Heiti TC','Hiragino Sans GB',sans-serif", "fontSize": "15px", "primaryColor": "#ffffff", "primaryTextColor": "#1f2937", "lineColor": "#6b7280", "background": "#ffffff", "mainBkg": "#ffffff", "nodeBorder": "#9ca3af", "clusterBkg": "#ffffff", "clusterBorder": "#9ca3af"}}}%%
+flowchart BT
+    subgraph TOP["基线评估与收敛"]
+        direction LR
+        A["<b>① 上传技能包</b><br/><span style='font-size:11px'>SKILL.md + 场景 + 标准</span>"]:::input
+        B["<b>② Executor 执行</b><br/><span style='font-size:11px'>运行所有测试场景</span>"]:::exec
+        C["<b>③ Executor 评分</b><br/><span style='font-size:11px'>二值标准 · 规则锚点</span>"]:::exec
+        D{"<b>④ 通过 100% ?</b><br/><span style='font-size:11px'>全部评估通过</span>"}:::ok
+        E["<b>⑤ 输出改进技能</b><br/><span style='font-size:11px'>improved_skill.zip + 变更日志</span>"]:::ok
+        A --> B --> C --> D
+        D -->|"<b>是</b>"| E
+    end
+    subgraph BOT["优化循环（每轮）"]
+        direction LR
+        F["<b>⑥ Analyst 诊断</b><br/><span style='font-size:11px'>定位根因 · 选策略</span>"]:::ana
+        G["<b>⑦ Mutator 修改</b><br/><span style='font-size:11px'>对 SKILL.md 恰好改一处</span>"]:::mut
+        H["<b>⑧ 回归守卫</b><br/><span style='font-size:11px'>frontmatter / 标题 / 体积</span>"]:::guard
+        I["<b>⑨ Executor 复评</b><br/><span style='font-size:11px'>重跑 + 重新评分</span>"]:::exec
+        J{"<b>⑩ 严格提升 ?</b><br/><span style='font-size:11px'>保留 / 回滚</span>"}:::guard
+        F --> G --> H --> I --> J
+    end
+    D -->|"<b>否</b>"| F
+    J -->|"<b>循环 · 至多 20 轮</b>"| D
+
+    classDef input fill:#6B7280,stroke:#4B5563,color:#fff,stroke-width:1.5px
+    classDef exec fill:#0072B2,stroke:#005a8c,color:#fff,stroke-width:1.5px
+    classDef ana fill:#E69F00,stroke:#b57f00,color:#fff,stroke-width:1.5px
+    classDef mut fill:#D55E00,stroke:#b54a00,color:#fff,stroke-width:1.5px
+    classDef guard fill:#7C3AED,stroke:#5f24bd,color:#fff,stroke-width:1.5px
+    classDef ok fill:#10B981,stroke:#0a8f62,color:#fff,stroke-width:1.5px

@@ -3,7 +3,7 @@
 # start-dev.sh —— SkillForge 前后端一键启动脚本
 # 用法：
 #   ./start-dev.sh           启动前后端（单终端，Ctrl+C 全部停止）
-#   QWEN_MODEL=qwen-plus ./start-dev.sh   覆盖模型名（默认 qwen3.7-max-2026-05-17）
+#   QWEN_MODEL=qwen-plus ./start-dev.sh   覆盖模型名（默认 deepseek-chat）
 #   QWEN_ENABLE_THINKING=0 ./start-dev.sh 关闭思考模式（默认 1）
 # 说明：端口已被占用时自动跳过对应服务；日志直接打印到当前终端。
 # =============================================================================
@@ -12,7 +12,9 @@ set -u
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 BACKEND_PORT=8891
 FRONTEND_PORT=3000
-QWEN_MODEL="${QWEN_MODEL:-qwen3.7-max-2026-05-17}"
+# 默认模型 deepseek-chat（DeepSeek 可选 provider，见 AGENTS.md 例外）；
+# 想用 Qwen/DashScope 时以 QWEN_MODEL=qwen3.7-max-preview 覆盖。
+QWEN_MODEL="${QWEN_MODEL:-deepseek-chat}"
 QWEN_ENABLE_THINKING="${QWEN_ENABLE_THINKING:-1}"
 
 is_port_listening() {

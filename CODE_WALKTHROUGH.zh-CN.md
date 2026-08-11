@@ -2,7 +2,7 @@
 
 > 面向零基础读者的全项目导读。本文件只解释"代码在做什么、为什么这样做、数据接下来去哪"，不修改任何代码。
 > 配套说明：源码中的中文注释统一使用少量标签 —— 【主流程】【初学者提示】【异步】【安全】【注意】。
-> 本应用是 Qwen-only 应用：技术栈为 Qwen-Agent + 阿里云百炼 DashScope，凭据字段为 `qwen_api_key`。
+> 本应用是 Qwen-only 应用：技术栈为 LangGraph（编排层）+ 阿里云百炼 DashScope（LLM 直调），凭据字段为 `qwen_api_key`。
 
 ---
 
@@ -50,7 +50,7 @@
 └────────────┘     .zip             └────────────────────────────────────────┘
        │
        ▼
- Qwen-Agent + DashScope（三个 Assistant：Executor / Analyst / Mutator）
+ LangGraph 状态图编排 + DashScope 直调（三角色：Executor / Analyst / Mutator）
 ```
 
 数据方向速记：**浏览器 ↔ FastAPI（JSON/文件）↔ 内存 session ↔ 优化器 ↔ Qwen 模型**。
@@ -142,8 +142,8 @@
 1. **上传文件后 `session_id` 如何产生和传递？**
    `backend/app.py` 的 `create_session_from_files()` 用 `uuid.uuid4()` 生成 `session_id`，连同技能文件一起存入内存 `sessions` 字典，然后把 `session_id` 返回给前端；前端 `UploadStep` 把它存进 state，之后所有请求（analyze / start / status / download）都带上它，后端凭它找到对应 session。
 
-2. **同步的 Qwen-Agent 调用为什么需要放进工作线程？**
-   Qwen-Agent 的 `Assistant.run()` 是**同步生成器**，会阻塞当前线程。FastAPI 的接口跑在**事件循环**上，如果直接在协程里调用同步阻塞代码，整个事件循环会被卡住，其他请求（比如正在轮询的 `/api/status`）就无法响应。所以 `_ask()` 用 `asyncio.to_thread(...)` 把它丢进线程池执行，再 `await` 结果。
+2. **同步的 DashScope 调用为什么需要放进工作线程？**
+   DashScope SDK 的 `Generation.call()` 是**同步阻塞**调用，会卡住当前线程。FastAPI 的接口跑在**事件循环**上，如果直接在协程里调用同步阻塞代码，整个事件循环会被卡住，其他请求（比如正在轮询的 `/api/status`）就无法响应。所以 `llm_client.ask()` 用 `asyncio.to_thread(...)` 把它丢进线程池执行，再 `await` 结果。
 
 3. **三个 Agent 如何完成一次优化轮次？**
    每轮先由 **Analyst** 分析当前失败项，输出根因与修改策略；再由 **Mutator** 按诊断对 SKILL.md 做"恰好一处"修改（开启并行时每轮生成多个候选，各用独立 Mutator 实例），返回完整新内容；最后由 **Executor** 对修改后的技能重新执行所有测试场景并打分（并行时取最优候选）。`optimize()` 把这三步循环 `max_rounds` 次。
@@ -169,7 +169,7 @@
 
 以下文件不属于教学注释范围，其作用在此统一说明：
 
-- `backend/requirements.txt` — Python 依赖清单（FastAPI、uvicorn、pydantic、qwen-agent 等）。
+- `backend/requirements.txt` — Python 依赖清单（FastAPI、uvicorn、pydantic、dashscope、langgraph 等）。
 - `frontend/package.json` / `package-lock.json` — 前端依赖与锁定版本（Next.js、React、Recharts、diff 等）。
 - `frontend/tsconfig.json` / `next.config.*` / `postcss.config.*` — TypeScript 与构建配置。
 - `frontend/src/app/favicon.ico` 等静态资源 — 无需注释。
