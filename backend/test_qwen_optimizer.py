@@ -1871,6 +1871,113 @@ class TestQualityDiverseLessonRag(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("_id", lessons[0])
 
 
+class TestLessonFailureContextAndBatching(unittest.IsolatedAsyncioTestCase):
+    """后续改进：失败 eval 进入查询，冷 lesson embedding 可按官方上限批处理。"""
+
+    def test_defaults_preserve_old_query_and_single_embedding_calls(self):
+        opt = make_optimizer()
+        self.assertFalse(opt.lesson_failure_context)
+        self.assertEqual(opt.lesson_embed_batch_size, 1)
+
+    def test_env_enables_failure_context_and_clamps_batch_to_ten(self):
+        with patch.dict(os.environ, {
+            "LESSON_FAILURE_CONTEXT": "1",
+            "LESSON_EMBED_BATCH_SIZE": "99",
+        }, clear=False):
+            opt = make_optimizer()
+        self.assertTrue(opt.lesson_failure_context)
+        self.assertEqual(opt.lesson_embed_batch_size, 10)
+
+    def test_failure_context_uses_failed_eval_and_matching_scenario(self):
+        scenarios = [
+            {"id": 1, "input": "unrelated first scenario"},
+            {"id": 2, "input": "validate required CSV columns"},
+        ]
+        evals = [{
+            "id": 7,
+            "name": "required columns",
+            "criterion": "Reject CSV input when required columns are missing.",
+            "question": "Does it reject a missing schema column?",
+            "pass_condition": "The missing column is named and rejected.",
+            "dimension": "correctness",
+        }]
+        details = [{
+            "eval_id": 7,
+            "scenario_id": 2,
+            "passed": False,
+            "reason": "required field was accepted",
+        }]
+        classic = SkillOptimizer._build_query(
+            "csv-validator", "data", scenarios, evals, details
+        )
+        enhanced = SkillOptimizer._build_query(
+            "csv-validator", "data", scenarios, evals, details,
+            include_failure_context=True,
+        )
+        self.assertNotIn("Reject CSV input", classic)
+        self.assertIn("unrelated first scenario", classic)
+        self.assertIn("Reject CSV input", enhanced)
+        self.assertIn("correctness", enhanced)
+        self.assertIn("validate required CSV columns", enhanced)
+        self.assertNotIn("unrelated first scenario", enhanced)
+
+    async def test_embed_many_deduplicates_and_batches_in_input_order(self):
+        opt = make_optimizer(lesson_embed_batch_size=2)
+        calls = []
+
+        def fake_batch(texts):
+            calls.append(list(texts))
+            return [[float(len(text)), 1.0] for text in texts]
+
+        with patch.object(opt, "_embed_many_sync", side_effect=fake_batch):
+            vectors = await opt._embed_many(["a", "bb", "a", "ccc"])
+        self.assertEqual(calls, [["a", "bb"], ["ccc"]])
+        self.assertEqual(vectors, [[1.0, 1.0], [2.0, 1.0], [1.0, 1.0], [3.0, 1.0]])
+
+    def test_embed_many_sync_restores_dashscope_text_index_order(self):
+        response = SimpleNamespace(
+            status_code=200,
+            output={"embeddings": [
+                {"text_index": 1, "embedding": [0.0, 1.0]},
+                {"text_index": 0, "embedding": [1.0, 0.0]},
+            ]},
+        )
+        fake_dashscope = SimpleNamespace(
+            TextEmbedding=SimpleNamespace(call=MagicMock(return_value=response))
+        )
+        opt = make_optimizer(lesson_embed_batch_size=2)
+        with patch.dict("sys.modules", {"dashscope": fake_dashscope}):
+            vectors = opt._embed_many_sync(["first", "second"])
+        self.assertEqual(vectors, [[1.0, 0.0], [0.0, 1.0]])
+        call_kwargs = fake_dashscope.TextEmbedding.call.call_args.kwargs
+        self.assertEqual(call_kwargs["input"], ["first", "second"])
+        self.assertNotIn("api_key", str(call_kwargs["input"]))
+
+    async def test_batch_failure_still_degrades_to_tag(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "lessons.jsonl")
+            SkillOptimizer._append_lesson(path, {
+                "skill_name": "writer", "strategy": "a", "summary": "same skill",
+            })
+            SkillOptimizer._append_lesson(path, {
+                "strategy": "b", "summary": "generic",
+            })
+            opt = make_optimizer(
+                lesson_file=path,
+                lesson_retrieval="hybrid",
+                lesson_rag_pipeline="quality_diverse",
+                lesson_embed_batch_size=2,
+            )
+            with (
+                patch.object(opt, "_embed", new=AsyncMock(return_value=[1.0, 0.0])),
+                patch.object(opt, "_embed_many_sync", side_effect=RuntimeError("batch down")),
+            ):
+                lessons = await opt._prepare_lessons(
+                    "---\nname: writer\n---", [{"id": 1, "input": "draft"}], [], [],
+                )
+        self.assertEqual([lesson["strategy"] for lesson in lessons], ["a", "b"])
+
+
 class TestLessonQualityGate(unittest.IsolatedAsyncioTestCase):
     """经验沉淀质量门槛：LESSON_MIN_GAIN / LESSON_MIN_FINAL（OR 语义）。"""
 

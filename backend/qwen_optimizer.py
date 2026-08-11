@@ -208,6 +208,8 @@ class SkillOptimizer:
         lesson_dedup_threshold: Optional[float] = None,
         lesson_context_chars: Optional[int] = None,
         lesson_signal_weights: Optional[Dict[str, float]] = None,
+        lesson_failure_context: Optional[bool] = None,
+        lesson_embed_batch_size: Optional[int] = None,
         lesson_min_gain: Optional[float] = None,
         lesson_min_final: Optional[float] = None,
         tie_dimension_lessons: Optional[bool] = None,
@@ -396,6 +398,22 @@ class SkillOptimizer:
                 name: valid_signal_weights.get(name, 0.0) / weight_total
                 for name in default_signal_weights
             }
+
+        # 【后续改进：失败感知查询】默认关闭。开启后，RAG 查询会加入失败
+        # eval 的 criterion/question/pass_condition 及对应失败场景；内容仅用于
+        # 当次 embedding/rerank 请求，不进入 lesson store 或任何返回结构。
+        if lesson_failure_context is None:
+            lesson_failure_context = os.getenv("LESSON_FAILURE_CONTEXT", "0") != "0"
+        self.lesson_failure_context = lesson_failure_context
+
+        # 【后续改进：批量 embedding】官方 text-embedding-v3 同步接口每批
+        # 最多 10 条。默认 1 保持原逐条调用；显式调大可降低经验库冷启动请求数。
+        if lesson_embed_batch_size is None:
+            try:
+                lesson_embed_batch_size = int(os.getenv("LESSON_EMBED_BATCH_SIZE", "1"))
+            except ValueError:
+                lesson_embed_batch_size = 1
+        self.lesson_embed_batch_size = max(1, min(int(lesson_embed_batch_size), 10))
 
         # 【经验沉淀质量门槛】LESSON_MIN_GAIN（提升幅度）/ LESSON_MIN_FINAL
         # （最终水位），OR 语义：任一启用的维度达标才沉淀经验；全 0=关闭=
@@ -1536,8 +1554,16 @@ class SkillOptimizer:
         return " ".join(str(p) for p in parts if p)
 
     @staticmethod
-    def _build_query(skill_name, domain, scenarios, evals, current_details, weak_dimensions=None):
-        """检索查询：领域 + 技能名 + 最近失败原因 + 场景输入摘要（规则拼接）。"""
+    def _build_query(
+        skill_name,
+        domain,
+        scenarios,
+        evals,
+        current_details,
+        weak_dimensions=None,
+        include_failure_context=False,
+    ):
+        """Build a bounded retrieval query from tags and observed failures."""
         parts = []
         if domain:
             parts.append(f"domain: {domain}")
@@ -1548,8 +1574,42 @@ class SkillOptimizer:
         failed = [d for d in (current_details or []) if not d.get("passed")]
         for d in failed[:3]:
             parts.append(str(d.get("reason") or ""))
-        for s in (scenarios or [])[:2]:
-            parts.append(str(s.get("input", ""))[:80])
+
+        if include_failure_context:
+            eval_by_id = {
+                str(item.get("id")): item
+                for item in (evals or [])
+                if isinstance(item, dict) and item.get("id") is not None
+            }
+            scenario_by_id = {
+                str(item.get("id")): item
+                for item in (scenarios or [])
+                if isinstance(item, dict) and item.get("id") is not None
+            }
+            used_scenarios = set()
+            for detail in failed[:3]:
+                eval_def = eval_by_id.get(str(detail.get("eval_id")))
+                if eval_def:
+                    fields = [
+                        eval_def.get("dimension"),
+                        eval_def.get("name"),
+                        eval_def.get("criterion"),
+                        eval_def.get("question"),
+                        eval_def.get("pass_condition"),
+                    ]
+                    context = " | ".join(str(value) for value in fields if value)
+                    if context:
+                        parts.append(f"failed evaluation: {context[:360]}")
+                scenario_id = str(detail.get("scenario_id"))
+                if scenario_id not in used_scenarios and scenario_id in scenario_by_id:
+                    scenario_input = str(scenario_by_id[scenario_id].get("input", ""))[:160]
+                    if scenario_input:
+                        parts.append(f"failed scenario: {scenario_input}")
+                    used_scenarios.add(scenario_id)
+        else:
+            # Classic/default query shape is preserved unless explicitly enabled.
+            for scenario in (scenarios or [])[:2]:
+                parts.append(str(scenario.get("input", ""))[:80])
         return " ".join(p for p in parts if p)
 
     @staticmethod
@@ -1624,6 +1684,70 @@ class SkillOptimizer:
             self._embed_cache[text] = await asyncio.to_thread(self._embed_sync, text)
         return self._embed_cache[text]
 
+    def _embed_many_sync(self, texts):
+        """Batch DashScope text-embedding-v3 call; response is restored by text_index."""
+        import dashscope
+        resp = dashscope.TextEmbedding.call(
+            model="text-embedding-v3",
+            input=texts,
+            api_key=self._api_key,
+            dimensions=512,
+        )
+        if getattr(resp, "status_code", 500) != 200:
+            raise RuntimeError(
+                f"embedding failed: {getattr(resp, 'code', '')} {getattr(resp, 'message', '')}"
+            )
+        raw = resp.output.get("embeddings", [])
+        ordered = [None] * len(texts)
+        for position, item in enumerate(raw):
+            try:
+                index = int(item.get("text_index", position))
+            except (TypeError, ValueError):
+                index = position
+            if 0 <= index < len(ordered):
+                ordered[index] = item.get("embedding")
+        if any(vector is None for vector in ordered):
+            raise RuntimeError("embedding failed: incomplete batch response")
+        return ordered
+
+    async def _embed_many(self, texts):
+        """Embed unique texts in bounded batches while preserving cache/order semantics."""
+        unique_missing = []
+        seen = set()
+        for text in texts:
+            if text not in self._embed_cache and text not in seen:
+                unique_missing.append(text)
+                seen.add(text)
+
+        if self.lesson_embed_batch_size <= 1:
+            for text in unique_missing:
+                # Do not rely on a patched/custom _embed implementation to mutate
+                # our cache as a side effect; its return value is the interface.
+                self._embed_cache[text] = await self._embed(text)
+        else:
+            size = self.lesson_embed_batch_size
+            for start in range(0, len(unique_missing), size):
+                batch = unique_missing[start:start + size]
+                vectors = await asyncio.to_thread(self._embed_many_sync, batch)
+                if len(vectors) != len(batch):
+                    raise RuntimeError("embedding failed: batch size mismatch")
+                self._embed_cache.update(zip(batch, vectors))
+        return [self._embed_cache[text] for text in texts]
+
+    async def _ensure_lesson_embeddings(self, lessons):
+        """Populate missing lesson vectors and persist them when SQLite row IDs exist."""
+        missing = []
+        for lesson in lessons:
+            if lesson.get("embedding") is None:
+                missing.append((lesson, self._lesson_index_text(lesson)))
+        if not missing:
+            return
+        vectors = await self._embed_many([text for _, text in missing])
+        for (lesson, _), vector in zip(missing, vectors):
+            lesson["embedding"] = vector
+            if lesson.get("_id") is not None:
+                self._update_lesson_embedding(self.lesson_file, lesson["_id"], vector)
+
     def _rerank_sync(self, query, docs):
         """DashScope gte-rerank（同步；在 _rerank 的线程桥接里执行）。"""
         import dashscope
@@ -1687,15 +1811,11 @@ class SkillOptimizer:
     async def _retrieve_lessons_quality_diverse(self, lessons, query, mode, limit, context):
         """RAG v2: multi-signal ranking, optional rerank, dedup, then MMR diversity."""
         qvec = await self._embed(query)
+        await self._ensure_lesson_embeddings(lessons)
         records = []
         count = max(1, len(lessons))
         for index, lesson in enumerate(lessons):
             vec = lesson.get("embedding")
-            if vec is None:
-                vec = await self._embed(self._lesson_index_text(lesson))
-                lesson["embedding"] = vec
-                if lesson.get("_id") is not None:
-                    self._update_lesson_embedding(self.lesson_file, lesson["_id"], vec)
             semantic = max(0.0, min(self._cosine(qvec, vec), 1.0))
             if mode == "semantic" and semantic < self.lesson_threshold:
                 continue
@@ -1866,15 +1986,10 @@ class SkillOptimizer:
                 lessons, query, mode, limit, context or {}
             )
         qvec = await self._embed(query)
+        await self._ensure_lesson_embeddings(lessons)
         scored = []
         for l in lessons:
             vec = l.get("embedding")
-            if vec is None:
-                vec = await self._embed(self._lesson_index_text(l))
-                l["embedding"] = vec
-                # 【RAG】惰性 embedding 写回 SQLite，下次会话直接复用。
-                if l.get("_id") is not None:
-                    self._update_lesson_embedding(self.lesson_file, l["_id"], vec)
             scored.append((l, self._cosine(qvec, vec)))
         if mode == "hybrid":
             dense_rank = [l for l, _ in sorted(scored, key=lambda x: x[1], reverse=True)]
@@ -1964,7 +2079,13 @@ class SkillOptimizer:
                 lessons = self._tag_filter(all_lessons, skill_name, domain, read_n)
             else:
                 query = self._build_query(
-                    skill_name, domain, scenarios, evals, current_details, weak_dimensions
+                    skill_name,
+                    domain,
+                    scenarios,
+                    evals,
+                    current_details,
+                    weak_dimensions,
+                    include_failure_context=self.lesson_failure_context,
                 )
                 if not query:
                     lessons = self._tag_filter(all_lessons, skill_name, domain, read_n)

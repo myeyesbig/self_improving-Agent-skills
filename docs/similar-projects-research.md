@@ -141,3 +141,9 @@ SkillForge 选择轻量的 `OPTIMIZATION_SEARCH=adaptive`：保持当前最优�
 5. 任一 embedding/rerank 异常仍静默降级 tag，默认 `classic` 完全保留旧路径。
 
 没有照搬 relevance feedback：反馈若落库会扩展数据类型与隐私边界，超出本次仅持久化模型生成 lesson 元数据的授权。评测也从“同技能或同领域即相关”改为显式 `relevant_ids`，同时报告 Top-1、MRR、nDCG、Recall、Precision、误注入率和多样性，避免用偏乐观的单一指标证明自己。
+
+## 十、RAG v2 后续审计：失败上下文与向量化冷启动
+
+实现后复查发现，`_build_query` 虽然接收 `evals`，此前却没有读取它：检索查询只有 `keyword:missing` 等失败 reason 和固定前两个场景，可能遗漏真正失败标准及对应场景。因此新增默认关闭的 `LESSON_FAILURE_CONTEXT`，按 `current_details.eval_id/scenario_id` 精确关联失败 eval 和场景，并把 criterion、question、pass condition、dimension 作为当次查询上下文；它们不进入 lesson store。
+
+另一处瓶颈是未缓存经验逐条 embedding。阿里云百炼的[文本向量同步 API](https://help.aliyun.com/en/model-studio/text-embedding-synchronous-api)明确支持 `TextEmbedding.call(input=batch)`，并给出每批最多 10 条的示例；[RAGFlow 的 DashScope 实现](https://github.com/infiniflow/ragflow/blob/main/rag/llm/embedding_model.py)也采用分批调用并依据 `text_index` 恢复顺序。SkillForge 因此新增 `LESSON_EMBED_BATCH_SIZE`（1–10，默认 1），先对重复文本去重，再批量调用、恢复原顺序并沿用 SQLite 惰性写回；失败仍降级 tag。

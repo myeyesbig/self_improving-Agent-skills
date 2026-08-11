@@ -260,6 +260,8 @@ SkillForge 提供一组**可选**优化旋钮，全部默认等价于经典行�
 | `LESSON_DEDUP_THRESHOLD` | 环境变量 | 0.92 | `quality_diverse` 的近重复 Jaccard 阈值（0–1） |
 | `LESSON_CONTEXT_CHARS` | 环境变量 | 6000 | `quality_diverse` 注入经验的总字符预算（至少 500） |
 | `LESSON_SIGNAL_WEIGHTS` | 环境变量 | 内置权重 | 可选 JSON，覆盖并自动归一化 `semantic/sparse/skill/domain/dimension/quality/recency` 权重 |
+| `LESSON_FAILURE_CONTEXT` | 环境变量 | 0（关闭） | 开启后把失败 eval 的标准、期望和对应失败场景加入当次检索查询；不持久化这些内容 |
+| `LESSON_EMBED_BATCH_SIZE` | 环境变量 | 1 | 未缓存经验的 DashScope embedding 批量大小（1–10）；1 保持逐条调用，10 降低大经验库冷启动请求数 |
 | `LESSON_MIN_GAIN` | 环境变量 | 0（关闭） | 经验沉淀质量门槛-提升幅度：score_after − score_before ≥ 该值才沉淀（OR 语义；推荐开启值 15） |
 | `LESSON_MIN_FINAL` | 环境变量 | 0（关闭） | 经验沉淀质量门槛-最终水位：score_after ≥ 该值才沉淀（OR 语义；推荐开启值 85）。任一维度达标即沉淀，过滤小修噪音 |
 

@@ -323,6 +323,8 @@ improved_skill.zip
 | `LESSON_DEDUP_THRESHOLD` | `0.92` | 近重复经验的 Jaccard 阈值（0–1） |
 | `LESSON_CONTEXT_CHARS` | `6000` | 注入经验的总字符预算（最小 500） |
 | `LESSON_SIGNAL_WEIGHTS` | 内置权重 | 可选 JSON；键为 `semantic/sparse/skill/domain/dimension/quality/recency`，自动归一化 |
+| `LESSON_FAILURE_CONTEXT` | `0`（关闭） | 把实际失败 eval 的 criterion/question/pass condition 和对应场景加入当次查询；不落库 |
+| `LESSON_EMBED_BATCH_SIZE` | `1` | 未缓存经验的 embedding 批量大小（1–10）；默认保持逐条调用 |
 | `LESSON_MIN_GAIN` | `0`（关闭） | 经验沉淀质量门槛（提升幅度）；推荐开启值 15 |
 | `LESSON_MIN_FINAL` | `0`（关闭） | 经验沉淀质量门槛（最终水位）；推荐开启值 85；与 `MIN_GAIN` 是 OR 语义 |
 
@@ -379,6 +381,8 @@ MUTATION_PARALLELISM=2 ./start-dev.sh
 SKILL_LESSONS_FILE=./data/skill_lessons.db \
 LESSON_RETRIEVAL=hybrid \
 LESSON_RAG_PIPELINE=quality_diverse \
+LESSON_FAILURE_CONTEXT=1 \
+LESSON_EMBED_BATCH_SIZE=10 \
 LESSON_THRESHOLD=0.3 \
 LESSON_TOP_K=5 \
 LESSON_RERANK=1 \
@@ -398,6 +402,8 @@ LESSON_MIN_FINAL=85 \
 `LESSON_MIN_GAIN=15` 与 `LESSON_MIN_FINAL=85` 是推荐的质量门槛（OR 语义，任一达标即沉淀），用来过滤「小幅修修补补」造成的经验库噪音。
 
 新版管线先用 embedding、中文/英文词面、技能、领域、目标弱维度、历史提升幅度/最终分和时序组成质量分；可选 `gte-rerank` 后，再删除近重复经验并做多样性选择。返回给模型的内容有字段白名单和字符预算，SQLite 中的向量不会进入 prompt。任一步失败仍自动回退到 `tag`；不设置 `LESSON_RAG_PIPELINE` 时行为与旧版一致。
+
+`LESSON_FAILURE_CONTEXT=1` 会把真正失败的评估标准与其场景优先放入检索查询，避免只用 `keyword:missing` 之类泛化 reason；这些查询内容只参与当次 embedding/rerank，不写入经验库。`LESSON_EMBED_BATCH_SIZE=10` 则把未缓存经验按官方上限批量向量化：N 条冷数据的文档 embedding 请求数从 N 次降为 `ceil(N/10)` 次；查询向量仍单独计算。批量请求失败时仍走原 tag 降级链。
 
 离线比较（不读取 key、使用固定查询标注）可运行：
 

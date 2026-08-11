@@ -36,3 +36,10 @@ cd backend
 结论：在固定小样本上，新管线保持 Top-1/MRR 不退化，同时把 nDCG@3 与 Recall@3 提升到 1.0，平均文本多样性也更高。策略多样性略降是因为某些查询的两个正确经验恰好使用同一策略；这项指标只作诊断，不作为相关性门槛。Precision 较低仍反映 top-3 在多数单答案查询中的数学上限，因此主要验收指标采用 MRR、nDCG 与 Recall。
 
 脚本在 compare 模式下要求新版 MRR 和 nDCG 均不低于 classic，否则以非零状态退出。该 fixture 是可重复的回归基线，不替代真实历史库上的人工标注评估；经验规模扩大后，应另建代表性查询集并继续使用相同指标。
+
+## 后续性能与查询质量守卫
+
+- `TestLessonFailureContextAndBatching` 验证默认查询形状和逐条 embedding 行为不变。
+- 开启失败上下文后，查询只选取实际失败的 eval 定义和对应场景，不再误用“前两个场景”。
+- 批量向量化会先对相同 lesson 文本去重，再按 `LESSON_EMBED_BATCH_SIZE` 分批，并按输入顺序恢复结果。
+- 任一批次异常仍由 `_prepare_lessons` 捕获并降级 tag，不影响优化主流程。
