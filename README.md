@@ -167,7 +167,8 @@ zip -r my-skill.zip my-skill/
 4. **回归守卫** 检查每个候选的结构完整性（frontmatter、标题、体积），命中即拒绝且跳过复评
 5. **Executor** 重新运行并重新评估修改后的技能（并行时取分数最优的候选）
 6. 比较分数 —— 严格高于「基线 + 提升阈值」则保留，否则回滚
-7. 评分达到 100%（全部评估通过）立即停止循环，否则重复直至最大轮数
+7. 可选地从总分同分但局部维度更优的未保留候选中提炼经验元数据；同分候选仍然回滚，绝不成为下一轮版本
+8. 评分达到 100%（全部评估通过）立即停止循环，否则重复直至最大轮数
 
 ### 4. 输出
 - 应用了全部成功修改的改进版 SKILL.md
@@ -239,6 +240,8 @@ SkillForge 提供一组**可选**优化旋钮，全部默认等价于经典行�
 | `SEARCH_EXPLORATION` | 环境变量 | 1.0 | `adaptive` 策略的 UCB 探索系数；0 只利用历史平均增益 |
 | `TIE_DIMENSION_LESSONS` | 环境变量 | 0（关闭） | 总分与胜者并列、但某维度更优的未选候选沉淀维度经验；候选本身仍不保留 |
 | `TIE_DIMENSION_MIN_GAIN` | 环境变量 | 0.0 | 平局候选相对胜者的维度提升须严格超过该百分点才沉淀 |
+| `CROSS_ROUND_TIE_DIMENSION_LESSONS` | 环境变量 | 0（关闭） | 扫描本轮所有通过守卫且完成评分的候选；若总分与轮首 incumbent 相同但某维度更优，则提炼跨轮经验；候选仍不保留 |
+| `CROSS_ROUND_TIE_DIMENSION_MIN_GAIN` | 环境变量 | 0.0 | 跨轮同分候选相对轮首 incumbent 的维度提升须严格超过该百分点才学习；非法值回退、负值钳制为 0.0 |
 | `WEAK_DIMENSION_FOCUS` | 环境变量 | 0（关闭） | 识别低分维度并注入 Analyst/Mutator，重排策略与经验检索，仍只做一个单点修改 |
 | `WEAK_DIMENSION_THRESHOLD` | 环境变量 | 50.0 | `pct` 小于等于该值的已测量维度进入专项列表 |
 | `WEAK_DIMENSION_MAX` | 环境变量 | 2 | 每轮最多专项关注的弱维度数（按分数升序） |
@@ -248,12 +251,12 @@ SkillForge 提供一组**可选**优化旋钮，全部默认等价于经典行�
 | `SATURATION_EXIT` | 环境变量 | 0（关闭） | 基线无可提升带（100% 或 0 分全失败）时跳过全部轮次 |
 | `FINAL_CONFIRM` | 环境变量 | 0（关闭） | 完成前对最终版本独立复核，未超过基线则回退（防单点幸运） |
 | `CANDIDATE_CONFIRM_RUNS` | 环境变量 | 0（关闭） | 初评胜者与当轮当前版本追加 1–3 次配对复评；每次都须继续严格胜出，并采用最低确认分，尤其适合并行候选 |
-| `SKILL_LESSONS_FILE` | 环境变量 | 无（关闭） | 跨会话经验库路径（jsonl 或 SQLite）：保留的修改沉淀为经验，下次优化注入 Analyst/Mutator |
+| `SKILL_LESSONS_FILE` | 环境变量 | 无（关闭） | 跨会话经验库路径（jsonl 或 SQLite）：保留修改和启用后的同分维度元数据可沉淀为经验，再注入 Analyst/Mutator |
 | `LESSON_N` | 环境变量 | 5 | 每次优化读取的最近经验条数 |
 | `LESSON_RETRIEVAL` | 环境变量 | off | 经验注入方式：`off`（最近 N 条）/ `tag`（同技能硬过滤）/ `semantic`（embedding 语义检索）/ `hybrid`（dense+sparse 混合）。semantic/hybrid 需要经验库使用 `.db` 后缀（SQLite）并调用 DashScope text-embedding-v3 |
 | `LESSON_THRESHOLD` | 环境变量 | 0.3 | semantic 检索的余弦相似度阈值（0~1） |
 | `LESSON_TOP_K` | 环境变量 | 5 | semantic/hybrid 检索后注入的经验条数（与 LESSON_N 读取条数独立） |
-| `LESSON_RERANK` | 环境变量 | 0（关闭） | 开启后对检索候选池调用 DashScope gte-rerank 重排再取 top-K（失败自动降级） |
+| `LESSON_RERANK` | 环境变量 | 0（关闭） | 开启后对检索候选池调用 DashScope gte-rerank 重排再取 top-K；失败时保留重排前顺序 |
 | `LESSON_RERANK_POOL` | 环境变量 | 20 | rerank 的候选池大小 |
 | `LESSON_RAG_PIPELINE` | 环境变量 | classic | `classic` 保持原排序；`quality_diverse` 开启语义/词面/技能/领域/弱维度/历史收益/时序多信号排序，再去重并做多样性选择 |
 | `LESSON_CANDIDATE_POOL` | 环境变量 | 20 | `quality_diverse` 在去重与多样性选择前保留的候选数 |
@@ -263,10 +266,21 @@ SkillForge 提供一组**可选**优化旋钮，全部默认等价于经典行�
 | `LESSON_SIGNAL_WEIGHTS` | 环境变量 | 内置权重 | 可选 JSON，覆盖并自动归一化 `semantic/sparse/skill/domain/dimension/quality/recency` 权重 |
 | `LESSON_FAILURE_CONTEXT` | 环境变量 | 0（关闭） | 开启后把失败 eval 的标准、期望和对应失败场景加入当次检索查询；不持久化这些内容 |
 | `LESSON_EMBED_BATCH_SIZE` | 环境变量 | 1 | 未缓存经验的 DashScope embedding 批量大小（1–10）；1 保持逐条调用，10 降低大经验库冷启动请求数 |
-| `LESSON_MIN_GAIN` | 环境变量 | 0（关闭） | 经验沉淀质量门槛-提升幅度：score_after − score_before ≥ 该值才沉淀（OR 语义；推荐开启值 15） |
-| `LESSON_MIN_FINAL` | 环境变量 | 0（关闭） | 经验沉淀质量门槛-最终水位：score_after ≥ 该值才沉淀（OR 语义；推荐开启值 85）。任一维度达标即沉淀，过滤小修噪音 |
+| `LESSON_MIN_GAIN` | 环境变量 | 0（关闭） | 普通/同轮经验的提升幅度门槛（与 `LESSON_MIN_FINAL` 为 OR；推荐 15）；跨轮同分经验如实为零总分增益，忽略此门槛 |
+| `LESSON_MIN_FINAL` | 环境变量 | 0（关闭） | 最终水位门槛（推荐 85）；普通/同轮经验仍与 `MIN_GAIN` 为 OR，跨轮同分经验启用该值后必须达到此水位才持久化 |
 
 > **安全与不变量**：凭据字段恒为 `qwen_api_key`；密钥仅存组件内存与请求体，绝不落日志/会话/zip/git。一次变异仍只改 SKILL.md 一处；只有「严格提升」的变异才会被保留，回归守卫只会更严格，绝不会让技能退化。
+
+同分维度经验分为两个互不隐式联动的范围：
+
+- `same_round`：`TIE_DIMENSION_LESSONS=1` 时，比较同一轮中总分与已保留 winner 相同的未选候选，参照维度是该 winner。
+- `cross_round`：`CROSS_ROUND_TIE_DIMENSION_LESSONS=1` 时，比较本轮所有通过结构/编辑守卫且真正完成评分的候选，参照物是**截至本轮开始最近一次通过严格提升门被保留的 incumbent**（第一轮为初始版本）。连续数轮没有保留新版本时，参照物仍是更早那次最近被保留的版本，而不是上一轮的临时候选。
+
+两类记录都使用 `lesson_type=tie_dimension`，并用 `comparison_scope` 区分；一个候选的多个优势维度聚合到同一条 `dimension_gains`，`target_dimension` 稳定选择增益最大的维度（同增益按维度名排序）。同一候选/维度同时命中两种比较时只记录一次，同轮信号优先。lesson 与轮次经验只含 strategy、diagnosis、summary、分数、目标维度等模型生成元数据，不含候选或 incumbent 的 SKILL.md、场景、执行/评分原文、Prompt、内部候选 ID或 API Key；既有 mutation log/API 中用于展示候选明细的 `candidate_id` 保持不变。
+
+跨轮候选的 `score_before` 与 `score_after` 都记录真实同分，不伪造总分提升；维度增益必须严格超过 `CROSS_ROUND_TIE_DIMENSION_MIN_GAIN`。因此 `LESSON_MIN_GAIN` 不参与其质量判断；若启用了 `LESSON_MIN_FINAL`，总分还必须达到该水位才写入跨会话经验库。未达到持久化水位的元数据仍可留在本会话 `round_memory`，但候选的 `current_md`、基线分、维度基线和 `kept=false` 均不改变。
+
+首轮仍在 baseline 后准备经验；开启跨轮学习后，后续每轮先检查协作式 stop，再在 Analyst 前刷新经验检索，使刚学到的维度信号可立即用于下一轮的弱维度定向。`off`/`tag` 只增加本地读取；`semantic`/`hybrid` 可能每轮增加查询 embedding，启用 rerank 时还可能增加 rerank 调用。embedding/检索失败会降级到 tag/轮内记忆，rerank 失败则保留重排前顺序，都不会影响优化主循环。JSONL 直接保存新字段；SQLite 用内置 `sqlite3` 向后兼容补充 `comparison_scope`，旧记录缺失该字段时按 legacy `same_round` 读取。默认开关为 0，因此不开启时调用路径与成本不变。
 
 角色模型示例（未设置三个角色变量时，行为与原来完全相同）：
 

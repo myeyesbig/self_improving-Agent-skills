@@ -215,6 +215,8 @@ class SkillOptimizer:
         lesson_min_final: Optional[float] = None,
         tie_dimension_lessons: Optional[bool] = None,
         tie_dimension_min_gain: Optional[float] = None,
+        cross_round_tie_dimension_lessons: Optional[bool] = None,
+        cross_round_tie_dimension_min_gain: Optional[float] = None,
         weak_dimension_focus: Optional[bool] = None,
         weak_dimension_threshold: Optional[float] = None,
         weak_dimension_max: Optional[int] = None,
@@ -454,6 +456,33 @@ class SkillOptimizer:
             except ValueError:
                 tie_dimension_min_gain = 0.0
         self.tie_dimension_min_gain = max(0.0, float(tie_dimension_min_gain))
+
+        # 【跨轮平局维度经验】使用独立开关，避免现有同轮开关在
+        # 升级后静默产生额外经验。该配置只决定是否提取元数据，不参与
+        # 候选保留判定。最小增益独立于同轮阈值，必须严格超过才命中。
+        if cross_round_tie_dimension_lessons is None:
+            cross_round_tie_dimension_lessons = (
+                os.getenv("CROSS_ROUND_TIE_DIMENSION_LESSONS", "0") != "0"
+            )
+        self.cross_round_tie_dimension_lessons = cross_round_tie_dimension_lessons
+        if cross_round_tie_dimension_min_gain is None:
+            try:
+                cross_round_tie_dimension_min_gain = float(
+                    os.getenv("CROSS_ROUND_TIE_DIMENSION_MIN_GAIN", "0.0")
+                )
+            except (TypeError, ValueError):
+                cross_round_tie_dimension_min_gain = 0.0
+        try:
+            cross_round_tie_dimension_min_gain = float(
+                cross_round_tie_dimension_min_gain
+            )
+        except (TypeError, ValueError):
+            cross_round_tie_dimension_min_gain = 0.0
+        if not math.isfinite(cross_round_tie_dimension_min_gain):
+            cross_round_tie_dimension_min_gain = 0.0
+        self.cross_round_tie_dimension_min_gain = max(
+            0.0, cross_round_tie_dimension_min_gain
+        )
 
         # 【目标 4：弱维度专项】默认关闭。开启时，把低于阈值的维度按分数
         # 排序并显式注入 Analyst / Mutator，同时重排候选策略与经验检索查询。
@@ -1355,6 +1384,20 @@ class SkillOptimizer:
         return bool(path and path.lower().endswith((".db", ".sqlite", ".sqlite3")))
 
     @staticmethod
+    def _normalize_lesson_metadata(lesson):
+        """Normalize additive lesson metadata without rewriting persisted data."""
+        normalized = dict(lesson)
+        if (
+            normalized.get("lesson_type") == "tie_dimension"
+            and not normalized.get("comparison_scope")
+        ):
+            # Records created before cross-round learning were necessarily
+            # same-round comparisons. Normalize only at read time so old JSONL
+            # and SQLite stores remain usable without a destructive rewrite.
+            normalized["comparison_scope"] = "same_round"
+        return normalized
+
+    @staticmethod
     def _embedding_to_blob(embedding):
         """numpy 向量 → float32 bytes（SQLite BLOB）；None 原样返回。"""
         if embedding is None:
@@ -1381,9 +1424,12 @@ class SkillOptimizer:
                     if not line:
                         continue
                     try:
-                        lessons.append(json.loads(line))
+                        lesson = json.loads(line)
                     except json.JSONDecodeError:
                         continue
+                    if isinstance(lesson, dict):
+                        lesson = SkillOptimizer._normalize_lesson_metadata(lesson)
+                    lessons.append(lesson)
         except OSError:
             return []
         return lessons[-max(1, limit):]
@@ -1402,10 +1448,14 @@ class SkillOptimizer:
                 target_dimension_col = (
                     "target_dimension" if "target_dimension" in columns else "NULL"
                 )
+                comparison_scope_col = (
+                    "comparison_scope" if "comparison_scope" in columns else "NULL"
+                )
                 rows = conn.execute(
                     "SELECT id, skill_name, domain, skill_description, strategy, diagnosis, "
                     "summary, score_before, score_after, created_at, embedding, "
-                    f"{lesson_type_col}, {dimension_gains_col}, {target_dimension_col} "
+                    f"{lesson_type_col}, {dimension_gains_col}, {target_dimension_col}, "
+                    f"{comparison_scope_col} "
                     "FROM lessons ORDER BY id DESC LIMIT ?",
                     (max(1, limit),),
                 ).fetchall()
@@ -1430,7 +1480,9 @@ class SkillOptimizer:
                             pass
                     if r[13]:
                         lesson["target_dimension"] = r[13]
-                    lessons.append(lesson)
+                    if r[14]:
+                        lesson["comparison_scope"] = r[14]
+                    lessons.append(SkillOptimizer._normalize_lesson_metadata(lesson))
                 return lessons
             finally:
                 conn.close()
@@ -1478,7 +1530,7 @@ class SkillOptimizer:
                     "strategy TEXT, diagnosis TEXT, summary TEXT,"
                     "score_before REAL, score_after REAL, created_at TEXT,"
                     "embedding BLOB, lesson_type TEXT, dimension_gains TEXT,"
-                    "target_dimension TEXT)"
+                    "target_dimension TEXT, comparison_scope TEXT)"
                 )
                 # 兼容既有数据库：CREATE IF NOT EXISTS 不会补列，按需迁移。
                 columns = {
@@ -1490,11 +1542,13 @@ class SkillOptimizer:
                     conn.execute("ALTER TABLE lessons ADD COLUMN dimension_gains TEXT")
                 if "target_dimension" not in columns:
                     conn.execute("ALTER TABLE lessons ADD COLUMN target_dimension TEXT")
+                if "comparison_scope" not in columns:
+                    conn.execute("ALTER TABLE lessons ADD COLUMN comparison_scope TEXT")
                 conn.execute(
                     "INSERT INTO lessons (skill_name, domain, skill_description, strategy, "
                     "diagnosis, summary, score_before, score_after, created_at, embedding, "
-                    "lesson_type, dimension_gains, target_dimension) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "lesson_type, dimension_gains, target_dimension, comparison_scope) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         lesson.get("skill_name"), lesson.get("domain"),
                         lesson.get("skill_description"), lesson.get("strategy"),
@@ -1508,6 +1562,7 @@ class SkillOptimizer:
                             if lesson.get("dimension_gains") else None
                         ),
                         lesson.get("target_dimension"),
+                        lesson.get("comparison_scope"),
                     ),
                 )
                 # 上限 1000：删除最旧的超量行。
@@ -1554,11 +1609,12 @@ class SkillOptimizer:
 
     @staticmethod
     def _lesson_index_text(lesson):
-        """经验 → 检索文本（strategy + diagnosis + summary 拼接）。"""
+        """经验 → 检索文本（模型建议 + 安全的结构化维度元数据）。"""
         parts = [
             lesson.get("strategy", ""),
             lesson.get("diagnosis", ""),
             lesson.get("summary", ""),
+            lesson.get("comparison_scope", ""),
             lesson.get("target_dimension", ""),
         ]
         if lesson.get("dimension_gains"):
@@ -1947,7 +2003,7 @@ class SkillOptimizer:
         allowed = (
             "skill_name", "domain", "strategy", "diagnosis", "summary",
             "score_before", "score_after", "lesson_type", "target_dimension",
-            "dimension_gains", "_retrieval",
+            "dimension_gains", "comparison_scope", "_retrieval",
         )
         compact = []
         for lesson in lessons:
@@ -2051,20 +2107,70 @@ class SkillOptimizer:
             return True
         return self.lesson_min_gain <= 0 and self.lesson_min_final <= 0
 
-    def _dimension_advantages(self, candidate_scores, winner_scores):
-        """Return dimensions where a tied candidate beats the selected winner."""
-        advantages = {}
-        for dimension, candidate in (candidate_scores or {}).items():
-            if not isinstance(candidate, dict):
+    def _cross_round_tie_lesson_qualifies(self, score):
+        """Apply only the final-score quality gate to a zero-total-gain lesson.
+
+        A cross-round tie has an honest total-score gain of zero, so
+        ``LESSON_MIN_GAIN`` is deliberately irrelevant. Its dimension-gain
+        threshold is the lesson's own quality gate; ``LESSON_MIN_FINAL`` remains
+        an optional additional persistence floor.
+        """
+        try:
+            score = float(score)
+        except (TypeError, ValueError):
+            return False
+        if not math.isfinite(score):
+            return False
+        return self.lesson_min_final <= 0 or score >= self.lesson_min_final
+
+    @staticmethod
+    def _tie_dimension_target(dimension_gains):
+        """Choose the largest-gain dimension, breaking ties by dimension name."""
+        if not isinstance(dimension_gains, dict) or not dimension_gains:
+            return None
+        ranked = []
+        for dimension, metadata in dimension_gains.items():
+            if not isinstance(metadata, dict):
                 continue
-            winner = (winner_scores or {}).get(dimension, {})
             try:
-                candidate_pct = float(candidate.get("pct", 0.0))
-                winner_pct = float(winner.get("pct", 0.0))
+                gain = float(metadata.get("gain"))
             except (TypeError, ValueError):
                 continue
+            if math.isfinite(gain):
+                ranked.append((-gain, str(dimension)))
+        if not ranked:
+            return None
+        return min(ranked)[1]
+
+    def _dimension_advantages(self, candidate_scores, winner_scores, min_gain=None):
+        """Return finite, shared dimensions where a tied candidate is better."""
+        if not isinstance(candidate_scores, dict) or not isinstance(winner_scores, dict):
+            return {}
+        if min_gain is None:
+            min_gain = self.tie_dimension_min_gain
+        try:
+            min_gain = float(min_gain)
+        except (TypeError, ValueError):
+            min_gain = 0.0
+        if not math.isfinite(min_gain):
+            min_gain = 0.0
+        min_gain = max(0.0, min_gain)
+        advantages = {}
+        for dimension, candidate in candidate_scores.items():
+            if not isinstance(candidate, dict) or "pct" not in candidate:
+                continue
+            winner = winner_scores.get(dimension)
+            if not isinstance(winner, dict) or "pct" not in winner:
+                continue
+            try:
+                candidate_pct = float(candidate["pct"])
+                winner_pct = float(winner["pct"])
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(candidate_pct) or not math.isfinite(winner_pct):
+                continue
             gain = candidate_pct - winner_pct
-            if gain > self.tie_dimension_min_gain:
+            if gain > min_gain:
                 advantages[dimension] = {
                     "candidate_pct": candidate_pct,
                     "winner_pct": winner_pct,

@@ -128,12 +128,26 @@ score_after > baseline + improvement_threshold + noise_floor   ← 严格高于
 | 维度 | 说明 |
 |------|------|
 | 存储 | `SKILL_LESSONS_FILE` 指向 jsonl 或 `.db`/`.sqlite` 文件（SQLite） |
-| 沉淀质量门槛 | `LESSON_MIN_GAIN`（提升幅度）或 `LESSON_MIN_FINAL`（最终水位）任一达标才沉淀；默认关闭（任何保留的修改都沉淀） |
+| 普通经验质量门 | `LESSON_MIN_GAIN`（提升幅度）或 `LESSON_MIN_FINAL`（最终水位）任一达标才沉淀；默认关闭（任何保留的修改都沉淀） |
+| 同分维度经验 | `lesson_type=tie_dimension`，通过 `comparison_scope=same_round/cross_round` 区分比较范围；候选正文永不保留 |
 | 检索模式 | `LESSON_RETRIEVAL`：`off`（默认，最近 N 条）/ `tag`（同技能硬过滤）/ `semantic`（embedding 检索）/ `hybrid`（dense+sparse 混合） |
-| embedding / rerank | 走 DashScope `text-embedding-v3` 与 `gte-rerank`；任何 embedding/rerank 失败自动降级到 tag 过滤 |
+| embedding / rerank | 走 DashScope `text-embedding-v3` 与 `gte-rerank`；embedding/检索失败降级到 tag，rerank 失败保留重排前顺序 |
 | 范围限制 | 只存**模型生成的 lesson 元数据**，绝不存技能内容、场景、输出或 API Key |
 
 > **默认关闭**：不设 `SKILL_LESSONS_FILE` 时系统表现与未引入经验库前完全一致。
+
+#### 同轮与跨轮同分经验
+
+- **同轮（`same_round`）**：开启 `TIE_DIMENSION_LESSONS` 后，本轮先产生一个通过严格提升门并被保留的 winner；其他候选若总分与 winner 相同、某个维度严格优于 winner，就提炼局部优势。
+- **跨轮（`cross_round`）**：开启独立的 `CROSS_ROUND_TIE_DIMENSION_LESSONS` 后，本轮每个通过结构/编辑守卫且真正完成评分的候选，都会与**截至本轮开始最近一次通过严格提升门被保留的 incumbent**比较。第一轮的 incumbent 是初始版本；若连续几轮没有新版本被保留，参照物仍是更早那次最近被保留的版本，而不是上一轮被丢弃的候选。
+
+跨轮逻辑不只看本轮 best。候选总分必须用 `math.isclose(..., abs_tol=1e-9)` 与轮首 incumbent 判定同分，并且至少一个同名维度的增益严格大于 `CROSS_ROUND_TIE_DIMENSION_MIN_GAIN`；等于阈值不算命中。总分低于 incumbent 不学习，总分高于 incumbent 继续走原有严格提升/配对复核/保留路径，不会被误标成跨轮同分。被回归守卫、`EDIT_LIMIT` 或配对复核拒绝，以及没有真实完成评分的候选，都不能贡献经验；同分候选也不会触发只面向初步严格提升者的 `CANDIDATE_CONFIRM_RUNS`。
+
+一个候选的多个优势维度聚合为一条 lesson，`target_dimension` 取增益最大的维度，同增益时按维度名稳定排序；同一轮以临时候选 ID + 维度去重，同一个信号若同时命中同轮和跨轮比较，仅保留同轮记录。候选 ID 在 tie lesson 提取流程中只用于当轮去重，不落库、不进 Prompt；既有 mutation log/API 的候选明细仍保留 `candidate_id`。跨轮记录如实保存相等的 `score_before` / `score_after`，不伪造总分提升；它只会让后续 Analyst/Mutator 获得维度信号，不会更新 `current_md`、基线分、维度基线，也始终保持 `kept=false`。这正是“学习信号”和“接受候选”分离，因此不违反严格提升冻结规则。
+
+跨轮经验用自己的严格维度增益阈值作为质量门，`LESSON_MIN_GAIN` 对它不适用；若 `LESSON_MIN_FINAL>0`，则同分总分还必须达到该水位才会持久化。没有配置经验库或未达到该水位时，聚合元数据仍可进入本会话的 `round_memory`。持久化字段只包括 skill/domain、strategy、diagnosis、summary、真实分数、scope、目标维度、聚合增益和时间等模型生成元数据；SKILL.md 正文、场景、eval/执行原文、输出、Prompt、候选 ID、内部数据库 ID和密钥均禁止落库。
+
+开启跨轮学习时，首轮沿用基线后的初始 lesson 准备；后续轮先执行协作式 stop 检查，再在 Analyst 前刷新 lesson，使上一轮学到的维度优势能在下一轮被 weak-dimension signal 与 `quality_diverse` 检索命中。`off`/`tag` 只增加本地读取；`semantic`/`hybrid` 会增加每轮查询 embedding，开启 rerank 时还可能增加 rerank 调用。embedding/检索失败仍降级到 tag/轮内记忆，rerank 失败保留重排前顺序，均不阻断优化；关闭跨轮开关时保持原来的检索次数和成本。JSONL 可直接往返新字段；SQLite 仅用 Python 内置 `sqlite3` 向后兼容补充 `comparison_scope` 列，旧 tie 记录缺少该列时按 `same_round` 读取。
 
 ---
 
@@ -311,7 +325,11 @@ improved_skill.zip
 | `FINAL_CONFIRM` | `0`（关闭） | 完成前对最终版本独立复核，未超过基线则回退（防单点幸运） |
 | `CANDIDATE_CONFIRM_RUNS` | `0`（关闭） | 初评胜者与当轮 incumbent 追加 1–3 次配对复评；每一对都须严格胜出，采用最低 challenger 分 |
 | `ANALYST_DIMENSION_WEIGHTS` | 无 | JSON 字符串，如 `{"correctness":2,"clarity":1}`；无权重时等价旧通过率 |
-| `SKILL_LESSONS_FILE` | 无（关闭） | 经验库路径（jsonl 或 `.db`/`.sqlite`）；开启后保留的修改沉淀为经验 |
+| `TIE_DIMENSION_LESSONS` | `0`（关闭） | 学习同轮 winner 与总分并列候选之间的维度优势；只存元数据，不保留候选 |
+| `TIE_DIMENSION_MIN_GAIN` | `0.0` | 同轮候选的维度增益须严格大于该值 |
+| `CROSS_ROUND_TIE_DIMENSION_LESSONS` | `0`（关闭） | 学习本轮有效候选相对轮首最近一次被严格保留 incumbent 的同分维度优势；独立于同轮开关 |
+| `CROSS_ROUND_TIE_DIMENSION_MIN_GAIN` | `0.0` | 跨轮候选的维度增益须严格大于该值；非法值回退、负数钳制为 0.0 |
+| `SKILL_LESSONS_FILE` | 无（关闭） | 经验库路径（jsonl 或 `.db`/`.sqlite`）；保留修改及启用后的同分维度元数据可沉淀为经验 |
 | `LESSON_RETRIEVAL` | `off` | `off` / `tag` / `semantic` / `hybrid` |
 | `LESSON_N` | `5` | `off`/`tag` 模式读取的最近经验条数 |
 | `LESSON_THRESHOLD` | `0.3` | semantic 模式余弦相似度阈值（0–1） |
@@ -326,8 +344,8 @@ improved_skill.zip
 | `LESSON_SIGNAL_WEIGHTS` | 内置权重 | 可选 JSON；键为 `semantic/sparse/skill/domain/dimension/quality/recency`，自动归一化 |
 | `LESSON_FAILURE_CONTEXT` | `0`（关闭） | 把实际失败 eval 的 criterion/question/pass condition 和对应场景加入当次查询；不落库 |
 | `LESSON_EMBED_BATCH_SIZE` | `1` | 未缓存经验的 embedding 批量大小（1–10）；默认保持逐条调用 |
-| `LESSON_MIN_GAIN` | `0`（关闭） | 经验沉淀质量门槛（提升幅度）；推荐开启值 15 |
-| `LESSON_MIN_FINAL` | `0`（关闭） | 经验沉淀质量门槛（最终水位）；推荐开启值 85；与 `MIN_GAIN` 是 OR 语义 |
+| `LESSON_MIN_GAIN` | `0`（关闭） | 普通/同轮经验的提升幅度门槛（与 `MIN_FINAL` 为 OR；推荐 15）；跨轮同分经验忽略该值 |
+| `LESSON_MIN_FINAL` | `0`（关闭） | 最终水位门槛（推荐 85）；普通/同轮经验与 `MIN_GAIN` 为 OR，跨轮同分经验启用后须达到该水位才持久化 |
 
 ---
 
@@ -383,6 +401,10 @@ MUTATION_PARALLELISM=2 ./start-dev.sh
 SKILL_LESSONS_FILE=./data/skill_lessons.db \
 LESSON_RETRIEVAL=hybrid \
 LESSON_RAG_PIPELINE=quality_diverse \
+TIE_DIMENSION_LESSONS=1 \
+TIE_DIMENSION_MIN_GAIN=5 \
+CROSS_ROUND_TIE_DIMENSION_LESSONS=1 \
+CROSS_ROUND_TIE_DIMENSION_MIN_GAIN=5 \
 LESSON_FAILURE_CONTEXT=1 \
 LESSON_EMBED_BATCH_SIZE=10 \
 LESSON_THRESHOLD=0.3 \
@@ -401,9 +423,13 @@ LESSON_MIN_FINAL=85 \
 | 候选很多、希望最相关的排前面 | 开 `LESSON_RERANK=1`（多一次 rerank 调用） |
 | 重复经验多、弱维度经验容易被淹没 | `LESSON_RAG_PIPELINE=quality_diverse`（推荐与 `hybrid` 配合） |
 
-`LESSON_MIN_GAIN=15` 与 `LESSON_MIN_FINAL=85` 是推荐的质量门槛（OR 语义，任一达标即沉淀），用来过滤「小幅修修补补」造成的经验库噪音。
+`TIE_DIMENSION_LESSONS` 与 `CROSS_ROUND_TIE_DIMENSION_LESSONS` 完全独立：只开前者不会在升级后静默增加跨轮经验；只开后者也会扫描所有守卫通过且已评分的候选，而不要求本轮先产生 winner。两个 `*_MIN_GAIN` 都采用严格 `>`，可按评分维度的百分点尺度调整。
 
-新版管线先用 embedding、中文/英文词面、技能、领域、目标弱维度、历史提升幅度/最终分和时序组成质量分；可选 `gte-rerank` 后，再删除近重复经验并做多样性选择。返回给模型的内容有字段白名单和字符预算，SQLite 中的向量不会进入 prompt。任一步失败仍自动回退到 `tag`；不设置 `LESSON_RAG_PIPELINE` 时行为与旧版一致。
+`LESSON_MIN_GAIN=15` 与 `LESSON_MIN_FINAL=85` 对普通成功经验和同轮 tie 经验维持 OR 语义，用来过滤「小幅修修补补」造成的经验库噪音。跨轮 tie 的总分增益真实为 0，因此不使用 `LESSON_MIN_GAIN`；它先通过自己的维度增益门，再将已启用的 `LESSON_MIN_FINAL` 作为额外持久化水位。未过最终水位的元数据仍可在当前会话的轮间记忆中使用。
+
+新版管线先用 embedding、中文/英文词面、技能、领域、目标弱维度、历史提升幅度/最终分和时序组成质量分；tie 经验的 `target_dimension` / `dimension_gains` 会贡献 dimension signal，`comparison_scope` 也在 Prompt 白名单内用于区分同轮与跨轮。可选 `gte-rerank` 后，再删除近重复经验并做多样性选择。返回给模型的内容有字段白名单和字符预算，SQLite 中的内部 ID与向量不会进入 Prompt。embedding/检索失败自动回退到 `tag`，rerank 失败保留原排序；不设置 `LESSON_RAG_PIPELINE` 时行为与旧版一致。
+
+首轮仍在 baseline 后准备经验；开启跨轮 tie 后，后续轮先检查协作式 stop，再在 Analyst 前重新读取/检索经验，以便上一轮新 lesson 立即生效。对于 `semantic`/`hybrid`，这意味着后续每轮至少可能多一次查询 embedding；启用 `LESSON_RERANK=1` 还可能多一次重排。不开跨轮开关时保持原先只准备经验的路径与成本。
 
 `LESSON_FAILURE_CONTEXT=1` 会把真正失败的评估标准与其场景优先放入检索查询，避免只用 `keyword:missing` 之类泛化 reason；这些查询内容只参与当次 embedding/rerank，不写入经验库。`LESSON_EMBED_BATCH_SIZE=10` 则把未缓存经验按官方上限批量向量化：N 条冷数据的文档 embedding 请求数从 N 次降为 `ceil(N/10)` 次；查询向量仍单独计算。批量请求失败时仍走原 tag 降级链。
 
@@ -562,4 +588,4 @@ SkillForge 把「写好一个 Agent 技能」这件事，从一次性创作变�
 
 ---
 
-*文档版本：2026-08-07 · 对应 SkillForge commit 当前工作区*
+*文档版本：2026-08-12 · 对应 SkillForge commit 当前工作区*

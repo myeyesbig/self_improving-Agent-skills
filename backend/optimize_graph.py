@@ -146,10 +146,16 @@ def build_optimize_graph(
         if state.get("weak_dimensions"):
             prepare_kwargs["weak_dimensions"] = state["weak_dimensions"]
         lessons = await opt._prepare_lessons(
-            state["skill_md"], scenarios, evals,
+            state["current_md"], scenarios, evals,
             state["current_details"], **prepare_kwargs,
         )
         return {"lessons": lessons}
+
+    # 跨轮平局学习开启时，每个后续轮次在 Analyst 前刷新经验库，使上一轮
+    # 新沉淀的维度元数据可以立即被 RAG 召回。首轮仍复用 baseline 后的
+    # prepare_lessons；功能关闭时不增加任何检索或 embedding 调用。
+    async def node_refresh_lessons(state: OptimizeState) -> dict:
+        return await node_prepare_lessons(state)
 
     # -- 条件路由：早停 / 耐心 / 达最大轮数 → finalize，否则下一轮 -------------
     def route_check(state: OptimizeState) -> str:
@@ -168,6 +174,11 @@ def build_optimize_graph(
         opt.check_stop()
         rnd = state["round_idx"] + 1
         return {"pending_events": [{"type": "experiment_start", "data": {"round": rnd}}]}
+
+    def route_after_check_stop(state: OptimizeState) -> str:
+        if opt.cross_round_tie_dimension_lessons and state["round_idx"] > 0:
+            return "refresh"
+        return "analyst"
 
     # -- 节点：Analyst 诊断 ---------------------------------------------------
     async def node_analyst(state: OptimizeState) -> dict:
@@ -369,9 +380,22 @@ def build_optimize_graph(
 
     # -- 节点：选优 + 保留判定 + 记忆/日志/经验沉淀 + 轮结果事件 -----------------
     async def node_decide(state: OptimizeState) -> dict:
-        baseline_pct = state["baseline_pct"]
+        # 冻结截至本轮开始最近一次通过严格提升门而被保留的 incumbent。
+        # 只有 decide 末尾确认 kept 后才会更新这些状态，因此这里正是跨轮
+        # 同分比较的历史参考，第一轮则对应原始技能的 baseline。
+        historical_best_pct = state["baseline_pct"]
+        historical_dimension_scores = copy.deepcopy(
+            state.get("current_dimension_scores", {})
+        )
+        baseline_pct = historical_best_pct
         candidates = merged_candidates(state)
         analysis = state.get("analysis") or {}
+
+        # guard 会给所有候选预填 baseline 分；只有出现在本轮 rescored 中，
+        # 才能证明候选真正通过守卫并完成评分。
+        rescored_ids = {
+            candidate.get("candidate_id") for candidate in state.get("rescored", [])
+        }
 
         scored = [c for c in candidates if c["rejected"] is None and c["new_md"] is not None]
         best = max(scored, key=lambda c: c["score_after"], default=None)
@@ -393,7 +417,9 @@ def build_optimize_graph(
 
         # 【目标 3】总分并列不改变 winner（max 的确定性首胜规则保持不变）；
         # 仅提取未选候选相对 winner 的维度优势，供轮间记忆/经验库学习。
-        tie_dimension_records = []
+        same_round_tie_records = []
+        cross_round_tie_records = []
+        seen_tie_dimensions = set()
         if opt.tie_dimension_lessons and kept and best is not None:
             for c in scored:
                 if c["candidate_id"] == best["candidate_id"]:
@@ -404,12 +430,65 @@ def build_optimize_graph(
                     c.get("dimension_scores", {}), best.get("dimension_scores", {})
                 )
                 if advantages:
-                    tie_dimension_records.append({
+                    same_round_tie_records.append({
                         "candidate_id": c["candidate_id"],
                         "strategy": c.get("strategy_type", analysis.get("mutation_strategy", "unknown")),
                         "summary": (c.get("description") or "")[:200],
                         "dimension_gains": advantages,
+                        "target_dimension": opt._tie_dimension_target(advantages),
+                        "comparison_scope": "same_round",
                     })
+                    seen_tie_dimensions.update(
+                        (c["candidate_id"], dimension) for dimension in advantages
+                    )
+
+        # 跨轮比较面向本轮所有已完成评分的有效候选，而不只看 best。候选与
+        # 轮首最近 incumbent 总分相同但局部维度更好时，只学习聚合元数据；
+        # 它仍不能成为 current_md，也不会被标记 kept。
+        if opt.cross_round_tie_dimension_lessons:
+            for c in scored:
+                candidate_id = c["candidate_id"]
+                if candidate_id not in rescored_ids:
+                    continue
+                if kept and best is not None and candidate_id == best["candidate_id"]:
+                    continue
+                if (
+                    confirmation_failed
+                    and best is not None
+                    and candidate_id == best["candidate_id"]
+                ):
+                    continue
+                if not math.isclose(
+                    c["score_after"], historical_best_pct, abs_tol=1e-9
+                ):
+                    continue
+                advantages = opt._dimension_advantages(
+                    c.get("dimension_scores", {}),
+                    historical_dimension_scores,
+                    min_gain=opt.cross_round_tie_dimension_min_gain,
+                )
+                advantages = {
+                    dimension: metadata
+                    for dimension, metadata in advantages.items()
+                    if (candidate_id, dimension) not in seen_tie_dimensions
+                }
+                if not advantages:
+                    continue
+                cross_round_tie_records.append({
+                    "candidate_id": candidate_id,
+                    "strategy": c.get(
+                        "strategy_type", analysis.get("mutation_strategy", "unknown")
+                    ),
+                    "summary": (c.get("description") or "")[:200],
+                    "dimension_gains": advantages,
+                    "target_dimension": opt._tie_dimension_target(advantages),
+                    "comparison_scope": "cross_round",
+                })
+                seen_tie_dimensions.update(
+                    (candidate_id, dimension) for dimension in advantages
+                )
+
+        tie_dimension_records = same_round_tie_records + cross_round_tie_records
 
         # 每候选一条 mutation_log（增量返回，经 add reducer 追加）。
         log_entries = []
@@ -457,7 +536,18 @@ def build_optimize_graph(
             "reason": mem_reason,
         }
         if tie_dimension_records:
-            mem_entry["tie_dimension_lessons"] = tie_dimension_records
+            # round_memory 可能进入 checkpoint，也会注入 Analyst prompt；仅保留
+            # 学习所需元数据，不携带内部候选 ID。
+            mem_entry["tie_dimension_lessons"] = [
+                {
+                    "strategy": tie["strategy"],
+                    "summary": tie["summary"],
+                    "dimension_gains": tie["dimension_gains"],
+                    "target_dimension": tie["target_dimension"],
+                    "comparison_scope": tie["comparison_scope"],
+                }
+                for tie in tie_dimension_records
+            ]
 
         # 保留则更新当前版本 + 经验沉淀（只记模型生成内容，安全）。
         current_md = state["current_md"]
@@ -487,7 +577,7 @@ def build_optimize_graph(
                 opt._append_lesson(opt.lesson_file, lesson)
             # 平局候选只沉淀元数据，不保留其 SKILL.md，也不改变 winner。
             if opt._lesson_qualifies(baseline_pct, best["score_after"]):
-                for tie in tie_dimension_records:
+                for tie in same_round_tie_records:
                     tie_lesson = {
                         "skill_name": opt._skill_name_from_md(state["skill_md"]),
                         "domain": state.get("domain") or "",
@@ -499,16 +589,37 @@ def build_optimize_graph(
                         "score_after": best["score_after"],
                         "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
                         "lesson_type": "tie_dimension",
+                        "comparison_scope": tie["comparison_scope"],
                         "dimension_gains": tie["dimension_gains"],
+                        "target_dimension": tie["target_dimension"],
                     }
-                    if opt.lesson_rag_pipeline == "quality_diverse" and tie["dimension_gains"]:
-                        tie_lesson["target_dimension"] = next(iter(tie["dimension_gains"]))
                     opt._append_lesson(opt.lesson_file, tie_lesson)
             current_md = best["new_md"]
             baseline_pct = best["score_after"]
             current_details = best.get("details", current_details)
             current_dimension_scores = best.get("dimension_scores", current_dimension_scores)
             weak_dimensions = opt._identify_weak_dimensions(current_dimension_scores)
+
+        # 跨轮同分经验不依赖本轮是否有 kept winner。它如实记录零总分增益，
+        # 忽略 LESSON_MIN_GAIN，仅在启用时接受 LESSON_MIN_FINAL 的持久化水位门。
+        if opt._cross_round_tie_lesson_qualifies(historical_best_pct):
+            for tie in cross_round_tie_records:
+                tie_lesson = {
+                    "skill_name": opt._skill_name_from_md(state["skill_md"]),
+                    "domain": state.get("domain") or "",
+                    "skill_description": "",
+                    "strategy": tie["strategy"],
+                    "diagnosis": (analysis.get("diagnosis") or "")[:200],
+                    "summary": tie["summary"],
+                    "score_before": historical_best_pct,
+                    "score_after": historical_best_pct,
+                    "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
+                    "lesson_type": "tie_dimension",
+                    "comparison_scope": tie["comparison_scope"],
+                    "dimension_gains": tie["dimension_gains"],
+                    "target_dimension": tie["target_dimension"],
+                }
+                opt._append_lesson(opt.lesson_file, tie_lesson)
 
         no_improve = 0 if kept else state["no_improve"] + 1
 
@@ -608,6 +719,7 @@ def build_optimize_graph(
     g = StateGraph(OptimizeState)
     g.add_node("baseline", node_baseline)
     g.add_node("prepare_lessons", node_prepare_lessons)
+    g.add_node("refresh_lessons", node_refresh_lessons)
     g.add_node("check_stop", node_check_stop)
     g.add_node("analyst", node_analyst)
     g.add_node("mutate_slot", node_mutate_slot)
@@ -624,7 +736,11 @@ def build_optimize_graph(
         "prepare_lessons", route_check,
         {"continue": "check_stop", "exit": "finalize"},
     )
-    g.add_edge("check_stop", "analyst")
+    g.add_conditional_edges(
+        "check_stop", route_after_check_stop,
+        {"refresh": "refresh_lessons", "analyst": "analyst"},
+    )
+    g.add_edge("refresh_lessons", "analyst")
     # analyst 后扇出到 N 个 mutate_slot（Send map-reduce）；guard 是汇聚点。
     g.add_conditional_edges("analyst", route_mutate)
     g.add_edge("mutate_slot", "guard")

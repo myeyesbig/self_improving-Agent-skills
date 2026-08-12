@@ -161,3 +161,26 @@ RAG 完成后的主循环审计发现：并行候选各评分一次后直接取�
 SkillForge 新增 `CANDIDATE_CONFIRM_RUNS=0..3`，默认 0 保持原调用路径。开启后仅当初评分已经越过 `improvement_threshold + noise_floor` 时，才将暂定胜者与当轮当前版本在同一 scenarios/evals 上成对复评；每一对都必须继续严格胜出，最终状态分取初评和所有 challenger 复评分中的最低值。任何一对打平或失败都将本轮标记为 `confirmation_failed`，候选不保留、不沉淀经验。该门不会接受原本不合格的候选，也不改变单点变异、回归守卫或轮间停止语义。
 
 本轮没有直接引入 held-out split：当前分析阶段默认只生成 3–4 个场景，自动切分会让训练或验证侧只剩 1–2 条，且现有 API 没有独立选择集。配对复核先解决评分噪声；真正的 held-out gate 应在未来同时扩充场景数量并显式区分 train/selection 数据后再做，避免用过小验证集制造虚假的安全感。
+
+## 十二、跨轮同分维度优势：扩展信号，不扩展接受集合
+
+同轮 `TIE_DIMENSION_LESSONS` 只能回答“这轮另一个候选相对已保留 winner，是否在局部维度更好”。它遗漏了另一类有价值信号：某轮可能没有任何总分严格提升，但一个已完成评分的候选与当前 incumbent 总分相同，并显著修复了 incumbent 的弱维度。按照 GEPA 的“signal + gate”取舍，这类候选的局部信号值得学习，但接受门不应因此扩大。
+
+SkillForge 因此把比较范围明确拆成两类：
+
+| `comparison_scope` | 参照物 | 候选范围 | 是否可替换当前版本 |
+|---|---|---|---|
+| `same_round` | 本轮通过严格提升门并被保留的 winner | 与 winner 总分相同的其他本轮有效候选 | 否 |
+| `cross_round` | 截至本轮开始最近一次通过严格提升门被保留的 incumbent | 本轮所有通过守卫且真实完成评分的候选 | 否 |
+
+“最近一次被保留的 incumbent”是比“上一轮版本”更准确的定义：如果连续几轮没有严格提升，上一轮只有被丢弃的临时候选，真正参照物仍是更早那次被保留的版本。由于 SkillForge 始终只有一个父节点且只接受严格提升，该 incumbent 同时也是截至轮首的历史最高总分版本。比较必须冻结轮首的 `current_md`、总分和维度成绩，并在任何本轮状态更新前完成，避免把新 winner 误当成历史参照。
+
+跨轮学习使用独立的 `CROSS_ROUND_TIE_DIMENSION_LESSONS=0`，不会因既有同轮开关为 1 而在升级后静默产生新经验；`CROSS_ROUND_TIE_DIMENSION_MIN_GAIN=0.0` 控制严格维度增益门。总分按现有浮点容差判定同分，维度增益必须严格大于阈值。低于 incumbent 的候选没有同分信号，高于 incumbent 的候选走原来的严格提升和可选配对复核；同分候选不会触发 `CANDIDATE_CONFIRM_RUNS`，也永远不会成为 `current_md` 或得到 `kept=true`。回归守卫、编辑幅度守卫、未完成评分和 confirmation 拒绝均先于经验提取生效。
+
+经验形状遵循“最小可复用元数据”：同一候选的多个优势维度聚合为一条 `tie_dimension` lesson，包含 scope、目标维度和 `dimension_gains`，目标维度取最大 gain（同 gain 按维度名稳定排序），但不保存候选/incumbent 的 SKILL.md、场景、eval/执行原文、输出或 Prompt。候选 ID在 tie 提取流程中只用于本轮 `(candidate_id, dimension)` 去重，不持久化或注入 Prompt；既有 mutation log/API 候选明细不变。同一信号同时命中两类比较时由 `same_round` 优先，避免重复沉淀。跨轮记录的 `score_before == score_after`，明确表达“总分没有进步”，而非制造虚假 gain。
+
+这也要求质量门分工清晰：跨轮经验以自身的严格维度增益阈值判断信号质量，不使用针对总分提升设计的 `LESSON_MIN_GAIN`；若启用了 `LESSON_MIN_FINAL`，它继续作为额外的持久化总分水位。未过持久化水位的元数据仍可进入当次会话的 `round_memory`。因此 lesson 质量判断只决定“是否记住”，不能改变“是否接受”。
+
+为了让跨轮信号真的影响下一轮，首轮仍在 baseline 后准备经验；开关启用时，后续轮在协作式 stop 检查之后、Analyst 之前刷新经验检索。`target_dimension` / `dimension_gains` 继续参与 `quality_diverse` 的弱维度 signal，`comparison_scope` 进入受控 Prompt 白名单；内部 ID与 embedding 仍被剥离。代价是 semantic/hybrid 模式可能在后续每轮增加查询 embedding，rerank 开启时还可能增加重排调用；embedding/检索失败仍降级 tag/轮内记忆，rerank 失败保留原排序。开关关闭时不改变原检索调用次数。
+
+JSONL 可直接承载新字段；SQLite 只用内置 `sqlite3` 增加可空 `comparison_scope` 并兼容旧库，历史 tie lesson 缺少 scope 时按 `same_round` 解读。该迁移没有扩大持久化数据边界，也没有新增依赖、provider 或保留种群。

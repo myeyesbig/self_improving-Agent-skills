@@ -39,6 +39,7 @@ from qwen_optimizer import (
     StopOptimizationError,
     _active_strategy_pool,
 )
+from optimize_graph import build_optimize_graph
 from app import (
     AnalyzeRequest,
     RegenerateRequest,
@@ -561,6 +562,8 @@ class TestTieDimensionLessons(unittest.IsolatedAsyncioTestCase):
             lessons = SkillOptimizer._load_lessons(lesson_path, limit=10)
             tie_lessons = [l for l in lessons if l.get("lesson_type") == "tie_dimension"]
             self.assertEqual(len(tie_lessons), 1)
+            self.assertEqual(tie_lessons[0]["comparison_scope"], "same_round")
+            self.assertEqual(tie_lessons[0]["target_dimension"], "clarity")
             self.assertEqual(tie_lessons[0]["dimension_gains"]["clarity"]["gain"], 50.0)
             self.assertNotIn("skill_md", tie_lessons[0])
             self.assertNotIn("new_skill_md", tie_lessons[0])
@@ -577,7 +580,852 @@ class TestTieDimensionLessons(unittest.IsolatedAsyncioTestCase):
             SkillOptimizer._append_lesson(path, lesson)
             loaded = SkillOptimizer._load_lessons(path, limit=1)[0]
             self.assertEqual(loaded["lesson_type"], "tie_dimension")
+            self.assertEqual(loaded["comparison_scope"], "same_round")
             self.assertEqual(loaded["dimension_gains"]["clarity"]["gain"], 25.0)
+
+
+class TestCrossRoundTieDimensionLessons(unittest.IsolatedAsyncioTestCase):
+    """跨轮同分候选只贡献元数据，并始终以最近一次 kept incumbent 为参照。"""
+
+    @staticmethod
+    def _dimensions(**scores):
+        return {
+            name: {"passed": 1, "total": 1, "pct": float(pct)}
+            for name, pct in scores.items()
+        }
+
+    @classmethod
+    def _score(cls, passed, total=100, *, dimensions=None, details=None):
+        return {
+            "passed": passed,
+            "total": total,
+            "per_eval": [],
+            "details": list(details or []),
+            "dimension_scores": dimensions or {},
+        }
+
+    @staticmethod
+    def _analysis(**overrides):
+        analysis = {
+            "diagnosis": "model diagnosis",
+            "mutation_strategy": "add_example",
+            "target_section": "Workflow",
+            "suggested_change": "add one focused example",
+        }
+        analysis.update(overrides)
+        return analysis
+
+    @staticmethod
+    def _candidate(candidate_id, score, dimensions, *, new_md=None, strategy=None,
+                   rejected=None, description=None):
+        candidate = {
+            "candidate_id": candidate_id,
+            "new_md": new_md if new_md is not None else f"# Candidate {candidate_id}",
+            "description": description or f"candidate {candidate_id} summary",
+            "reasoning": "model reasoning",
+            "strategy_type": strategy or f"strategy-{candidate_id}",
+            "target_dimension": None,
+            "rejected": rejected,
+            "score_after": score,
+            "per_eval": [],
+            "details": [],
+            "dimension_scores": dimensions,
+        }
+        return candidate
+
+    @staticmethod
+    async def _decide(opt, *, baseline=80.0, incumbent_md="# Incumbent",
+                      incumbent_dimensions=None, candidates=None, rescored=None,
+                      confirmation=None):
+        graph = build_optimize_graph(
+            opt,
+            max_rounds=1,
+            n_candidates=max(1, len(candidates or [])),
+            strategy_pool=["add_example"],
+            effective_patience=0,
+            scenarios=[],
+            evals=[],
+        )
+        state = {
+            "skill_md": "---\nname: safe-skill\n---\n# Original",
+            "domain": "writing",
+            "current_md": incumbent_md,
+            "baseline_pct": baseline,
+            "current_details": [{"eval_id": 1, "passed": False}],
+            "current_dimension_scores": incumbent_dimensions or {},
+            "weak_dimensions": [],
+            "score_history": [baseline],
+            "mutation_log": [],
+            "round_memory": [],
+            "round_idx": 0,
+            "no_improve": 0,
+            "analysis": TestCrossRoundTieDimensionLessons._analysis(),
+            "candidates": candidates or [],
+            "rescored": rescored or [],
+            "confirmation": confirmation or {},
+        }
+        return await graph.nodes["decide"].ainvoke(state)
+
+    @staticmethod
+    def _tie_lessons(path, scope=None):
+        lessons = [
+            lesson for lesson in SkillOptimizer._load_lessons(path, limit=100)
+            if lesson.get("lesson_type") == "tie_dimension"
+        ]
+        if scope is not None:
+            lessons = [
+                lesson for lesson in lessons
+                if lesson.get("comparison_scope") == scope
+            ]
+        return lessons
+
+    def test_default_off_and_independent_configuration(self):
+        with patch.dict(os.environ, {}, clear=True):
+            opt = make_optimizer()
+        self.assertFalse(opt.cross_round_tie_dimension_lessons)
+        self.assertEqual(opt.cross_round_tie_dimension_min_gain, 0.0)
+
+        # 开启旧的同轮功能不得静默开启跨轮功能。
+        with patch.dict(os.environ, {"TIE_DIMENSION_LESSONS": "1"}, clear=True):
+            opt = make_optimizer()
+        self.assertTrue(opt.tie_dimension_lessons)
+        self.assertFalse(opt.cross_round_tie_dimension_lessons)
+
+        with patch.dict(os.environ, {
+            "CROSS_ROUND_TIE_DIMENSION_LESSONS": "1",
+            "CROSS_ROUND_TIE_DIMENSION_MIN_GAIN": "6.5",
+        }, clear=True):
+            opt = make_optimizer()
+        self.assertTrue(opt.cross_round_tie_dimension_lessons)
+        self.assertEqual(opt.cross_round_tie_dimension_min_gain, 6.5)
+
+        # 显式构造参数优先于环境变量，且跨轮阈值不复用同轮阈值。
+        with patch.dict(os.environ, {
+            "CROSS_ROUND_TIE_DIMENSION_LESSONS": "1",
+            "CROSS_ROUND_TIE_DIMENSION_MIN_GAIN": "9",
+            "TIE_DIMENSION_MIN_GAIN": "99",
+        }, clear=True):
+            opt = make_optimizer(
+                cross_round_tie_dimension_lessons=False,
+                cross_round_tie_dimension_min_gain=2.0,
+            )
+        self.assertFalse(opt.cross_round_tie_dimension_lessons)
+        self.assertEqual(opt.cross_round_tie_dimension_min_gain, 2.0)
+        self.assertEqual(opt.tie_dimension_min_gain, 99.0)
+
+    def test_invalid_and_negative_minimum_gain_fall_back_to_zero(self):
+        with patch.dict(os.environ, {
+            "CROSS_ROUND_TIE_DIMENSION_MIN_GAIN": "not-a-number",
+        }, clear=True):
+            self.assertEqual(make_optimizer().cross_round_tie_dimension_min_gain, 0.0)
+        self.assertEqual(
+            make_optimizer(cross_round_tie_dimension_min_gain=-3.0)
+            .cross_round_tie_dimension_min_gain,
+            0.0,
+        )
+
+    def test_dimension_gain_boundary_is_strict_and_requires_reference_score(self):
+        opt = make_optimizer(cross_round_tie_dimension_min_gain=5.0)
+        gains = opt._dimension_advantages(
+            {
+                "equal-boundary": {"pct": 85.0},
+                "over-boundary": {"pct": 85.001},
+                "missing-reference": {"pct": 100.0},
+                "non-finite": {"pct": float("nan")},
+            },
+            {
+                "equal-boundary": {"pct": 80.0},
+                "over-boundary": {"pct": 80.0},
+                "non-finite": {"pct": 0.0},
+            },
+            min_gain=opt.cross_round_tie_dimension_min_gain,
+        )
+        self.assertNotIn("equal-boundary", gains)
+        self.assertEqual(gains["over-boundary"]["gain"], 5.0)
+        self.assertNotIn("missing-reference", gains)
+        self.assertNotIn("non-finite", gains)
+
+    def test_target_dimension_uses_largest_gain_then_dimension_name(self):
+        opt = make_optimizer()
+        self.assertEqual(opt._tie_dimension_target({
+            "quality": {"gain": 10.0},
+            "clarity": {"gain": 20.0},
+            "correctness": {"gain": 20.0},
+        }), "clarity")
+
+    async def test_disabled_feature_preserves_tied_candidate_behavior(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "lessons.jsonl")
+            opt = make_optimizer(lesson_file=path)
+            dims = self._dimensions(clarity=90, correctness=70)
+            candidate = self._candidate(0, 80.0, dims)
+            result = await self._decide(
+                opt,
+                incumbent_dimensions=self._dimensions(clarity=70, correctness=90),
+                candidates=[candidate],
+                rescored=[candidate],
+            )
+            self.assertEqual(self._tie_lessons(path), [])
+        self.assertEqual(result["current_md"], "# Incumbent")
+        self.assertEqual(result["baseline_pct"], 80.0)
+        self.assertFalse(result["kept"])
+        self.assertNotIn("tie_dimension_lessons", result["round_memory"][0])
+
+    async def test_lower_higher_and_tied_without_advantage_do_not_learn(self):
+        cases = (
+            ("lower", 79.0, self._dimensions(clarity=100), False),
+            ("higher", 81.0, self._dimensions(clarity=100), True),
+            ("tie-no-advantage", 80.0, self._dimensions(clarity=70), False),
+        )
+        for name, score, dimensions, expected_kept in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                path = os.path.join(tmp, "lessons.jsonl")
+                opt = make_optimizer(
+                    lesson_file=path,
+                    cross_round_tie_dimension_lessons=True,
+                )
+                candidate = self._candidate(0, score, dimensions)
+                result = await self._decide(
+                    opt,
+                    incumbent_dimensions=self._dimensions(clarity=70),
+                    candidates=[candidate],
+                    rescored=[candidate],
+                )
+                self.assertEqual(self._tie_lessons(path, "cross_round"), [])
+                self.assertEqual(result["kept"], expected_kept)
+
+    async def test_isclose_total_learns_but_normalizes_total_scores_to_incumbent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "lessons.jsonl")
+            opt = make_optimizer(
+                lesson_file=path,
+                cross_round_tie_dimension_lessons=True,
+            )
+            candidate = self._candidate(
+                0, 80.0 - 5e-10, self._dimensions(clarity=90)
+            )
+            result = await self._decide(
+                opt,
+                incumbent_dimensions=self._dimensions(clarity=70),
+                candidates=[candidate],
+                rescored=[candidate],
+            )
+            lessons = self._tie_lessons(path, "cross_round")
+        self.assertEqual(len(lessons), 1)
+        self.assertEqual(lessons[0]["score_before"], 80.0)
+        self.assertEqual(lessons[0]["score_after"], 80.0)
+        self.assertFalse(result["kept"])
+        self.assertEqual(result["baseline_pct"], 80.0)
+
+    async def test_latest_kept_incumbent_survives_an_intervening_discarded_round(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "lessons.jsonl")
+            opt = make_optimizer(
+                lesson_file=path,
+                regression_check=False,
+                cross_round_tie_dimension_lessons=True,
+            )
+            scores = {
+                "# Initial": self._score(
+                    60, dimensions=self._dimensions(clarity=40, correctness=80)
+                ),
+                "# Latest incumbent": self._score(
+                    80, dimensions=self._dimensions(clarity=60, correctness=100)
+                ),
+                "# Discarded lower": self._score(
+                    70, dimensions=self._dimensions(clarity=95, correctness=45)
+                ),
+                "# Cross-round tie": self._score(
+                    80, dimensions=self._dimensions(clarity=90, correctness=70)
+                ),
+            }
+            mutations = [
+                {"description": "kept incumbent", "reasoning": "r",
+                 "new_skill_md": "# Latest incumbent"},
+                {"description": "lower candidate", "reasoning": "r",
+                 "new_skill_md": "# Discarded lower"},
+                {"description": "tie candidate", "reasoning": "r",
+                 "new_skill_md": "# Cross-round tie"},
+            ]
+
+            async def score(skill_md, *_args, **_kwargs):
+                return scores[skill_md]
+
+            with (
+                patch.object(opt, "_score_skill", new=score),
+                patch.object(
+                    opt, "_analyze_failures",
+                    new=AsyncMock(return_value=self._analysis()),
+                ),
+                patch.object(opt, "_mutate_skill", new=AsyncMock(side_effect=mutations)),
+            ):
+                result = await opt.optimize(
+                    {"SKILL.md": "# Initial"}, [], [], max_rounds=3,
+                )
+
+            lessons = self._tie_lessons(path, "cross_round")
+        self.assertEqual(result["improved_skill_md"], "# Latest incumbent")
+        self.assertEqual(result["final_score"], 80.0)
+        self.assertEqual(result["score_history"], [60.0, 80.0, 80.0, 80.0])
+        self.assertEqual([entry["kept"] for entry in result["mutation_log"]], [True, False, False])
+        self.assertEqual(len(lessons), 1)
+        clarity = lessons[0]["dimension_gains"]["clarity"]
+        # 参照 60 分 clarity 的最近 kept incumbent，而非初始版本的 40 分。
+        self.assertEqual(clarity, {
+            "candidate_pct": 90.0,
+            "winner_pct": 60.0,
+            "gain": 30.0,
+        })
+
+    async def test_all_scored_candidates_learn_and_each_candidate_aggregates_dimensions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "lessons.jsonl")
+            opt = make_optimizer(
+                lesson_file=path,
+                cross_round_tie_dimension_lessons=True,
+            )
+            incumbent = self._dimensions(clarity=60, correctness=60, quality=60)
+            first = self._candidate(
+                0, 80.0,
+                self._dimensions(clarity=90, correctness=75, quality=60),
+                strategy="rewrite_section",
+            )
+            second = self._candidate(
+                1, 80.0,
+                self._dimensions(clarity=60, correctness=65, quality=95),
+                strategy="add_example",
+            )
+            result = await self._decide(
+                opt,
+                incumbent_dimensions=incumbent,
+                candidates=[first, second],
+                rescored=[first, second],
+            )
+            lessons = self._tie_lessons(path, "cross_round")
+        self.assertEqual(len(lessons), 2)
+        by_strategy = {lesson["strategy"]: lesson for lesson in lessons}
+        self.assertEqual(
+            set(by_strategy["rewrite_section"]["dimension_gains"]),
+            {"clarity", "correctness"},
+        )
+        self.assertEqual(by_strategy["rewrite_section"]["target_dimension"], "clarity")
+        self.assertEqual(
+            set(by_strategy["add_example"]["dimension_gains"]),
+            {"correctness", "quality"},
+        )
+        self.assertEqual(by_strategy["add_example"]["target_dimension"], "quality")
+        self.assertFalse(result["kept"])
+        self.assertFalse(any(entry["kept"] for entry in result["mutation_log"]))
+        for record in result["round_memory"][0]["tie_dimension_lessons"]:
+            self.assertNotIn("candidate_id", record)
+        for lesson in lessons:
+            self.assertNotIn("candidate_id", lesson)
+
+    async def test_same_round_and_cross_round_paths_deduplicate_candidate_dimension(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "lessons.jsonl")
+            opt = make_optimizer(
+                lesson_file=path,
+                tie_dimension_lessons=True,
+                cross_round_tie_dimension_lessons=True,
+            )
+            incumbent = self._dimensions(clarity=70)
+            microscopic_winner = self._candidate(
+                0, 80.0 + 5e-10, incumbent, strategy="add_example"
+            )
+            tied_nonwinner = self._candidate(
+                1, 80.0, self._dimensions(clarity=90), strategy="rewrite_section"
+            )
+            await self._decide(
+                opt,
+                incumbent_dimensions=incumbent,
+                candidates=[microscopic_winner, tied_nonwinner],
+                rescored=[microscopic_winner, tied_nonwinner],
+            )
+            lessons = self._tie_lessons(path)
+        self.assertEqual(len(lessons), 1)
+        self.assertEqual(lessons[0]["comparison_scope"], "same_round")
+        self.assertEqual(set(lessons[0]["dimension_gains"]), {"clarity"})
+
+    async def test_guard_edit_limit_and_unscored_candidates_cannot_learn(self):
+        # 回归守卫与编辑幅度拒绝都必须发生在评分前。
+        rejection_cases = (
+            (
+                "regression",
+                make_optimizer(
+                    cross_round_tie_dimension_lessons=True,
+                    regression_check=True,
+                ),
+                "---\nname: safe\n---\n# Broken without frontmatter",
+                "# Broken without frontmatter",
+            ),
+            (
+                "edit-limit",
+                make_optimizer(
+                    cross_round_tie_dimension_lessons=True,
+                    regression_check=False,
+                    edit_limit=0.1,
+                ),
+                "# S\n" + "a" * 100,
+                "# S\n" + "a" * 100 + "b" * 50,
+            ),
+        )
+        for name, opt, original_md, candidate_md in rejection_cases:
+            baseline = self._score(
+                80, dimensions=self._dimensions(clarity=70)
+            )
+            mutation = {
+                "description": "must not learn",
+                "reasoning": "r",
+                "new_skill_md": candidate_md,
+            }
+            with self.subTest(name=name):
+                with (
+                    patch.object(
+                        opt, "_score_skill", new=AsyncMock(return_value=baseline)
+                    ) as scorer,
+                    patch.object(
+                        opt, "_analyze_failures",
+                        new=AsyncMock(return_value=self._analysis()),
+                    ),
+                    patch.object(
+                        opt, "_mutate_skill", new=AsyncMock(return_value=mutation)
+                    ),
+                ):
+                    result = await opt.optimize(
+                        {"SKILL.md": original_md}, [], [], max_rounds=1
+                    )
+                    self.assertEqual(scorer.await_count, 1)
+                    self.assertFalse(result["mutation_log"][0]["kept"])
+
+        # guard 的 score_after 只是占位基线；没有出现在 rescored 的候选不算完成评分。
+        opt = make_optimizer(cross_round_tie_dimension_lessons=True)
+        unscored = self._candidate(0, 80.0, self._dimensions(clarity=100))
+        result = await self._decide(
+            opt,
+            incumbent_dimensions=self._dimensions(clarity=70),
+            candidates=[unscored],
+            rescored=[],
+        )
+        self.assertNotIn("tie_dimension_lessons", result["round_memory"][0])
+        self.assertFalse(result["kept"])
+
+    async def test_confirmation_failed_candidate_cannot_learn(self):
+        opt = make_optimizer(cross_round_tie_dimension_lessons=True)
+        candidate = self._candidate(0, 80.0, self._dimensions(clarity=95))
+        result = await self._decide(
+            opt,
+            incumbent_dimensions=self._dimensions(clarity=70),
+            candidates=[candidate],
+            rescored=[candidate],
+            confirmation={
+                "candidate_id": 0,
+                "passed": False,
+                "runs": 1,
+                "incumbent_scores": [80.0],
+                "challenger_scores": [80.0],
+                "confirmed_score": 80.0,
+            },
+        )
+        self.assertNotIn("tie_dimension_lessons", result["round_memory"][0])
+        self.assertFalse(result["kept"])
+        self.assertEqual(result["mutation_log"][0]["reason"], "confirmation_failed")
+
+    async def test_tied_candidate_does_not_trigger_confirmation_but_still_learns(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "lessons.jsonl")
+            opt = make_optimizer(
+                lesson_file=path,
+                regression_check=False,
+                candidate_confirm_runs=2,
+                cross_round_tie_dimension_lessons=True,
+            )
+            baseline = self._score(
+                80, dimensions=self._dimensions(clarity=70)
+            )
+            tied = self._score(
+                80, dimensions=self._dimensions(clarity=90)
+            )
+            with (
+                patch.object(
+                    opt, "_score_skill", new=AsyncMock(side_effect=[baseline, tied])
+                ) as scorer,
+                patch.object(
+                    opt, "_analyze_failures",
+                    new=AsyncMock(return_value=self._analysis()),
+                ),
+                patch.object(opt, "_mutate_skill", new=AsyncMock(return_value={
+                    "description": "clarity metadata",
+                    "reasoning": "r",
+                    "new_skill_md": "# Tie",
+                })),
+            ):
+                result = await opt.optimize({"SKILL.md": "# Original"}, [], [], max_rounds=1)
+            lessons = self._tie_lessons(path, "cross_round")
+        self.assertEqual(scorer.await_count, 2)
+        self.assertEqual(len(lessons), 1)
+        self.assertFalse(result["mutation_log"][0]["kept"])
+        self.assertNotEqual(result["mutation_log"][0]["reason"], "confirmation_failed")
+
+    async def test_tie_lesson_does_not_mutate_incumbent_state(self):
+        opt = make_optimizer(cross_round_tie_dimension_lessons=True)
+        incumbent_dimensions = self._dimensions(clarity=70, correctness=90)
+        candidate = self._candidate(
+            0, 80.0, self._dimensions(clarity=90, correctness=70)
+        )
+        result = await self._decide(
+            opt,
+            incumbent_dimensions=incumbent_dimensions,
+            candidates=[candidate],
+            rescored=[candidate],
+        )
+        self.assertEqual(result["current_md"], "# Incumbent")
+        self.assertEqual(result["baseline_pct"], 80.0)
+        self.assertEqual(result["current_dimension_scores"], incumbent_dimensions)
+        self.assertEqual(result["score_history"], [80.0])
+        self.assertFalse(result["mutation_log"][0]["kept"])
+
+    async def test_cross_round_quality_gate_ignores_gain_but_honors_final_waterline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pass_path = os.path.join(tmp, "pass.jsonl")
+            blocked_path = os.path.join(tmp, "blocked.jsonl")
+            candidate = self._candidate(0, 80.0, self._dimensions(clarity=90))
+            incumbent = self._dimensions(clarity=70)
+
+            ignores_gain = make_optimizer(
+                lesson_file=pass_path,
+                lesson_min_gain=999.0,
+                lesson_min_final=0.0,
+                cross_round_tie_dimension_lessons=True,
+            )
+            pass_result = await self._decide(
+                ignores_gain,
+                incumbent_dimensions=incumbent,
+                candidates=[candidate],
+                rescored=[candidate],
+            )
+            self.assertEqual(len(self._tie_lessons(pass_path, "cross_round")), 1)
+
+            at_waterline_path = os.path.join(tmp, "at-waterline.jsonl")
+            at_waterline = make_optimizer(
+                lesson_file=at_waterline_path,
+                lesson_min_gain=999.0,
+                lesson_min_final=80.0,
+                cross_round_tie_dimension_lessons=True,
+            )
+            await self._decide(
+                at_waterline,
+                incumbent_dimensions=incumbent,
+                candidates=[candidate],
+                rescored=[candidate],
+            )
+            self.assertEqual(
+                len(self._tie_lessons(at_waterline_path, "cross_round")), 1
+            )
+
+            below_waterline = make_optimizer(
+                lesson_file=blocked_path,
+                lesson_min_gain=0.0,
+                lesson_min_final=80.001,
+                cross_round_tie_dimension_lessons=True,
+            )
+            blocked_result = await self._decide(
+                below_waterline,
+                incumbent_dimensions=incumbent,
+                candidates=[candidate],
+                rescored=[candidate],
+            )
+            self.assertEqual(self._tie_lessons(blocked_path, "cross_round"), [])
+
+        # 持久化水位不影响当轮 advisory memory。
+        self.assertIn("tie_dimension_lessons", pass_result["round_memory"][0])
+        self.assertIn("tie_dimension_lessons", blocked_result["round_memory"][0])
+
+    def test_jsonl_round_trip_and_legacy_scope_normalization(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "lessons.jsonl")
+            SkillOptimizer._append_lesson(path, {
+                "strategy": "legacy",
+                "lesson_type": "tie_dimension",
+                "dimension_gains": {"clarity": {"gain": 10.0}},
+            })
+            SkillOptimizer._append_lesson(path, {
+                "strategy": "cross",
+                "lesson_type": "tie_dimension",
+                "comparison_scope": "cross_round",
+                "target_dimension": "quality",
+                "dimension_gains": {"quality": {"gain": 20.0}},
+            })
+            legacy, cross = SkillOptimizer._load_lessons(path, limit=10)
+        self.assertEqual(legacy["comparison_scope"], "same_round")
+        self.assertEqual(cross["comparison_scope"], "cross_round")
+        self.assertEqual(cross["target_dimension"], "quality")
+
+    def test_sqlite_legacy_schema_migrates_and_round_trips_scope(self):
+        import sqlite3
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "lessons.db")
+            conn = sqlite3.connect(path)
+            try:
+                conn.execute(
+                    "CREATE TABLE lessons ("
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                    "skill_name TEXT, domain TEXT, skill_description TEXT,"
+                    "strategy TEXT, diagnosis TEXT, summary TEXT,"
+                    "score_before REAL, score_after REAL, created_at TEXT,"
+                    "embedding BLOB, lesson_type TEXT, dimension_gains TEXT,"
+                    "target_dimension TEXT)"
+                )
+                conn.execute(
+                    "INSERT INTO lessons (strategy, lesson_type, dimension_gains, "
+                    "target_dimension) VALUES (?, ?, ?, ?)",
+                    (
+                        "legacy", "tie_dimension",
+                        json.dumps({"clarity": {"gain": 10.0}}), "clarity",
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            SkillOptimizer._append_lesson(path, {
+                "strategy": "cross",
+                "lesson_type": "tie_dimension",
+                "comparison_scope": "cross_round",
+                "target_dimension": "quality",
+                "dimension_gains": {"quality": {"gain": 20.0}},
+            })
+            loaded = SkillOptimizer._load_lessons(path, limit=10)
+            conn = sqlite3.connect(path)
+            try:
+                columns = {
+                    row[1] for row in conn.execute("PRAGMA table_info(lessons)")
+                }
+            finally:
+                conn.close()
+        self.assertIn("comparison_scope", columns)
+        self.assertEqual(loaded[0]["comparison_scope"], "same_round")
+        self.assertEqual(loaded[1]["comparison_scope"], "cross_round")
+        self.assertEqual(loaded[1]["dimension_gains"]["quality"]["gain"], 20.0)
+
+    async def test_cross_round_dimension_metadata_is_a_weak_dimension_signal(self):
+        opt = make_optimizer(
+            lesson_rag_pipeline="quality_diverse",
+            lesson_signal_weights={"semantic": 1, "dimension": 5},
+        )
+        lessons = [
+            {
+                "strategy": "cross-clarity",
+                "summary": "rewrite guidance",
+                "lesson_type": "tie_dimension",
+                "comparison_scope": "cross_round",
+                "target_dimension": "clarity",
+                "dimension_gains": {"clarity": {"gain": 20.0}},
+                "embedding": [1.0, 0.0],
+            },
+            {
+                "strategy": "same-correctness",
+                "summary": "rewrite guidance",
+                "lesson_type": "tie_dimension",
+                "comparison_scope": "same_round",
+                "target_dimension": "correctness",
+                "dimension_gains": {"correctness": {"gain": 20.0}},
+                "embedding": [1.0, 0.0],
+            },
+        ]
+        context = {"weak_dimensions": [{"dimension": "clarity", "pct": 25.0}]}
+        with patch.object(opt, "_embed", new=AsyncMock(return_value=[1.0, 0.0])):
+            top = await opt._retrieve_lessons(
+                lessons, "rewrite guidance", "hybrid", 2, context=context,
+            )
+        self.assertEqual(top[0]["strategy"], "cross-clarity")
+        self.assertIn("weak_dimension", top[0]["_retrieval"]["matched"])
+
+    def test_prompt_whitelist_keeps_scope_but_drops_internal_and_raw_fields(self):
+        opt = make_optimizer(lesson_rag_pipeline="quality_diverse")
+        compact = opt._compact_lessons_for_prompt([{
+            "strategy": "rewrite_section",
+            "summary": "clarify workflow",
+            "lesson_type": "tie_dimension",
+            "comparison_scope": "cross_round",
+            "target_dimension": "clarity",
+            "dimension_gains": {"clarity": {"gain": 20.0}},
+            "_id": 42,
+            "embedding": [1.0, 0.0],
+            "candidate_id": 7,
+            "skill_md": "PRIVATE SKILL BODY",
+            "scenarios": ["PRIVATE SCENARIO"],
+            "output": "PRIVATE OUTPUT",
+            "api_key": "PRIVATE KEY",
+        }])[0]
+        self.assertEqual(compact["comparison_scope"], "cross_round")
+        for forbidden in (
+            "_id", "embedding", "candidate_id", "skill_md", "scenarios", "output", "api_key"
+        ):
+            self.assertNotIn(forbidden, compact)
+
+    async def test_cross_round_mode_refreshes_rag_each_round_with_latest_incumbent(self):
+        opt = make_optimizer(
+            regression_check=False,
+            parallelism=2,
+            cross_round_tie_dimension_lessons=True,
+        )
+        scores = {
+            "# Original": self._score(
+                80, dimensions=self._dimensions(clarity=70, correctness=90),
+                details=[{"eval_id": 1, "passed": False, "reason": "original"}],
+            ),
+            "# Winner": self._score(
+                90, dimensions=self._dimensions(clarity=80, correctness=100),
+                details=[{"eval_id": 1, "passed": False, "reason": "winner"}],
+            ),
+            "# Historical tie": self._score(
+                80, dimensions=self._dimensions(clarity=95, correctness=65)
+            ),
+            "# Low A": self._score(70, dimensions=self._dimensions(clarity=70)),
+            "# Low B": self._score(60, dimensions=self._dimensions(clarity=60)),
+        }
+        mutations = [
+            {"description": "winner", "reasoning": "r", "new_skill_md": "# Winner"},
+            {"description": "cross tie", "reasoning": "r", "new_skill_md": "# Historical tie"},
+            {"description": "low a", "reasoning": "r", "new_skill_md": "# Low A"},
+            {"description": "low b", "reasoning": "r", "new_skill_md": "# Low B"},
+        ]
+        recalled = {
+            "strategy": "rewrite_section",
+            "summary": "round-one cross tie",
+            "lesson_type": "tie_dimension",
+            "comparison_scope": "cross_round",
+            "target_dimension": "clarity",
+            "dimension_gains": {"clarity": {"gain": 25.0}},
+        }
+        prepared = AsyncMock(side_effect=[[], [recalled]])
+        analyst_lessons = []
+
+        async def score(skill_md, *_args, **_kwargs):
+            return scores[skill_md]
+
+        async def analyze(*_args, **kwargs):
+            analyst_lessons.append(kwargs.get("lessons", []))
+            return self._analysis()
+
+        with (
+            patch.object(opt, "_score_skill", new=score),
+            patch.object(opt, "_prepare_lessons", new=prepared),
+            patch.object(opt, "_analyze_failures", new=analyze),
+            patch.object(opt, "_mutate_skill", new=AsyncMock(side_effect=mutations)),
+        ):
+            result = await opt.optimize(
+                {"SKILL.md": "# Original"}, [], [], max_rounds=2,
+                parallel_mutations=2,
+            )
+
+        self.assertEqual(prepared.await_count, 2)
+        self.assertEqual(prepared.await_args_list[0].args[0], "# Original")
+        self.assertEqual(prepared.await_args_list[1].args[0], "# Winner")
+        self.assertEqual(analyst_lessons, [[], [recalled]])
+        self.assertEqual(result["improved_skill_md"], "# Winner")
+
+    async def test_disabled_mode_does_not_add_per_round_rag_refresh(self):
+        opt = make_optimizer(regression_check=False)
+        baseline = self._score(80, dimensions=self._dimensions(clarity=70))
+        same = self._score(80, dimensions=self._dimensions(clarity=90))
+        prepare = AsyncMock(return_value=[])
+        with (
+            patch.object(
+                opt, "_score_skill", new=AsyncMock(side_effect=[baseline, same, same])
+            ),
+            patch.object(opt, "_prepare_lessons", new=prepare),
+            patch.object(
+                opt, "_analyze_failures", new=AsyncMock(return_value=self._analysis())
+            ),
+            patch.object(opt, "_mutate_skill", new=AsyncMock(return_value={
+                "description": "same", "reasoning": "r", "new_skill_md": "# Same",
+            })),
+        ):
+            await opt.optimize({"SKILL.md": "# Original"}, [], [], max_rounds=2)
+        self.assertEqual(prepare.await_count, 1)
+
+    async def test_cooperative_stop_runs_before_next_round_rag_refresh(self):
+        stop_values = iter([False, False, True])
+        opt = make_optimizer(
+            regression_check=False,
+            cross_round_tie_dimension_lessons=True,
+            stop_provider=lambda: next(stop_values),
+        )
+        baseline = self._score(80, dimensions=self._dimensions(clarity=70))
+        tied = self._score(80, dimensions=self._dimensions(clarity=90))
+        prepare = AsyncMock(return_value=[])
+        with (
+            patch.object(opt, "_score_skill", new=AsyncMock(side_effect=[baseline, tied])),
+            patch.object(opt, "_prepare_lessons", new=prepare),
+            patch.object(
+                opt, "_analyze_failures", new=AsyncMock(return_value=self._analysis())
+            ),
+            patch.object(opt, "_mutate_skill", new=AsyncMock(return_value={
+                "description": "tie", "reasoning": "r", "new_skill_md": "# Tie",
+            })),
+        ):
+            with self.assertRaises(StopOptimizationError):
+                await opt.optimize({"SKILL.md": "# Original"}, [], [], max_rounds=2)
+        self.assertEqual(prepare.await_count, 1)
+
+    async def test_persistence_excludes_skill_scenarios_outputs_and_credentials(self):
+        raw_skill = "PRIVATE_SKILL_BODY"
+        raw_scenario = "PRIVATE_SCENARIO_INPUT"
+        raw_output = "PRIVATE_EXECUTOR_OUTPUT"
+        secret = "sk-" + "A" * 32
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "lessons.jsonl")
+            original_md = f"---\nname: safe-skill\n---\n# Skill\n{raw_skill}"
+            candidate_md = original_md + "\nPRIVATE_CANDIDATE_BODY"
+            opt = make_optimizer(
+                api_key=secret,
+                lesson_file=path,
+                regression_check=False,
+                cross_round_tie_dimension_lessons=True,
+            )
+            baseline = self._score(
+                80,
+                dimensions=self._dimensions(clarity=70),
+                details=[{"output": raw_output, "reason": "baseline detail"}],
+            )
+            tied = self._score(
+                80,
+                dimensions=self._dimensions(clarity=90),
+                details=[{"output": raw_output, "reason": "candidate detail"}],
+            )
+            with (
+                patch.object(opt, "_score_skill", new=AsyncMock(side_effect=[baseline, tied])),
+                patch.object(
+                    opt, "_analyze_failures", new=AsyncMock(return_value=self._analysis())
+                ),
+                patch.object(opt, "_mutate_skill", new=AsyncMock(return_value={
+                    "description": "clarity improved",
+                    "reasoning": "model metadata",
+                    "new_skill_md": candidate_md,
+                })),
+            ):
+                result = await opt.optimize(
+                    {"SKILL.md": original_md},
+                    [{"id": 1, "input": raw_scenario}],
+                    [{"id": 1, "question": "PRIVATE_EVAL_TEXT"}],
+                    max_rounds=1,
+                )
+            with open(path, encoding="utf-8") as lesson_file:
+                persisted = lesson_file.read()
+
+        self.assertFalse(result["mutation_log"][0]["kept"])
+        for forbidden in (
+            raw_skill,
+            "PRIVATE_CANDIDATE_BODY",
+            raw_scenario,
+            "PRIVATE_EVAL_TEXT",
+            raw_output,
+            secret,
+        ):
+            self.assertNotIn(forbidden, persisted)
 
 
 class TestWeakDimensionFocus(unittest.IsolatedAsyncioTestCase):
