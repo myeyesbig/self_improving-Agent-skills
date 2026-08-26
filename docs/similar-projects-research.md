@@ -128,14 +128,14 @@ SkillForge 选择轻量的 `OPTIMIZATION_SEARCH=adaptive`：保持当前最优�
 
 本轮复核了三个可直接映射到 SkillForge、且无需引入框架的主来源：
 
-- [FlagEmbedding](https://github.com/FlagOpen/FlagEmbedding) 的 BGE-M3 路线把 dense、sparse 与 multi-vector 视为互补信号，并建议在初筛后使用 cross-encoder reranker。SkillForge 保留现有 DashScope embedding / `gte-rerank`，但把“词面与语义互补”落实为轻量多信号排序。
+- [FlagEmbedding](https://github.com/FlagOpen/FlagEmbedding) 的 BGE-M3 路线把 dense、sparse 与 multi-vector 视为互补信号，并建议在初筛后使用 cross-encoder reranker。SkillForge 保留现有 DashScope embedding / `qwen3-rerank`，但把“词面与语义互补”落实为轻量多信号排序。
 - [Qdrant](https://github.com/qdrant/qdrant) 同时提供 dense+sparse hybrid、RRF/DBSF、payload filtering、MMR 与 relevance feedback。SkillForge 借鉴 metadata soft boost、候选融合和 MMR 多样性，不引入向量数据库，也不持久化用户内容或反馈。
 - [Haystack](https://github.com/deepset-ai/haystack) 的多检索器路径会并行汇总、去重并用 RRF 融合。SkillForge 对应地在一个本地函数内完成候选池、近重复删除与确定性归并，避免引入新依赖。
 
 此前管线的主要问题不是“没有 embedding”，而是排序目标太单薄：同技能、同领域、弱维度、历史收益与经验重复度都没有进入最终选择；中文词面又会被 ASCII-only tokenizer 忽略；SQLite embedding 还可能被一起注入 prompt。新版 `LESSON_RAG_PIPELINE=quality_diverse` 因此采用：
 
 1. embedding 语义、中文/英文词面、技能、领域、弱维度、历史质量和时序七信号加权；
-2. `gte-rerank` 仍为可选的候选级交叉编码器，并与确定性质量分融合；
+2. `qwen3-rerank` 仍为可选的候选级交叉编码器，并与确定性质量分融合；
 3. 近重复过滤后用 MMR 式贪心选择，避免 top-K 都是同一个建议的改写；
 4. 只把白名单元数据注入模型，并设置总字符预算；内部 ID 与 embedding 永不进入 prompt；
 5. 任一 embedding/rerank 异常仍静默降级 tag，默认 `classic` 完全保留旧路径。

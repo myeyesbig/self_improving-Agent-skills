@@ -2992,6 +2992,10 @@ class TestLessonDashScopeKeySeparation(unittest.TestCase):
         self.assertEqual(
             fake_dashscope.TextReRank.call.call_args.kwargs["api_key"], "rag-key"
         )
+        self.assertEqual(
+            fake_dashscope.TextReRank.call.call_args.kwargs["model"],
+            "qwen3-rerank",
+        )
 
     def test_rag_calls_fall_back_to_optimizer_key_without_env(self):
         opt = make_optimizer(api_key="generation-key", model="glm-4-flash")

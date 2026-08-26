@@ -270,7 +270,7 @@ SkillForge 提供一组**可选**优化旋钮，全部默认等价于经典行�
 | `LESSON_RETRIEVAL` | 环境变量 | off | 经验注入方式：`off`（最近 N 条）/ `tag`（同技能硬过滤）/ `semantic`（embedding 语义检索）/ `hybrid`（dense+sparse 混合）。semantic/hybrid 需要经验库使用 `.db` 后缀（SQLite）并调用 DashScope text-embedding-v3 |
 | `LESSON_THRESHOLD` | 环境变量 | 0.3 | semantic 检索的余弦相似度阈值（0~1） |
 | `LESSON_TOP_K` | 环境变量 | 5 | semantic/hybrid 检索后注入的经验条数（与 LESSON_N 读取条数独立） |
-| `LESSON_RERANK` | 环境变量 | 0（关闭） | 开启后对检索候选池调用 DashScope gte-rerank 重排再取 top-K；失败时保留重排前顺序 |
+| `LESSON_RERANK` | 环境变量 | 0（关闭） | 开启后对检索候选池调用 DashScope qwen3-rerank 重排再取 top-K；失败时保留重排前顺序。北京地域当前有条件限时免费额度，超出后按输入 Token 计费 |
 | `LESSON_RERANK_POOL` | 环境变量 | 20 | rerank 的候选池大小 |
 | `LESSON_RAG_PIPELINE` | 环境变量 | classic | `classic` 保持原排序；`quality_diverse` 开启语义/词面/技能/领域/弱维度/历史收益/时序多信号排序，再去重并做多样性选择 |
 | `LESSON_CANDIDATE_POOL` | 环境变量 | 20 | `quality_diverse` 在去重与多样性选择前保留的候选数 |

@@ -131,7 +131,7 @@ score_after > baseline + improvement_threshold + noise_floor   ← 严格高于
 | 普通经验质量门 | `LESSON_MIN_GAIN`（提升幅度）或 `LESSON_MIN_FINAL`（最终水位）任一达标才沉淀；默认关闭（任何保留的修改都沉淀） |
 | 同分维度经验 | `lesson_type=tie_dimension`，通过 `comparison_scope=same_round/cross_round` 区分比较范围；候选正文永不保留 |
 | 检索模式 | `LESSON_RETRIEVAL`：`off`（默认，最近 N 条）/ `tag`（同技能硬过滤）/ `semantic`（embedding 检索）/ `hybrid`（dense+sparse 混合） |
-| embedding / rerank | 走 DashScope `text-embedding-v3` 与 `gte-rerank`；embedding/检索失败降级到 tag，rerank 失败保留重排前顺序 |
+| embedding / rerank | 走 DashScope `text-embedding-v3` 与 `qwen3-rerank`；embedding/检索失败降级到 tag，rerank 失败保留重排前顺序 |
 | 范围限制 | 只存**模型生成的 lesson 元数据**，绝不存技能内容、场景、输出或 API Key |
 
 > **默认关闭**：不设 `SKILL_LESSONS_FILE` 时系统表现与未引入经验库前完全一致。
@@ -359,7 +359,7 @@ improved_skill.zip
 | `LESSON_N` | `5` | `off`/`tag` 模式读取的最近经验条数 |
 | `LESSON_THRESHOLD` | `0.3` | semantic 模式余弦相似度阈值（0–1） |
 | `LESSON_TOP_K` | `5` | semantic/hybrid 模式注入 Analyst 的经验条数 |
-| `LESSON_RERANK` | `0`（关闭） | 开启后对检索候选池用 `gte-rerank` 重排再取 top-K |
+| `LESSON_RERANK` | `0`（关闭） | 开启后对检索候选池用 `qwen3-rerank` 重排再取 top-K；北京地域有条件限时免费额度，超出后按输入 Token 计费 |
 | `LESSON_RERANK_POOL` | `20` | rerank 候选池大小 |
 | `LESSON_RAG_PIPELINE` | `classic` | `classic` 保持旧排序；`quality_diverse` 开启多信号质量排序、去重和多样性选择 |
 | `LESSON_CANDIDATE_POOL` | `20` | 新管线在去重/多样性选择前保留的候选数 |
@@ -455,7 +455,7 @@ LESSON_MIN_FINAL=85 \
 
 `LESSON_MIN_GAIN=15` 与 `LESSON_MIN_FINAL=85` 对普通成功经验和同轮 tie 经验维持 OR 语义，用来过滤「小幅修修补补」造成的经验库噪音。跨轮 tie 的总分增益真实为 0，因此不使用 `LESSON_MIN_GAIN`；它先通过自己的维度增益门，再将已启用的 `LESSON_MIN_FINAL` 作为额外持久化水位。未过最终水位的元数据仍可在当前会话的轮间记忆中使用。
 
-新版管线先用 embedding、中文/英文词面、技能、领域、目标弱维度、历史提升幅度/最终分和时序组成质量分；tie 经验的 `target_dimension` / `dimension_gains` 会贡献 dimension signal，`comparison_scope` 也在 Prompt 白名单内用于区分同轮与跨轮。可选 `gte-rerank` 后，再删除近重复经验并做多样性选择。返回给模型的内容有字段白名单和字符预算，SQLite 中的内部 ID与向量不会进入 Prompt。embedding/检索失败自动回退到 `tag`，rerank 失败保留原排序；不设置 `LESSON_RAG_PIPELINE` 时行为与旧版一致。
+新版管线先用 embedding、中文/英文词面、技能、领域、目标弱维度、历史提升幅度/最终分和时序组成质量分；tie 经验的 `target_dimension` / `dimension_gains` 会贡献 dimension signal，`comparison_scope` 也在 Prompt 白名单内用于区分同轮与跨轮。可选 `qwen3-rerank` 后，再删除近重复经验并做多样性选择。返回给模型的内容有字段白名单和字符预算，SQLite 中的内部 ID与向量不会进入 Prompt。embedding/检索失败自动回退到 `tag`，rerank 失败保留原排序；不设置 `LESSON_RAG_PIPELINE` 时行为与旧版一致。
 
 首轮仍在 baseline 后准备经验；开启跨轮 tie 后，后续轮先检查协作式 stop，再在 Analyst 前重新读取/检索经验，以便上一轮新 lesson 立即生效。对于 `semantic`/`hybrid`，这意味着后续每轮至少可能多一次查询 embedding；启用 `LESSON_RERANK=1` 还可能多一次重排。不开跨轮开关时保持原先只准备经验的路径与成本。
 

@@ -328,7 +328,7 @@ class SkillOptimizer:
         self.lesson_top_k = max(1, int(lesson_top_k))
 
         # 【RAG 重排】LESSON_RERANK=1 时对 semantic/hybrid 的候选池调用 DashScope
-        # gte-rerank 重排后取 top-K；默认 0 关闭（保持现有排序）。候选池大小
+        # qwen3-rerank 重排后取 top-K；默认 0 关闭（保持现有排序）。候选池大小
         # 由 LESSON_RERANK_POOL 控制（默认 20）。
         if lesson_rerank is None:
             lesson_rerank = os.getenv("LESSON_RERANK", "0") != "0"
@@ -1821,13 +1821,13 @@ class SkillOptimizer:
                 self._update_lesson_embedding(self.lesson_file, lesson["_id"], vector)
 
     def _rerank_sync(self, query, docs):
-        """DashScope gte-rerank（同步；在 _rerank 的线程桥接里执行）。
+        """DashScope qwen3-rerank（同步；在 _rerank 的线程桥接里执行）。
 
         key 来源同 _embed_sync：DASHSCOPE_API_KEY 环境变量优先，否则主 key。
         """
         import dashscope
         resp = dashscope.TextReRank.call(
-            model="gte-rerank", query=query, documents=docs,
+            model="qwen3-rerank", query=query, documents=docs,
             api_key=os.getenv("DASHSCOPE_API_KEY") or self._api_key, top_n=len(docs),
         )
         if getattr(resp, "status_code", 500) != 200:
@@ -2051,10 +2051,10 @@ class SkillOptimizer:
         return compact
 
     async def _retrieve_lessons(self, lessons, query, mode, limit, context=None):
-        """semantic/hybrid 检索：embedding 余弦（+sparse/RRF）；可选 gte-rerank 重排。
+        """semantic/hybrid 检索：embedding 余弦（+sparse/RRF）；可选 qwen3-rerank 重排。
 
         【D 选项】LESSON_RERANK 开启时对候选池（前 max(limit, rerank_pool) 条）
-        调用 gte-rerank 重排后取 top-K；rerank 失败静默降级到原始排序。
+        调用 qwen3-rerank 重排后取 top-K；rerank 失败静默降级到原始排序。
         """
         if self.lesson_rag_pipeline == "quality_diverse":
             return await self._retrieve_lessons_quality_diverse(
