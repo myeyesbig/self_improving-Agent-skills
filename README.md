@@ -1,6 +1,6 @@
 # 🔥 SkillForge —— 自我进化型 Agent 技能锻造厂
 
-**SkillForge** 基于 **LangGraph** 状态图编排与 **阿里云百炼（DashScope）** 直调构建的技能自优化系统，自动改进你的 Agent 技能。上传一个技能，让智能体生成测试场景与评估标准，然后观察三个角色（Executor / Analyst / Mutator）通过迭代优化协作改进你的技能 —— 每一次变异都在砧台上被锤打、评估，只保留真正更强的版本。
+**SkillForge** 基于 **LangGraph** 状态图编排与 **阿里云百炼（DashScope）** 直调构建（可选 DeepSeek / 智谱 GLM）的技能自优化系统，自动改进你的 Agent 技能。上传一个技能，让智能体生成测试场景与评估标准，然后观察三个角色（Executor / Analyst / Mutator）通过迭代优化协作改进你的技能 —— 每一次变异都在砧台上被锤打、评估，只保留真正更强的版本。
 
 > 一个受 Karpathy「自动研究」方法论启发的个人项目：与其手动调提示词，不如定义成功标准，让 AI 自我进化。
 
@@ -57,7 +57,7 @@ skillforge/
 
 - **后端**：Python 3.10+、FastAPI、LangGraph、DashScope、Pydantic
 - **前端**：Next.js 15、React 19、Tailwind CSS v4、Recharts
-- **AI**：LangGraph 状态图编排的三角色循环，DashScope SDK 直调 Qwen（`qwen-plus`）；结构化输出走协议层 JSON mode + Pydantic 校验 + 宽容解析兜底
+- **AI**：LangGraph 状态图编排的三角色循环，DashScope SDK 直调 Qwen（`qwen-plus`），可用 `deepseek-` / `glm-` 模型名前缀按角色切换 DeepSeek / 智谱 GLM；结构化输出走协议层 JSON mode + Pydantic 校验 + 宽容解析兜底
 - **实时通信**：Server-Sent Events（SSE）实时推送优化进度
 
 ## 快速开始
@@ -269,7 +269,7 @@ SkillForge 提供一组**可选**优化旋钮，全部默认等价于经典行�
 | `LESSON_MIN_GAIN` | 环境变量 | 0（关闭） | 普通/同轮经验的提升幅度门槛（与 `LESSON_MIN_FINAL` 为 OR；推荐 15）；跨轮同分经验如实为零总分增益，忽略此门槛 |
 | `LESSON_MIN_FINAL` | 环境变量 | 0（关闭） | 最终水位门槛（推荐 85）；普通/同轮经验仍与 `MIN_GAIN` 为 OR，跨轮同分经验启用该值后必须达到此水位才持久化 |
 
-> **安全与不变量**：凭据字段恒为 `qwen_api_key`；密钥仅存组件内存与请求体，绝不落日志/会话/zip/git。一次变异仍只改 SKILL.md 一处；只有「严格提升」的变异才会被保留，回归守卫只会更严格，绝不会让技能退化。
+> **安全与不变量**：主凭据字段恒为 `qwen_api_key`；请求密钥仅存组件内存与请求体，可选的厂商/RAG 环境密钥仅由后端读取，两者都绝不落日志/会话/zip/git。一次变异仍只改 SKILL.md 一处；只有「严格提升」的变异才会被保留，回归守卫只会更严格，绝不会让技能退化。
 
 同分维度经验分为两个互不隐式联动的范围：
 
@@ -291,7 +291,7 @@ MUTATOR_MODEL=qwen-max \
 python backend/app.py
 ```
 
-任一角色模型名以 `deepseek-` 开头时，仅该角色走现有 DeepSeek 显式路由；密钥仍只通过请求体直传。
+任一角色模型名以 `deepseek-` 开头时，仅该角色走 DeepSeek 显式路由；以 `glm-` 开头时，仅该角色走智谱 Zhipu 显式路由。GLM 生成优先读取后端 `ZHIPU_API_KEY`，未设时回退到调用方传入的主 key；当 DeepSeek/GLM 生成与 DashScope embedding/rerank 并用时，用 `DASHSCOPE_API_KEY` 为 RAG 单独配置百炼凭据。
 
 在 `qwen_optimizer.py` 中调整模型：
 

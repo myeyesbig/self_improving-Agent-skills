@@ -29,7 +29,7 @@
 
 ### 1.1 系统总览与角色分工
 
-SkillForge 把「评估一个技能 → 找出问题 → 改一版 → 再评估」这件原本要人做的事，交给了三个职责单一的模型角色（Executor / Analyst / Mutator）。它们由 LangGraph 状态图编排、共用同一份 DashScope 配置（同一把 Key），互相不共享会话记忆，全部通过文件/进度事件进行协作。
+SkillForge 把「评估一个技能 → 找出问题 → 改一版 → 再评估」这件原本要人做的事，交给了三个职责单一的模型角色（Executor / Analyst / Mutator）。它们由 LangGraph 状态图编排，默认走 DashScope/Qwen，也可按角色显式选择 DeepSeek 或智谱 GLM；角色之间不共享会话记忆，全部通过文件/进度事件进行协作。
 
 | 智能体 | 角色 | 职责 | 输出结构 |
 |--------|------|------|----------|
@@ -306,13 +306,16 @@ improved_skill.zip
 | `parallel_mutations` | 后端 `MUTATION_PARALLELISM`，默认 1 | 1–3 | 每轮并行生成几个候选变异；并行时取分数最高者 |
 | `strategy_pool` | 全量 7 种 | 策略名数组 | 限定 Analyst 可选的变异策略；空数组 → 后端回退到全量 |
 | `improvement_threshold` | 0.0 | ≥ 0 | 候选提升必须 > `baseline + threshold + noise_floor` 才保留 |
-| `qwen_api_key` | 必填 | string | DashScope Key，仅存前端内存与请求体，不落盘 |
+| `qwen_api_key` | 必填 | string | 主凭据字段；Qwen 时为 DashScope Key，显式 GLM 路由未设 `ZHIPU_API_KEY` 时可作为智谱 key 回退；仅存前端内存与请求体，不落盘 |
 
 **环境变量**（启动后端前设置）：
 
 | 变量 | 默认 | 说明 |
 |------|------|------|
 | `QWEN_MODEL` | `qwen-plus` | 三个 Agent 共用的模型；`start-dev.sh` 默认 `qwen3.7-max-2026-05-17` |
+| `EXECUTOR_MODEL` / `ANALYST_MODEL` / `MUTATOR_MODEL` | 回退 `QWEN_MODEL` | 按角色选模型；`deepseek-` 前缀只走 DeepSeek，`glm-` 前缀只走智谱 GLM |
+| `ZHIPU_API_KEY` | 无 | GLM 生成的后端凭据，优先于调用方传入的主 key；不得写入日志或会话 |
+| `DASHSCOPE_API_KEY` | 无 | DeepSeek/GLM 做生成时，可单独为 lesson embedding/rerank 提供 DashScope 凭据 |
 | `QWEN_ENABLE_THINKING` | `0`（关闭） | 打开模型思考模式；某些日期快照模型强制要求开启 |
 | `MUTATION_PARALLELISM` | `1` | 默认并行变异数（与请求字段 `parallel_mutations` 同义） |
 | `IMPROVEMENT_THRESHOLD` | `0.0` | 提升阈值 |
@@ -379,8 +382,10 @@ improved_skill.zip
 ```bash
 QWEN_MODEL=qwen-max ./start-dev.sh            # 或写在 .env / shell rc
 QWEN_MODEL=qwen3.7-max-2026-05-17 QWEN_ENABLE_THINKING=1 ./start-dev.sh  # 强模型 + 思考模式
+EXECUTOR_MODEL=deepseek-chat ANALYST_MODEL=glm-4-flash MUTATOR_MODEL=glm-4-flash \
+ZHIPU_API_KEY='your-zhipu-key' ./start-dev.sh
 ```
-也支持在请求体内临时指定（参考 `SkillOptimizer.__init__` 的 `model=` 参数）。
+也支持在请求体内临时指定（参考 `SkillOptimizer.__init__` 的 `model=` 参数）。若同时开启 `semantic`/`hybrid` lesson 检索或 rerank，请另设 `DASHSCOPE_API_KEY`；该 key 只用于 DashScope embedding/rerank，不替换 GLM 生成 key。
 
 ### Q5. 怎么开启并行变异？收益与风险是什么？
 **答**：

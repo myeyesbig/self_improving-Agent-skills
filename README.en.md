@@ -1,6 +1,6 @@
 # 🔥 SkillForge — Forge Better Agent Skills
 
-**SkillForge** automatically optimizes your agent skills with a skill self-improvement system built on **LangGraph** state-graph orchestration and **Qwen via Alibaba Cloud Model Studio (DashScope)**. Upload a skill, let the agents generate test scenarios and evaluation criteria, then watch as three roles (Executor / Analyst / Mutator) collaborate to improve your skill through iterative optimization — every mutation is hammered on the anvil, scored, and kept only when it is genuinely stronger.
+**SkillForge** automatically optimizes your agent skills with a skill self-improvement system built on **LangGraph** state-graph orchestration and **Qwen via Alibaba Cloud Model Studio (DashScope)**, with optional DeepSeek / Zhipu GLM alternatives. Upload a skill, let the agents generate test scenarios and evaluation criteria, then watch as three roles (Executor / Analyst / Mutator) collaborate to improve your skill through iterative optimization — every mutation is hammered on the anvil, scored, and kept only when it is genuinely stronger.
 
 > A personal project inspired by Karpathy's autoresearch methodology: instead of hand-tuning prompts, define success criteria and let the AI improve itself.
 
@@ -58,7 +58,7 @@ skillforge/
 
 - **Backend**: Python 3.10+, FastAPI, LangGraph, DashScope, Pydantic
 - **Frontend**: Next.js 15, React 19, Tailwind CSS v4, Recharts
-- **AI**: LangGraph-orchestrated three-role loop with direct DashScope SDK calls to Qwen (`qwen-plus`) — structured output via protocol-level JSON mode + Pydantic validation + tolerant parsing fallback
+- **AI**: LangGraph-orchestrated three-role loop with direct DashScope SDK calls to Qwen (`qwen-plus`), plus per-role opt-in routing to DeepSeek (`deepseek-` prefix) or Zhipu GLM (`glm-` prefix) — structured output via protocol-level JSON mode + Pydantic validation + tolerant parsing fallback
 - **Real-time**: Server-Sent Events (SSE) for live optimization progress
 
 ## Quick Start
@@ -240,13 +240,15 @@ SkillForge exposes a set of **optional** optimization knobs, all defaulting to c
 | `LESSON_MIN_GAIN` | env var | 0 (off) | Lesson-persistence quality gate — minimum improvement: persist only when score_after − score_before ≥ value (OR semantics; suggested 15) |
 | `LESSON_MIN_FINAL` | env var | 0 (off) | Lesson-persistence quality gate — minimum final score: persist only when score_after ≥ value (OR semantics; suggested 85). Either dimension qualifying persists the lesson, filtering small-fix noise |
 
-> **Security & invariants**: the credential field is always `qwen_api_key`; the key lives only in component memory and the request body — never in logs, sessions, zips, or git. A mutation still changes exactly one spot in SKILL.md; only strictly-improving mutations are kept, and the regression guard is strictly protective — it can never let a skill degrade.
+> **Security & invariants**: the primary credential field remains `qwen_api_key`; request keys live only in component memory and the request body, while optional provider/RAG environment keys are read only by the backend. Neither path may enter logs, sessions, zips, or git. A mutation still changes exactly one spot in SKILL.md; only strictly-improving mutations are kept, and the regression guard is strictly protective — it can never let a skill degrade.
 
 In `qwen_optimizer.py`, adjust the model:
 
 ```python
 def __init__(self, api_key: str, model: Optional[str] = None):  # defaults to QWEN_MODEL or "qwen-plus"
 ```
+
+A role model name starting with `deepseek-` routes only that role through the explicit DeepSeek route; `glm-` routes it through Zhipu GLM. GLM generation prefers the backend-only `ZHIPU_API_KEY` and otherwise falls back to the caller's primary key. When DeepSeek/GLM generation is combined with DashScope embedding or reranking, configure `DASHSCOPE_API_KEY` separately for RAG.
 
 ## Development
 

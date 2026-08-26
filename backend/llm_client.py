@@ -1,12 +1,12 @@
 # =============================================================================
-# 【文件头】llm_client.py —— LLM 直调薄封装（DashScope 为主，DeepSeek 可选）
+# 【文件头】llm_client.py —— LLM 直调薄封装（DashScope 为主，DeepSeek/GLM 可选）
 # 职责：发起生成调用并提供三件小事：
 #         1. to_thread 桥接（SDK/requests 是同步的，放进工作线程不阻塞事件循环）
 #         2. 对网络/限流类异常做指数退避重试（解析错误不重试）
 #         3. 可选 JSON mode（response_format={"type": "json_object"}）
-# 服务选择（显式、非通用抽象，见 AGENTS.md 2026-08-11 DeepSeek 例外）：
-#   - 模型名以 deepseek- 开头 → DeepSeek OpenAI 兼容 API（api.deepseek.com），
-#     key 从 DEEPSEEK_API_KEY 环境变量读取（缺失即报错）
+# 服务选择（显式、非通用抽象，见 AGENTS.md 例外条款）：
+#   - 模型名以 deepseek- 开头 → DeepSeek OpenAI 兼容 API（api.deepseek.com）
+#   - 模型名以 glm- 开头 → 智谱 Zhipu OpenAI 兼容 API（open.bigmodel.cn）
 #   - 其余模型 → 阿里云百炼 DashScope（默认主服务，key 由调用方直传）
 # 安全：key 只存在于本对象/环境变量中，绝不打印、不落日志、不序列化进任何
 #       返回结构。
@@ -17,9 +17,10 @@
 """Thin async wrapper around the LLM chat APIs.
 
 DashScope is the default and primary service (direct ``Generation.call``, same
-SDK family as the lesson-store embedding / rerank). As an explicit, non-generic
-extension, model names with the ``deepseek-`` prefix are routed to DeepSeek's
-OpenAI-compatible REST API. Responsibilities are deliberately limited:
+SDK family as the lesson-store embedding / rerank). As explicit, non-generic
+extensions, model names with the ``deepseek-`` prefix are routed to DeepSeek's
+OpenAI-compatible REST API, and model names with the ``glm-`` prefix are routed
+to Zhipu's OpenAI-compatible REST API. Responsibilities are deliberately limited:
   1. bridge synchronous calls through ``asyncio.to_thread``,
   2. retry transient failures (network / rate-limit) with exponential backoff,
   3. optional JSON mode via ``response_format``.
@@ -43,10 +44,21 @@ REQUEST_TIMEOUT = 120   # 单次生成请求超时（秒）
 # -- DeepSeek（可选 provider，AGENTS.md 2026-08-11 例外）---------------------
 DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
 
+# -- Zhipu GLM（可选 provider，AGENTS.md 2026-08-17 例外）-----------
+ZHIPU_API_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+# GLM-4-Flash 长生成较慢（实测 ~1100 字符需 42s），默认 120s 读超时会误杀
+# 写文档/邮件类技能的长输出调用，故该分支单独放宽到 300s。
+GLM_REQUEST_TIMEOUT = 300
+
 
 def _is_deepseek_model(model: str) -> bool:
     """显式路由：模型名以 deepseek- 前缀开头即走 DeepSeek API。"""
     return bool(model and model.startswith("deepseek-"))
+
+
+def _is_glm_model(model: str) -> bool:
+    """显式路由：模型名以 glm- 前缀开头即走智谱 Zhipu API。"""
+    return bool(model and model.startswith("glm-"))
 
 
 # 命中任一关键词视为瞬时故障，值得重试；大小写不敏感。
@@ -107,11 +119,14 @@ class LLMClient:
     def _call_once(self, system: str, user: str, json_mode: bool) -> str:
         """单次生成调用；非 200 状态码视为业务失败并抛 RuntimeError。
 
-        模型名以 deepseek- 开头时路由到 DeepSeek OpenAI 兼容 API，否则走
-        DashScope（默认主服务）。分支显式且固定，不引入通用 provider 抽象。
+        模型名以 deepseek- 开头时路由到 DeepSeek OpenAI 兼容 API，以 glm-
+        开头时路由到智谱 Zhipu OpenAI 兼容 API，否则走 DashScope（默认主
+        服务）。分支显式且固定，不引入通用 provider 抽象。
         """
         if _is_deepseek_model(self.model):
             return self._call_once_deepseek(system, user, json_mode)
+        if _is_glm_model(self.model):
+            return self._call_once_glm(system, user, json_mode)
         return self._call_once_dashscope(system, user, json_mode)
 
     def _call_once_dashscope(self, system: str, user: str, json_mode: bool) -> str:
@@ -160,8 +175,10 @@ class LLMClient:
           1. 前端 DeepSeek key（LLMClient.deepseek_api_key，双输入框场景）
           2. 前端通用 key（LLMClient.api_key，兼容旧前端只填一个框）
           3. DEEPSEEK_API_KEY 环境变量
-        三者皆无则报错。DeepSeek 不区分 enable_thinking（deepseek-reasoner
-        自带推理），因此不传该参数。
+        三者皆无则报错。经验库 embedding/rerank 与生成分离：检索侧单独读取
+        DASHSCOPE_API_KEY（见 qwen_optimizer 的 _embed_sync/_rerank_sync）。
+        DeepSeek 不区分 enable_thinking（deepseek-reasoner 自带推理），
+        因此不传该参数。
         """
         api_key = self._deepseek_api_key or self._api_key or os.getenv("DEEPSEEK_API_KEY")
         if not api_key:
@@ -195,6 +212,54 @@ class LLMClient:
             text = None
         if not text:
             raise RuntimeError("DeepSeek generation returned empty text")
+        return text
+
+    def _call_once_glm(self, system: str, user: str, json_mode: bool) -> str:
+        """智谱 Zhipu OpenAI 兼容 API（requests 直调，零新增依赖）。
+
+        key 来源（AGENTS.md 2026-08-17 例外条款，优先级从高到低）：
+          1. ZHIPU_API_KEY 环境变量（CLI/benchmark 多 key 场景：主 key 留给
+             DashScope 供经验库 embedding/rerank，生成走独立的智谱 key）
+          2. 调用方直传 key（LLMClient.api_key，仅用智谱时直接传主 key）
+        二者皆无则报错。智谱支持 response_format json_object，与 deepseek
+        分支同构。
+        """
+        api_key = os.getenv("ZHIPU_API_KEY") or self._api_key
+        if not api_key:
+            raise RuntimeError(
+                "No API key for Zhipu GLM: pass a Zhipu key to the optimizer "
+                "or set the ZHIPU_API_KEY environment variable"
+            )
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "temperature": self.temperature,
+            "stream": False,
+        }
+        if json_mode:
+            payload["response_format"] = {"type": "json_object"}
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        resp = requests.post(
+            ZHIPU_API_URL, json=payload, headers=headers, timeout=GLM_REQUEST_TIMEOUT,
+        )
+        if resp.status_code != 200:
+            # Do not echo the provider response body: it may contain request-derived
+            # material and must never flow into API errors or production logs.
+            if resp.status_code == 429 or resp.status_code >= 500:
+                raise RuntimeError(
+                    f"Zhipu GLM generation temporarily unavailable: HTTP {resp.status_code}"
+                )
+            raise RuntimeError(f"Zhipu GLM generation failed: HTTP {resp.status_code}")
+        data = resp.json()
+        try:
+            text = data["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError):
+            text = None
+        if not text:
+            raise RuntimeError("Zhipu GLM generation returned empty text")
         return text
 
     # -- 异步桥接 -------------------------------------------------------------

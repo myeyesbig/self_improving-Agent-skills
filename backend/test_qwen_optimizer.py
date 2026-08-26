@@ -27,7 +27,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from pydantic import ValidationError
 
-from llm_client import LLMClient
+from llm_client import GLM_REQUEST_TIMEOUT, LLMClient
 from qwen_optimizer import (
     ANALYST_SYSTEM_PROMPT,
     EXECUTOR_SYSTEM_PROMPT,
@@ -2935,6 +2935,66 @@ class TestLessonFailureContextAndBatching(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([lesson["strategy"] for lesson in lessons], ["a", "b"])
 
 
+class TestLessonDashScopeKeySeparation(unittest.TestCase):
+    """Generation credentials must stay separate from DashScope RAG calls."""
+
+    @staticmethod
+    def _fake_dashscope():
+        embedding_response = SimpleNamespace(
+            status_code=200,
+            output={"embeddings": [{"text_index": 0, "embedding": [1.0, 0.0]}]},
+        )
+        rerank_response = SimpleNamespace(
+            status_code=200,
+            output={"results": [{"index": 0, "relevance_score": 0.9}]},
+        )
+        return SimpleNamespace(
+            TextEmbedding=SimpleNamespace(call=MagicMock(return_value=embedding_response)),
+            TextReRank=SimpleNamespace(call=MagicMock(return_value=rerank_response)),
+        )
+
+    def test_dashscope_env_key_wins_for_all_rag_calls(self):
+        opt = make_optimizer(api_key="generation-key", model="glm-4-flash")
+        fake_dashscope = self._fake_dashscope()
+        with (
+            patch.dict("sys.modules", {"dashscope": fake_dashscope}),
+            patch.dict(os.environ, {"DASHSCOPE_API_KEY": "rag-key"}, clear=False),
+        ):
+            opt._embed_sync("single")
+            opt._embed_many_sync(["batch"])
+            opt._rerank_sync("query", ["document"])
+
+        embedding_keys = [
+            call.kwargs["api_key"]
+            for call in fake_dashscope.TextEmbedding.call.call_args_list
+        ]
+        self.assertEqual(embedding_keys, ["rag-key", "rag-key"])
+        self.assertEqual(
+            fake_dashscope.TextReRank.call.call_args.kwargs["api_key"], "rag-key"
+        )
+
+    def test_rag_calls_fall_back_to_optimizer_key_without_env(self):
+        opt = make_optimizer(api_key="generation-key", model="glm-4-flash")
+        fake_dashscope = self._fake_dashscope()
+        with (
+            patch.dict("sys.modules", {"dashscope": fake_dashscope}),
+            patch.dict(os.environ, {"DASHSCOPE_API_KEY": ""}, clear=False),
+        ):
+            opt._embed_sync("single")
+            opt._embed_many_sync(["batch"])
+            opt._rerank_sync("query", ["document"])
+
+        embedding_keys = [
+            call.kwargs["api_key"]
+            for call in fake_dashscope.TextEmbedding.call.call_args_list
+        ]
+        self.assertEqual(embedding_keys, ["generation-key", "generation-key"])
+        self.assertEqual(
+            fake_dashscope.TextReRank.call.call_args.kwargs["api_key"],
+            "generation-key",
+        )
+
+
 class TestLessonQualityGate(unittest.IsolatedAsyncioTestCase):
     """经验沉淀质量门槛：LESSON_MIN_GAIN / LESSON_MIN_FINAL（OR 语义）。"""
 
@@ -3398,6 +3458,118 @@ class TestLLMClient(unittest.IsolatedAsyncioTestCase):
                 text = client.sync_call("sys", "hi")
         self.assertEqual(text, "qwen-reply")
         self.assertEqual(mock_call.call_args.kwargs["api_key"], "sk-qwen")
+
+    def test_glm_model_routes_to_zhipu_and_prefers_env_key(self):
+        client = LLMClient(api_key="caller-key", model="glm-4-flash")
+        fake_resp = SimpleNamespace(
+            status_code=200,
+            json=lambda: {"choices": [{"message": {"content": "glm-reply"}}]},
+            text="",
+        )
+        with (
+            patch.dict(os.environ, {"ZHIPU_API_KEY": "zhipu-env-key"}, clear=False),
+            patch("llm_client.requests.post", return_value=fake_resp) as mock_post,
+            patch("llm_client.dashscope.Generation.call") as mock_dashscope,
+        ):
+            text = client.sync_call("system", "user")
+
+        self.assertEqual(text, "glm-reply")
+        args, kwargs = mock_post.call_args
+        self.assertIn("open.bigmodel.cn", args[0])
+        self.assertEqual(kwargs["headers"]["Authorization"], "Bearer zhipu-env-key")
+        self.assertEqual(kwargs["json"]["model"], "glm-4-flash")
+        self.assertEqual(kwargs["json"]["messages"], [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "user"},
+        ])
+        self.assertEqual(kwargs["timeout"], GLM_REQUEST_TIMEOUT)
+        mock_dashscope.assert_not_called()
+
+    def test_glm_falls_back_to_caller_key_and_supports_json_mode(self):
+        client = LLMClient(api_key="caller-key", model="glm-4-flash")
+        fake_resp = SimpleNamespace(
+            status_code=200,
+            json=lambda: {"choices": [{"message": {"content": '{"ok":true}'}}]},
+            text="",
+        )
+        with (
+            patch.dict(os.environ, {"ZHIPU_API_KEY": ""}, clear=False),
+            patch("llm_client.requests.post", return_value=fake_resp) as mock_post,
+        ):
+            text = client.sync_call("system", "user", json_mode=True)
+
+        self.assertEqual(text, '{"ok":true}')
+        kwargs = mock_post.call_args.kwargs
+        self.assertEqual(kwargs["headers"]["Authorization"], "Bearer caller-key")
+        self.assertEqual(
+            kwargs["json"]["response_format"], {"type": "json_object"}
+        )
+
+    def test_glm_missing_key_raises_without_network(self):
+        client = LLMClient(api_key="", model="glm-4-flash", max_attempts=1)
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("llm_client.requests.post") as mock_post,
+        ):
+            with self.assertRaises(RuntimeError) as ctx:
+                client.sync_call("system", "user")
+        self.assertIn("API key", str(ctx.exception))
+        mock_post.assert_not_called()
+
+    def test_glm_non_200_error_does_not_echo_response_body(self):
+        client = LLMClient(api_key="caller-key", model="glm-4-flash", max_attempts=1)
+        fake_resp = SimpleNamespace(
+            status_code=401,
+            text="provider echoed sensitive-request-material",
+            json=lambda: {},
+        )
+        with (
+            patch.dict(os.environ, {"ZHIPU_API_KEY": ""}, clear=False),
+            patch("llm_client.requests.post", return_value=fake_resp),
+        ):
+            with self.assertRaises(RuntimeError) as ctx:
+                client.sync_call("system", "user")
+        message = str(ctx.exception)
+        self.assertIn("401", message)
+        self.assertNotIn("sensitive-request-material", message)
+
+    def test_glm_transient_http_status_retries_without_echoing_body(self):
+        client = LLMClient(api_key="caller-key", model="glm-4-flash", max_attempts=2)
+        failed = SimpleNamespace(
+            status_code=500,
+            text="provider echoed sensitive-request-material",
+            json=lambda: {},
+        )
+        succeeded = SimpleNamespace(
+            status_code=200,
+            text="",
+            json=lambda: {"choices": [{"message": {"content": "recovered"}}]},
+        )
+        with (
+            patch.dict(os.environ, {"ZHIPU_API_KEY": ""}, clear=False),
+            patch(
+                "llm_client.requests.post", side_effect=[failed, succeeded]
+            ) as mock_post,
+            patch("llm_client.time.sleep"),
+        ):
+            text = client.sync_call("system", "user")
+        self.assertEqual(text, "recovered")
+        self.assertEqual(mock_post.call_count, 2)
+
+    def test_non_glm_model_ignores_zhipu_env(self):
+        client = LLMClient(api_key="qwen-key", model="qwen-plus")
+        with (
+            patch.dict(os.environ, {"ZHIPU_API_KEY": "zhipu-env-key"}, clear=False),
+            patch(
+                "llm_client.dashscope.Generation.call",
+                return_value=self._resp("qwen-reply"),
+            ) as mock_dashscope,
+            patch("llm_client.requests.post") as mock_post,
+        ):
+            text = client.sync_call("system", "user")
+        self.assertEqual(text, "qwen-reply")
+        self.assertEqual(mock_dashscope.call_args.kwargs["api_key"], "qwen-key")
+        mock_post.assert_not_called()
 
     def test_enable_thinking_passed_only_when_on(self):
         on = LLMClient(api_key="k", model="m", enable_thinking=True)

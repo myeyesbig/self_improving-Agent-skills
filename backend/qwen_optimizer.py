@@ -1734,11 +1734,15 @@ class SkillOptimizer:
         return [(by_id[k], s) for k, s in ordered]
 
     def _embed_sync(self, text):
-        """DashScope text-embedding-v3（同步；在 _embed 的线程桥接里执行）。"""
+        """DashScope text-embedding-v3（同步；在 _embed 的线程桥接里执行）。
+
+        key 来源：DASHSCOPE_API_KEY 环境变量优先（CLI/benchmark 用 DeepSeek/
+        GLM 生成时，主 key 不是百炼 key，检索侧需单独取百炼 key），否则主 key。
+        """
         import dashscope
         resp = dashscope.TextEmbedding.call(
             model="text-embedding-v3", input=text,
-            api_key=self._api_key, dimensions=512,
+            api_key=os.getenv("DASHSCOPE_API_KEY") or self._api_key, dimensions=512,
         )
         if getattr(resp, "status_code", 500) != 200:
             raise RuntimeError(
@@ -1758,7 +1762,7 @@ class SkillOptimizer:
         resp = dashscope.TextEmbedding.call(
             model="text-embedding-v3",
             input=texts,
-            api_key=self._api_key,
+            api_key=os.getenv("DASHSCOPE_API_KEY") or self._api_key,
             dimensions=512,
         )
         if getattr(resp, "status_code", 500) != 200:
@@ -1817,11 +1821,14 @@ class SkillOptimizer:
                 self._update_lesson_embedding(self.lesson_file, lesson["_id"], vector)
 
     def _rerank_sync(self, query, docs):
-        """DashScope gte-rerank（同步；在 _rerank 的线程桥接里执行）。"""
+        """DashScope gte-rerank（同步；在 _rerank 的线程桥接里执行）。
+
+        key 来源同 _embed_sync：DASHSCOPE_API_KEY 环境变量优先，否则主 key。
+        """
         import dashscope
         resp = dashscope.TextReRank.call(
             model="gte-rerank", query=query, documents=docs,
-            api_key=self._api_key, top_n=len(docs),
+            api_key=os.getenv("DASHSCOPE_API_KEY") or self._api_key, top_n=len(docs),
         )
         if getattr(resp, "status_code", 500) != 200:
             raise RuntimeError(
