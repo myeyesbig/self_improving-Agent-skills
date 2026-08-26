@@ -11,6 +11,11 @@
 
 export const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8891";
 
+// 临时默认的 Codex ChatGPT 模式由本机登录态认证，仍保留 qwen_api_key
+// 请求字段但允许空字符串。显式切回旧模型时设为 0，恢复原有前端 key 门槛。
+export const CODEX_CHATGPT_MODE =
+  process.env.NEXT_PUBLIC_CODEX_CHATGPT_MODE !== "0";
+
 // -- 通用请求封装 -------------------------------------------------------------
 
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
@@ -60,7 +65,7 @@ export interface AnalyzePayload {
   evals: any[];
 }
 
-/** 让 Qwen/DeepSeek 分析技能并生成测试场景与评估标准（POST /api/analyze） */
+/** 让当前配置的模型分析技能并生成测试场景与评估标准（POST /api/analyze） */
 export async function analyzeSkill(
   sessionId: string,
   apiKey: string,

@@ -29,7 +29,7 @@
 
 ### 1.1 系统总览与角色分工
 
-SkillForge 把「评估一个技能 → 找出问题 → 改一版 → 再评估」这件原本要人做的事，交给了三个职责单一的模型角色（Executor / Analyst / Mutator）。它们由 LangGraph 状态图编排，默认走 DashScope/Qwen，也可按角色显式选择 DeepSeek 或智谱 GLM；角色之间不共享会话记忆，全部通过文件/进度事件进行协作。
+SkillForge 把「评估一个技能 → 找出问题 → 改一版 → 再评估」交给三个职责单一的模型角色（Executor / Analyst / Mutator）。它们由 LangGraph 状态图编排，生成暂时默认走本机 Codex App Server 的 ChatGPT 登录态，也可按角色显式切回 DashScope/Qwen、DeepSeek 或智谱 GLM；角色之间不共享模型会话记忆，全部通过图状态和进度事件协作。
 
 | 智能体 | 角色 | 职责 | 输出结构 |
 |--------|------|------|----------|
@@ -164,7 +164,9 @@ cd /Users/luboru/Desktop/Self-Improving\ Agent\ \ Skills
 
 `start-dev.sh` 会在一个终端内同时拉起后端（8891）与前端（3000）。端口被占用时会自动跳过该端口。Ctrl+C 一次性停两个服务。
 
-- 后端默认模型：`start-dev.sh` 默认是 `qwen3.7-max-2026-05-17`（带思考模式）。可用 `QWEN_MODEL=qwen-plus ./start-dev.sh` 改回默认
+- 后端临时默认模型：`gpt-5.6-sol`，使用本机 Codex App Server 与 ChatGPT 登录态。首次运行前执行 `codex login` 并选择 ChatGPT
+- 切回旧模型：`QWEN_MODEL=qwen-plus NEXT_PUBLIC_CODEX_CHATGPT_MODE=0 ./start-dev.sh`
+- Codex 推理档位：默认采用 `model/list` 为模型公布的默认值，可用 `CODEX_REASONING_EFFORT=medium` 覆盖
 - 前端默认端口 3000（Next.js dev server）
 
 **方式 B：手动双终端**
@@ -188,6 +190,22 @@ curl -o /dev/null -w "%{http_code}\n" http://localhost:3000   # → 200
 
 打开浏览器访问 **http://localhost:3000**。
 
+**Codex 模型与认证边界**
+
+2026-08-26 通过当前 ChatGPT Pro 账户的 App Server `model/list` 实测可见：`gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna`、`gpt-5.5`、`gpt-5.4`、`gpt-5.4-mini`、`gpt-5.3-codex-spark`。其中 `gpt-5.6-sol` 被账户标记为默认。模型权限会变化，运行时 `model/list` 始终高于本文快照；配置不存在的模型或不支持的 reasoning effort 会在发送项目 Prompt 前失败。
+
+每次 `gpt-` 调用依次执行：
+
+1. 启动本机 `codex app-server --stdio`，剥离 OpenAI/DashScope/DeepSeek/GLM API-key 环境变量；
+2. `account/read` 必须返回 `type=chatgpt`，API-key 登录直接拒绝；
+3. `model/list` 验证模型与推理档位；
+4. 在空临时目录创建 ephemeral、只读、禁网、无批准 thread；
+5. 任何命令、文件、MCP、Web 等工具 item 都中止调用；结构化结果经严格 `outputSchema` wrapper 解包后再做现有 Pydantic 校验。
+
+选择 Codex 时，SKILL.md、场景、eval、执行结果和模型 Prompt 会发送给 OpenAI，并受当前 ChatGPT 工作区的数据控制约束；SkillForge 不把它们保存成 Codex 历史线程，也不写入日志或 lesson store。
+
+OpenAI Platform 的 `text-embedding-3-small` / `text-embedding-3-large` 不在这条套餐路径中，需要独立 API key 和 API 计费。SkillForge 的 semantic/hybrid lesson 检索仍使用 DashScope `text-embedding-v3` 与 `DASHSCOPE_API_KEY`；未配置或失败时按既有 tag/轮内记忆降级。
+
 ### 2.2 Step 1 — 上传技能
 
 界面四步进度条当前停在 **1 Upload**。
@@ -197,7 +215,7 @@ curl -o /dev/null -w "%{http_code}\n" http://localhost:3000   # → 200
 操作要点：
 
 1. **拖拽**技能 zip 到「Drop your skill here」区域，或者点 `Upload .zip` / `Upload Folder`
-2. **填写 DashScope API Key**（password 类型，组件内存保存，**绝不落盘、不写入日志、不写入下载 zip**）
+2. 默认 Codex 模式无需填写 API Key；只有显式覆盖为 Qwen / DeepSeek / GLM 时才填写相应凭据（password 类型，组件内存保存，**绝不落盘、不写日志、不写下载 zip**）
 3. **或**直接从下方 4 个内置示例里点一个：
 
    | 示例技能 | 用途 |
@@ -211,7 +229,7 @@ curl -o /dev/null -w "%{http_code}\n" http://localhost:3000   # → 200
 
 ![Step1 上传完成态](screenshots/02-step1-example-loaded.png)
 
-> 上图是上传 `project-graveyard.zip` 后的状态，列出 `SKILL.md / README.md / scripts/graveyard.py / references/causes-of-death.md`。下一步填 Key 再点 `Analyze Skill`。
+> 上图是上传 `project-graveyard.zip` 后的状态。默认 Codex 模式可直接点 `Analyze Skill`；只有覆盖为其他模型时才需先填写对应 Key。
 
 **上传校验规则**（后端硬限制）：
 
@@ -306,16 +324,19 @@ improved_skill.zip
 | `parallel_mutations` | 后端 `MUTATION_PARALLELISM`，默认 1 | 1–3 | 每轮并行生成几个候选变异；并行时取分数最高者 |
 | `strategy_pool` | 全量 7 种 | 策略名数组 | 限定 Analyst 可选的变异策略；空数组 → 后端回退到全量 |
 | `improvement_threshold` | 0.0 | ≥ 0 | 候选提升必须 > `baseline + threshold + noise_floor` 才保留 |
-| `qwen_api_key` | 必填 | string | 主凭据字段；Qwen 时为 DashScope Key，显式 GLM 路由未设 `ZHIPU_API_KEY` 时可作为智谱 key 回退；仅存前端内存与请求体，不落盘 |
+| `qwen_api_key` | 字段必传；Codex 可为空 | string | 兼容主字段；`gpt-` 路由忽略其值并使用 ChatGPT 登录，Qwen/GLM 等旧路由仍按原凭据规则使用；不落盘 |
 
 **环境变量**（启动后端前设置）：
 
 | 变量 | 默认 | 说明 |
 |------|------|------|
-| `QWEN_MODEL` | `qwen-plus` | 三个 Agent 共用的模型；`start-dev.sh` 默认 `qwen3.7-max-2026-05-17` |
-| `EXECUTOR_MODEL` / `ANALYST_MODEL` / `MUTATOR_MODEL` | 回退 `QWEN_MODEL` | 按角色选模型；`deepseek-` 前缀只走 DeepSeek，`glm-` 前缀只走智谱 GLM |
+| `QWEN_MODEL` | `gpt-5.6-sol` | 兼容保留的基础模型变量；`gpt-` 走 Codex，`deepseek-` / `glm-` 走固定例外，其余走 DashScope |
+| `CODEX_CLI_PATH` | 自动发现 | Codex CLI 路径；macOS 也尝试 ChatGPT App 内置可执行文件 |
+| `CODEX_REASONING_EFFORT` | `model/list` 默认值 | Codex 推理档位，必须属于账户为目标模型公布的档位 |
+| `EXECUTOR_MODEL` / `ANALYST_MODEL` / `MUTATOR_MODEL` | 回退 `QWEN_MODEL` | 按角色选模型，沿用上述固定路由 |
 | `ZHIPU_API_KEY` | 无 | GLM 生成的后端凭据，优先于调用方传入的主 key；不得写入日志或会话 |
-| `DASHSCOPE_API_KEY` | 无 | DeepSeek/GLM 做生成时，可单独为 lesson embedding/rerank 提供 DashScope 凭据 |
+| `DASHSCOPE_API_KEY` | 无 | Codex/DeepSeek/GLM 做生成时，单独为 lesson embedding/rerank 提供 DashScope 凭据 |
+| `NEXT_PUBLIC_CODEX_CHATGPT_MODE` | `1` | 前端允许空兼容 key 并显示 Codex 登录提示；切回旧默认模型时设 `0` |
 | `QWEN_ENABLE_THINKING` | `0`（关闭） | 打开模型思考模式；某些日期快照模型强制要求开启 |
 | `MUTATION_PARALLELISM` | `1` | 默认并行变异数（与请求字段 `parallel_mutations` 同义） |
 | `IMPROVEMENT_THRESHOLD` | `0.0` | 提升阈值 |
@@ -355,7 +376,7 @@ improved_skill.zip
 ## 3. 常见问题 FAQ
 
 ### Q1. 我没有 DashScope API Key，能跑吗？
-**答：不能。** Executor 分析、评分、变异、Mutator 重写全部走 Qwen；没有 Key 会在 Step 2 Analyze 阶段失败。请到 [阿里云百炼控制台](https://bailian.console.aliyun.com/) 申请。
+**答：默认可以。** 先执行 `codex login` 并选择 ChatGPT，Codex 路由不需要 DashScope Key。只有以下情况才需要百炼凭据：显式将生成模型切回 Qwen，或开启 lesson `semantic` / `hybrid` embedding 与 rerank。后一种情况使用独立的 `DASHSCOPE_API_KEY`。
 
 ### Q2. 上传 zip 失败 / 提示「Only text files allowed」？
 **答**：SkillForge 故意只允许文本类文件（防止脚本注入与大体积二进制）。如果你确实要传一个 Python 脚本，确保它叫 `.py` 而不是 `.pyc` / `.so`。其他常见原因：
@@ -377,15 +398,16 @@ improved_skill.zip
 | Mutator 改得太激进 | 单次修改幅度过大 | 打开 `EDIT_LIMIT=0.3` 限制单轮最大变化比例 |
 | 永远卡在一种失败模式 | 策略池过窄 | 传 `strategy_pool: ["add_constraint","add_example","rewrite_section"]` 缩窄反而更易聚焦 |
 
-### Q4. 怎么换模型？默认 `qwen-plus` 太弱 / 太慢
+### Q4. 怎么换模型？怎么调 Codex 推理档位？
 **答**：
 ```bash
-QWEN_MODEL=qwen-max ./start-dev.sh            # 或写在 .env / shell rc
-QWEN_MODEL=qwen3.7-max-2026-05-17 QWEN_ENABLE_THINKING=1 ./start-dev.sh  # 强模型 + 思考模式
+CODEX_REASONING_EFFORT=medium ./start-dev.sh
+EXECUTOR_MODEL=gpt-5.6-luna ANALYST_MODEL=gpt-5.6-sol MUTATOR_MODEL=gpt-5.6-terra ./start-dev.sh
+QWEN_MODEL=qwen-max NEXT_PUBLIC_CODEX_CHATGPT_MODE=0 ./start-dev.sh
 EXECUTOR_MODEL=deepseek-chat ANALYST_MODEL=glm-4-flash MUTATOR_MODEL=glm-4-flash \
 ZHIPU_API_KEY='your-zhipu-key' ./start-dev.sh
 ```
-也支持在请求体内临时指定（参考 `SkillOptimizer.__init__` 的 `model=` 参数）。若同时开启 `semantic`/`hybrid` lesson 检索或 rerank，请另设 `DASHSCOPE_API_KEY`；该 key 只用于 DashScope embedding/rerank，不替换 GLM 生成 key。
+`gpt-` 模型和推理档位必须出现在当前账户 `model/list`。若同时开启 `semantic`/`hybrid` lesson 检索或 rerank，请另设 `DASHSCOPE_API_KEY`；它只用于 DashScope embedding/rerank，不会被 Codex 生成读取。
 
 ### Q5. 怎么开启并行变异？收益与风险是什么？
 **答**：
@@ -397,7 +419,7 @@ MUTATION_PARALLELISM=2 ./start-dev.sh
 ```
 - **收益**：每轮尝试 2–3 个不同候选，取最优；跑同一总轮数下找改进的概率更高
 - **代价**：每轮 LLM 调用量 ×并行数；Token 费用线性增长
-- **注意**：上限 3，且每个槽位使用**独立的 Assistant 实例**（并发跑同一实例会导致消息流串台）
+- **注意**：上限 3；Codex 路由为每次调用创建独立 ephemeral App Server 进程，候选之间不会共享线程历史
 
 ### Q6. 跨会话经验库怎么开？怎么决定 LESSON_RETRIEVAL 选哪档？
 **答**：
@@ -495,10 +517,10 @@ cd "/Users/luboru/Desktop/Self-Improving Agent  Skills/frontend" && npm run dev
 |------|------|------|------|
 | `POST` | `/api/upload` | 上传技能 zip（≤10MB） | 返回 `session_id` + 文件清单 |
 | `POST` | `/api/upload-files` | 上传文件夹（保留相对路径） | 多文件上传 |
-| `POST` | `/api/analyze` | 生成 scenarios + evals | 必传 `qwen_api_key` |
-| `POST` | `/api/regenerate` | 重新生成 scenarios + evals | 必传 `qwen_api_key` |
+| `POST` | `/api/analyze` | 生成 scenarios + evals | 必传兼容字段 `qwen_api_key`；Codex 可为空字符串 |
+| `POST` | `/api/regenerate` | 重新生成 scenarios + evals | 同上 |
 | `POST` | `/api/update-config` | 保存用户审阅/编辑后的配置 | 必传 `session_id` |
-| `POST` | `/api/start/{session_id}` | 启动优化 | `qwen_api_key` + 可选 `max_rounds` / `parallel_mutations` / `strategy_pool` / `improvement_threshold` |
+| `POST` | `/api/start/{session_id}` | 启动优化 | 兼容字段 `qwen_api_key` + 可选 `max_rounds` / `parallel_mutations` / `strategy_pool` / `improvement_threshold` |
 | `GET`  | `/api/status/{session_id}` | 轮询进度（**当前 UI 使用**） | 每 3 秒一次 |
 | `GET`  | `/api/stream/{session_id}` | SSE 推送（已实现，前端暂未消费） | 保留作扩展用 |
 | `POST` | `/api/stop/{session_id}` | 协作式停止 | 轮间生效 |
@@ -509,7 +531,7 @@ cd "/Users/luboru/Desktop/Self-Improving Agent  Skills/frontend" && npm run dev
 
 **通用约定**：
 
-- 凭据字段：`qwen_api_key`（仅请求体，**绝不恢复或别名 `gemini_api_key`**）
+- 凭据字段名保持 `qwen_api_key`（Codex 路由可为空；**绝不恢复或别名 `gemini_api_key`**）
 - 错误响应：FastAPI 标准格式 `{"detail": "..."}`
 - 所有路由的内存状态走 `sessions: dict[str, dict]`，1 小时 TTL 自动清理
 
@@ -560,7 +582,7 @@ Your skill instructions here...
 | 症状 | 检查顺序 |
 |------|----------|
 | 前端打开空白 | 后端是否在 8891？`curl /health`；前端编译是否报错？`npm run dev` 输出 |
-| Analyze 失败 | API Key 是否正确？模型是否限流？先试 `qwen-plus` 跑通 |
+| Analyze 失败 | 先检查 `codex login status` 是否为 ChatGPT 登录、目标模型是否仍在 `model/list`；旧路由再检查对应 API Key |
 | 上传 413 | 包 > 10 MB |
 | 上传 415 / 400 | 含非文本文件 |
 | Step3 一直 0% | 进度事件是否被消费？`/api/status` 是否返回 events；查看后端日志 |

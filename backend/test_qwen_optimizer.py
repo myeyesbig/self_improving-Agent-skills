@@ -18,6 +18,7 @@ DashScope API key or network access is required.
 """
 
 import asyncio
+import io
 import json
 import os
 import tempfile
@@ -27,7 +28,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from pydantic import ValidationError
 
-from llm_client import GLM_REQUEST_TIMEOUT, LLMClient
+from llm_client import DEFAULT_MODEL, GLM_REQUEST_TIMEOUT, LLMClient, _is_codex_model
 from qwen_optimizer import (
     ANALYST_SYSTEM_PROMPT,
     EXECUTOR_SYSTEM_PROMPT,
@@ -272,10 +273,10 @@ class TestApiKeyHandling(unittest.TestCase):
         self.assertNotIn(key, list(os.environ.values()))
         self.assertNotIn("GOOGLE_" + "API_KEY", os.environ)
 
-    # 默认模型必须是 qwen-plus。
-    def test_model_defaults_to_qwen_plus(self):
+    # 临时默认模型使用当前 ChatGPT 账户 model/list 标记的 Codex 默认项。
+    def test_model_defaults_to_codex_sol(self):
         opt = make_optimizer()
-        self.assertEqual(opt.model, "qwen-plus")
+        self.assertEqual(opt.model, DEFAULT_MODEL)
 
     # QWEN_MODEL 环境变量可覆盖默认模型。
     def test_qwen_model_env_override(self):
@@ -366,6 +367,14 @@ class TestFastApiRequestModels(unittest.TestCase):
     def test_analyze_accepts_qwen_api_key(self):
         req = AnalyzeRequest(session_id="s1", qwen_api_key="k")
         self.assertEqual(req.qwen_api_key, "k")
+
+    def test_codex_default_accepts_empty_compatibility_key(self):
+        analyze = AnalyzeRequest(session_id="s1", qwen_api_key="")
+        regenerate = RegenerateRequest(session_id="s1", qwen_api_key="")
+        start = StartRequest(qwen_api_key="")
+        self.assertEqual(analyze.qwen_api_key, "")
+        self.assertEqual(regenerate.qwen_api_key, "")
+        self.assertEqual(start.qwen_api_key, "")
 
     def test_analyze_rejects_legacy_key_field(self):
         with self.assertRaises(ValidationError):
@@ -2994,6 +3003,26 @@ class TestLessonDashScopeKeySeparation(unittest.TestCase):
             "generation-key",
         )
 
+    def test_codex_generation_does_not_change_dashscope_embedding_route(self):
+        opt = make_optimizer(api_key="", model="gpt-5.6-sol")
+        fake_dashscope = self._fake_dashscope()
+        with (
+            patch.dict("sys.modules", {"dashscope": fake_dashscope}),
+            patch.dict(os.environ, {"DASHSCOPE_API_KEY": "rag-only-key"}, clear=False),
+            patch("llm_client._CodexAppServerClient.call") as mock_codex,
+        ):
+            vector = opt._embed_sync("lesson metadata")
+        self.assertEqual(vector, [1.0, 0.0])
+        self.assertEqual(
+            fake_dashscope.TextEmbedding.call.call_args.kwargs["model"],
+            "text-embedding-v3",
+        )
+        self.assertEqual(
+            fake_dashscope.TextEmbedding.call.call_args.kwargs["api_key"],
+            "rag-only-key",
+        )
+        mock_codex.assert_not_called()
+
 
 class TestLessonQualityGate(unittest.IsolatedAsyncioTestCase):
     """经验沉淀质量门槛：LESSON_MIN_GAIN / LESSON_MIN_FINAL（OR 语义）。"""
@@ -3590,6 +3619,256 @@ class TestLLMClient(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(mock_bridge.call_args[0][0], client.sync_call)
         self.assertEqual(mock_bridge.call_args[0][1], "sys")
         self.assertEqual(mock_bridge.call_args[0][2], "hi")
+
+
+class _FakeCodexProcess:
+    """In-memory newline JSON process used by Codex App Server route tests."""
+
+    def __init__(self, messages):
+        self.stdin = io.StringIO()
+        encoded = "".join(json.dumps(item) + "\n" for item in messages)
+        self.stdout = io.StringIO(encoded)
+        self.returncode = None
+
+    def poll(self):
+        return self.returncode
+
+    def terminate(self):
+        self.returncode = 0
+
+    def kill(self):
+        self.returncode = -9
+
+    def wait(self, timeout=None):
+        return self.returncode or 0
+
+
+class TestCodexAppServerRoute(unittest.TestCase):
+    """Codex ChatGPT 路由：认证、模型、隔离、结构化输出与 fail-closed。"""
+
+    @staticmethod
+    def _model_entry(model="gpt-5.6-sol", efforts=None):
+        efforts = efforts or ["low", "medium", "high"]
+        return {
+            "id": model,
+            "model": model,
+            "displayName": "GPT test",
+            "hidden": False,
+            "isDefault": True,
+            "defaultReasoningEffort": "low",
+            "supportedReasoningEfforts": [
+                {"reasoningEffort": effort, "description": effort}
+                for effort in efforts
+            ],
+        }
+
+    @classmethod
+    def _success_messages(cls, text='{"result":"{\\"ok\\":true}"}'):
+        return [
+            {"id": 1, "result": {"userAgent": "test"}},
+            {"id": 2, "result": {"account": {"type": "chatgpt", "planType": "pro"}}},
+            {"id": 3, "result": {"data": [cls._model_entry()], "nextCursor": None}},
+            {
+                "id": 4,
+                "result": {
+                    "thread": {
+                        "id": "thr_test",
+                        "sessionId": "thr_test",
+                        "ephemeral": True,
+                    }
+                },
+            },
+            {"id": 5, "result": {"turn": {"id": "turn_test", "status": "inProgress"}}},
+            {
+                "method": "item/completed",
+                "params": {
+                    "item": {
+                        "id": "msg_test",
+                        "type": "agentMessage",
+                        "phase": "final_answer",
+                        "text": text,
+                    }
+                },
+            },
+            {
+                "method": "turn/completed",
+                "params": {"turn": {"id": "turn_test", "status": "completed"}},
+            },
+        ]
+
+    @staticmethod
+    def _sent_messages(process):
+        return [json.loads(line) for line in process.stdin.getvalue().splitlines()]
+
+    def _call_with_process(self, process, *, json_mode=True, env=None):
+        client = LLMClient(
+            api_key="provider-secret-must-not-propagate",
+            model="gpt-5.6-sol",
+            max_attempts=1,
+        )
+        env = {"CODEX_REASONING_EFFORT": "", **(env or {})}
+        with (
+            patch.dict(os.environ, env, clear=False),
+            patch("llm_client._resolve_codex_cli", return_value="/fake/codex"),
+            patch("llm_client.subprocess.Popen", return_value=process) as mock_popen,
+            patch("llm_client.dashscope.Generation.call") as mock_dashscope,
+            patch("llm_client.requests.post") as mock_http,
+        ):
+            text = client.sync_call("system-role", "user-prompt", json_mode=json_mode)
+        mock_dashscope.assert_not_called()
+        mock_http.assert_not_called()
+        return text, mock_popen
+
+    def test_gpt_prefix_is_fixed_codex_route(self):
+        self.assertTrue(_is_codex_model("gpt-5.6-sol"))
+        self.assertFalse(_is_codex_model("qwen-plus"))
+        self.assertFalse(_is_codex_model("deepseek-chat"))
+        self.assertFalse(_is_codex_model("glm-4-flash"))
+
+    def test_chatgpt_route_is_ephemeral_text_only_and_uses_output_schema(self):
+        process = _FakeCodexProcess(self._success_messages())
+        env = {
+            "OPENAI_API_KEY": "openai-platform-secret",
+            "QWEN_API_KEY": "qwen-environment-secret",
+            "DASHSCOPE_API_KEY": "dashscope-secret",
+            "DEEPSEEK_API_KEY": "deepseek-secret",
+            "ZHIPU_API_KEY": "zhipu-secret",
+            "CODEX_REASONING_EFFORT": "medium",
+        }
+        text, mock_popen = self._call_with_process(process, env=env)
+        self.assertEqual(text, '{"ok":true}')
+
+        sent = self._sent_messages(process)
+        methods = [item.get("method") for item in sent]
+        self.assertEqual(
+            methods,
+            ["initialize", "initialized", "account/read", "model/list", "thread/start", "turn/start"],
+        )
+        thread_params = next(item["params"] for item in sent if item.get("method") == "thread/start")
+        self.assertTrue(thread_params["ephemeral"])
+        self.assertEqual(thread_params["approvalPolicy"], "never")
+        self.assertEqual(thread_params["sandbox"], "read-only")
+        self.assertEqual(thread_params["config"], {"mcp_servers": {}})
+
+        turn_params = next(item["params"] for item in sent if item.get("method") == "turn/start")
+        self.assertEqual(turn_params["effort"], "medium")
+        self.assertEqual(turn_params["sandboxPolicy"], {"type": "readOnly", "networkAccess": False})
+        self.assertEqual(turn_params["outputSchema"]["type"], "object")
+        self.assertFalse(turn_params["outputSchema"]["additionalProperties"])
+        self.assertEqual(turn_params["outputSchema"]["required"], ["result"])
+
+        popen_env = mock_popen.call_args.kwargs["env"]
+        for key in (
+            "OPENAI_API_KEY",
+            "QWEN_API_KEY",
+            "DASHSCOPE_API_KEY",
+            "DEEPSEEK_API_KEY",
+            "ZHIPU_API_KEY",
+        ):
+            self.assertNotIn(key, popen_env)
+        self.assertNotIn("provider-secret-must-not-propagate", process.stdin.getvalue())
+
+    def test_plain_text_turn_omits_output_schema(self):
+        process = _FakeCodexProcess(self._success_messages(text="plain reply"))
+        text, _ = self._call_with_process(process, json_mode=False)
+        self.assertEqual(text, "plain reply")
+        sent = self._sent_messages(process)
+        turn_params = next(item["params"] for item in sent if item.get("method") == "turn/start")
+        self.assertNotIn("outputSchema", turn_params)
+
+    def test_api_key_login_fails_before_prompt_submission(self):
+        process = _FakeCodexProcess([
+            {"id": 1, "result": {}},
+            {"id": 2, "result": {"account": {"type": "apiKey"}}},
+        ])
+        client = LLMClient(api_key="provider-secret", model="gpt-5.6-sol", max_attempts=1)
+        with (
+            patch("llm_client._resolve_codex_cli", return_value="/fake/codex"),
+            patch("llm_client.subprocess.Popen", return_value=process),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "ChatGPT login required"):
+                client.sync_call("system-secret", "prompt-secret")
+        sent = self._sent_messages(process)
+        self.assertNotIn("thread/start", [item.get("method") for item in sent])
+        self.assertNotIn("prompt-secret", process.stdin.getvalue())
+
+    def test_unavailable_model_fails_before_prompt_submission(self):
+        process = _FakeCodexProcess([
+            {"id": 1, "result": {}},
+            {"id": 2, "result": {"account": {"type": "chatgpt"}}},
+            {"id": 3, "result": {"data": [self._model_entry("gpt-other")] }},
+        ])
+        client = LLMClient(api_key="", model="gpt-5.6-sol", max_attempts=1)
+        with (
+            patch("llm_client._resolve_codex_cli", return_value="/fake/codex"),
+            patch("llm_client.subprocess.Popen", return_value=process),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "not available"):
+                client.sync_call("system-secret", "prompt-secret")
+        self.assertNotIn("prompt-secret", process.stdin.getvalue())
+
+    def test_unsupported_reasoning_effort_fails_closed(self):
+        process = _FakeCodexProcess([
+            {"id": 1, "result": {}},
+            {"id": 2, "result": {"account": {"type": "chatgpt"}}},
+            {"id": 3, "result": {"data": [self._model_entry(efforts=["low"])]}},
+        ])
+        client = LLMClient(api_key="", model="gpt-5.6-sol", max_attempts=1)
+        with (
+            patch.dict(os.environ, {"CODEX_REASONING_EFFORT": "ultra"}, clear=False),
+            patch("llm_client._resolve_codex_cli", return_value="/fake/codex"),
+            patch("llm_client.subprocess.Popen", return_value=process),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "not supported"):
+                client.sync_call("system", "prompt")
+
+    def test_forbidden_tool_item_aborts_generation(self):
+        messages = self._success_messages()
+        messages[5] = {
+            "method": "item/started",
+            "params": {
+                "item": {
+                    "id": "cmd_test",
+                    "type": "commandExecution",
+                    "command": "printenv",
+                }
+            },
+        }
+        process = _FakeCodexProcess(messages)
+        client = LLMClient(api_key="", model="gpt-5.6-sol", max_attempts=1)
+        with (
+            patch("llm_client._resolve_codex_cli", return_value="/fake/codex"),
+            patch("llm_client.subprocess.Popen", return_value=process),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "forbidden tool"):
+                client.sync_call("system", "prompt")
+
+    def test_server_error_body_is_not_exposed(self):
+        process = _FakeCodexProcess([
+            {"id": 1, "result": {}},
+            {"id": 2, "error": {"message": "provider echoed prompt-secret"}},
+        ])
+        client = LLMClient(api_key="", model="gpt-5.6-sol", max_attempts=1)
+        with (
+            patch("llm_client._resolve_codex_cli", return_value="/fake/codex"),
+            patch("llm_client.subprocess.Popen", return_value=process),
+        ):
+            with self.assertRaises(RuntimeError) as ctx:
+                client.sync_call("system", "prompt-secret")
+        self.assertNotIn("prompt-secret", str(ctx.exception))
+
+    def test_app_server_retry_notification_does_not_abort_turn(self):
+        messages = self._success_messages()
+        messages.insert(5, {
+            "method": "error",
+            "params": {
+                "willRetry": True,
+                "error": {"message": "temporary upstream issue"},
+            },
+        })
+        process = _FakeCodexProcess(messages)
+        text, _ = self._call_with_process(process)
+        self.assertEqual(text, '{"ok":true}')
 
 
 if __name__ == "__main__":

@@ -184,3 +184,13 @@ SkillForge 因此把比较范围明确拆成两类：
 为了让跨轮信号真的影响下一轮，首轮仍在 baseline 后准备经验；开关启用时，后续轮在协作式 stop 检查之后、Analyst 之前刷新经验检索。`target_dimension` / `dimension_gains` 继续参与 `quality_diverse` 的弱维度 signal，`comparison_scope` 进入受控 Prompt 白名单；内部 ID与 embedding 仍被剥离。代价是 semantic/hybrid 模式可能在后续每轮增加查询 embedding，rerank 开启时还可能增加重排调用；embedding/检索失败仍降级 tag/轮内记忆，rerank 失败保留原排序。开关关闭时不改变原检索调用次数。
 
 JSONL 可直接承载新字段；SQLite 只用内置 `sqlite3` 增加可空 `comparison_scope` 并兼容旧库，历史 tie lesson 缺少 scope 时按 `same_round` 解读。该迁移没有扩大持久化数据边界，也没有新增依赖、provider 或保留种群。
+
+## 十三、Codex 套餐生成路由：固定适配而非通用 Provider
+
+OpenAI 官方把 Codex App Server 定位为富客户端的本地集成协议：客户端先初始化，再通过 `account/read`、`model/list`、`thread/start` 和 `turn/start` 驱动一次任务。它与 OpenAI Platform API 是两种计费/认证边界：ChatGPT 登录使用订阅访问，API key 登录按 Platform 用量计费。因此 SkillForge 没有复用 OpenAI-compatible HTTP 客户端，也没有把 `OPENAI_API_KEY` 加入凭据优先级，而是为 `gpt-` 建立单一、可审计的 App Server 分支。
+
+本路由选择每次调用一个全新进程与 ephemeral thread，而不是复用持久 Codex 对话。代价是增加进程启动开销；收益是并行候选之间没有历史串扰，上传技能与 Prompt 不会落入 Codex 本地 thread 历史，且在提交任何 Prompt 前就能验证 `account.type=chatgpt` 和账户模型目录。进程运行在空临时目录，设置只读、禁网、无批准，并剥离所有模型 API key；协议流只允许 user/agent/reasoning/plan 文本 item，任何命令、文件、MCP 或 Web item 都 fail closed。
+
+App Server 的严格 `outputSchema` 不允许任意 object（顶层必须 `additionalProperties=false`）。现有 Analyst/Mutator 的具体 Pydantic schema 已写入 Prompt，但 `llm_client` 的通用 JSON-mode 接口不知道每次具体字段。因此适配层使用唯一的 `{result: string}` 严格 wrapper，让模型把原目标 JSON 序列化进 `result`；解包后继续走既有宽容 JSON 提取和 Pydantic 校验。这样没有改动三角色协议，也没有让结构化输出退化为纯文本约定。
+
+没有把 OpenAI embedding 纳入本次路线。`text-embedding-3-small/large` 属于 Platform API，需要独立 key 和 API 计费，当前 ChatGPT/Codex `model/list` 也不暴露 embedding。SkillForge 继续让 semantic/hybrid lesson 检索使用 DashScope `text-embedding-v3` 与独立 `DASHSCOPE_API_KEY`，失败时按原设计降级 tag/轮内记忆。生成套餐与 RAG embedding 的费用、凭据和故障域因此保持分离。

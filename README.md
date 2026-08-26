@@ -1,6 +1,6 @@
 # 🔥 SkillForge —— 自我进化型 Agent 技能锻造厂
 
-**SkillForge** 基于 **LangGraph** 状态图编排与 **阿里云百炼（DashScope）** 直调构建（可选 DeepSeek / 智谱 GLM）的技能自优化系统，自动改进你的 Agent 技能。上传一个技能，让智能体生成测试场景与评估标准，然后观察三个角色（Executor / Analyst / Mutator）通过迭代优化协作改进你的技能 —— 每一次变异都在砧台上被锤打、评估，只保留真正更强的版本。
+**SkillForge** 是基于 **LangGraph** 状态图编排的技能自优化系统。生成调用暂时默认使用本机 **Codex App Server + ChatGPT 登录态**，同时保留 DashScope Qwen、DeepSeek 与智谱 GLM 的显式模型路由。上传一个技能，让 Executor / Analyst / Mutator 通过迭代协作改进它 —— 每一次变异都在砧台上被锤打、评估，只保留真正更强的版本。
 
 > 一个受 Karpathy「自动研究」方法论启发的个人项目：与其手动调提示词，不如定义成功标准，让 AI 自我进化。
 
@@ -40,7 +40,7 @@ skillforge/
 │   ├── app.py              # REST API 端点 + SSE 流式推送
 │   ├── qwen_optimizer.py   # 算法核心（评分/诊断/变异/回归守卫/经验库）
 │   ├── optimize_graph.py    # LangGraph 状态图编排（条件边 + Send 并行）
-│   ├── llm_client.py        # DashScope 直调薄封装（桥接/重试/JSON mode）
+│   ├── llm_client.py        # Codex/DashScope/DeepSeek/GLM 固定路由薄封装
 │   └── requirements.txt
 ├── frontend/               # Next.js + React + Tailwind
 │   ├── src/
@@ -57,12 +57,12 @@ skillforge/
 
 - **后端**：Python 3.10+、FastAPI、LangGraph、DashScope、Pydantic
 - **前端**：Next.js 15、React 19、Tailwind CSS v4、Recharts
-- **AI**：LangGraph 状态图编排的三角色循环，DashScope SDK 直调 Qwen（`qwen-plus`），可用 `deepseek-` / `glm-` 模型名前缀按角色切换 DeepSeek / 智谱 GLM；结构化输出走协议层 JSON mode + Pydantic 校验 + 宽容解析兜底
+- **AI**：LangGraph 三角色循环；`gpt-` 模型通过本机 Codex App Server 使用 ChatGPT 订阅认证，其他固定路由保留 DashScope Qwen、DeepSeek 与智谱 GLM；结构化输出走协议约束 + Pydantic 校验 + 宽容解析兜底
 - **实时通信**：Server-Sent Events（SSE）实时推送优化进度
 
 ## 快速开始
 
-> **一键启动**：项目根目录执行 `./start-dev.sh` 可同时拉起前后端（单终端，Ctrl+C 全部停止；端口已占用时自动跳过）。默认模型 `qwen3.7-max-2026-05-17` 并开启思考模式，可用 `QWEN_MODEL` / `QWEN_ENABLE_THINKING` 环境变量覆盖。
+> **一键启动**：先执行 `codex login` 并选择 ChatGPT 登录，再在项目根目录执行 `./start-dev.sh`。临时默认模型是 `gpt-5.6-sol`；可用兼容变量 `QWEN_MODEL` 或三个角色变量覆盖，`CODEX_REASONING_EFFORT` 控制 Codex 推理档位。
 
 ### 后端配置
 
@@ -81,7 +81,7 @@ python app.py
 # 服务运行在 http://localhost:8891
 ```
 
-后端默认使用 `qwen-plus` 模型，可通过可选的 `QWEN_MODEL` 环境变量覆盖，例如 `QWEN_MODEL=qwen-max python app.py`。
+后端临时默认使用本机 Codex App Server 的 `gpt-5.6-sol`。它只接受 ChatGPT 登录态，不读取 `OPENAI_API_KEY`；可通过兼容变量覆盖，例如 `QWEN_MODEL=qwen-plus python app.py` 切回 DashScope。
 
 ### 前端配置
 
@@ -98,10 +98,10 @@ npm run dev
 
 ### 使用步骤
 
-1. 在[阿里云百炼控制台](https://bailian.console.aliyun.com/)获取 DashScope API Key
+1. 安装 Codex CLI，并执行 `codex login` 选择 ChatGPT 登录
 2. 打开 http://localhost:3000
 3. 以 .zip 格式上传技能文件夹（或试用示例）
-4. 输入你的 DashScope API Key
+4. 默认 Codex 模式下无需填写 API Key；覆盖为 Qwen / DeepSeek / GLM 时再配置相应凭据
 5. 审阅并编辑生成的测试场景与评估标准
 6. 点击「Start Optimization」，观看智能体协作改进你的技能
 7. 完成后下载改进后的技能
@@ -189,7 +189,7 @@ zip -r my-skill.zip my-skill/
 |--------|----------|-------------|
 | `POST` | `/api/upload` | 上传技能 zip（最大 10MB，仅文本文件） |
 | `POST` | `/api/upload-files` | 上传多个文件（文件夹上传） |
-| `POST` | `/api/analyze` | 生成场景与评估标准（需要 DashScope API Key） |
+| `POST` | `/api/analyze` | 生成场景与评估标准（默认使用本机 ChatGPT 登录） |
 | `POST` | `/api/regenerate` | 重新生成场景与评估标准 |
 | `POST` | `/api/update-config` | 保存用户选择/编辑的配置 |
 | `POST` | `/api/start/{session_id}` | 启动优化 |
@@ -205,7 +205,13 @@ zip -r my-skill.zip my-skill/
 
 ### 后端
 
-DashScope API Key 随每次请求由前端传入（字段 `qwen_api_key`），并直接用于 DashScope SDK 调用配置 —— 绝不写入进程级环境变量、不存入会话、不记入日志。模型默认使用 `qwen-plus`，可通过可选的 `QWEN_MODEL` 环境变量覆盖；Executor、Analyst、Mutator 还可分别用 `EXECUTOR_MODEL`、`ANALYST_MODEL`、`MUTATOR_MODEL` 覆盖。服务运行在 **8891** 端口。
+生成模型临时默认使用 `gpt-5.6-sol`，通过本机 Codex App Server 消耗当前 ChatGPT/Codex 套餐额度。每次调用都会先用 `account/read` 确认认证类型为 `chatgpt`，再用 `model/list` 验证模型与推理档位；如果 Codex CLI 使用 API key 登录则直接失败，避免静默产生 OpenAI Platform API 费用。
+
+请求字段仍为 `qwen_api_key` 以保持 API 兼容，Codex 默认模式允许传空字符串。覆盖为 Qwen、DeepSeek 或 GLM 时，该字段和既有厂商环境变量继续按原规则工作。所有请求密钥均不写入进程级环境变量、不存入会话、不记入日志。Executor、Analyst、Mutator 可分别用 `EXECUTOR_MODEL`、`ANALYST_MODEL`、`MUTATOR_MODEL` 覆盖。服务运行在 **8891** 端口。
+
+> **数据边界**：选择 `gpt-` 模型时，SKILL.md、场景、评估标准、执行结果和生成 Prompt 会发送到 OpenAI Codex，并受当前 ChatGPT 工作区的数据控制约束。SkillForge 使用临时只读 thread，不把它们持久化为 Codex 对话，也不写入日志或 lesson store。
+
+2026-08-26 当前 ChatGPT Pro 账户实测可见的生成模型为：`gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna`、`gpt-5.5`、`gpt-5.4`、`gpt-5.4-mini`、`gpt-5.3-codex-spark`。该清单会随账户权限变化；运行时以 App Server `model/list` 为准。
 
 上传限制：
 - 单次上传最大 **10MB**
@@ -217,7 +223,9 @@ DashScope API Key 随每次请求由前端传入（字段 `qwen_api_key`），�
 
 ### 前端
 
-API Key 在界面中输入，仅保存在组件内存中（不持久化），并以 `qwen_api_key` 字段随每次请求发送。
+Codex 默认模式显示本机 ChatGPT 登录提示，不要求 API Key。覆盖到其他模型时，界面中的 Key 仍只保存在组件内存中，并通过既有 `qwen_api_key` / `deepseek_api_key` 字段发送。
+
+`NEXT_PUBLIC_CODEX_CHATGPT_MODE` 默认为 `1`，只控制前端是否允许空兼容 key；若后端显式切回 Qwen/DeepSeek/GLM，请同时设为 `0` 恢复旧界面凭据门槛。后端最终仍以模型 ID 和实际认证结果为准。
 
 ### 优化参数
 
@@ -233,6 +241,9 @@ SkillForge 提供一组**可选**优化旋钮，全部默认等价于经典行�
 | `REGRESSION_CHECK` | 环境变量 | 1（开启） | 变异先过结构完整性守卫，0 关闭 |
 | `NOISE_FLOOR` | 环境变量 | 0.0 | 候选提升须超过「基线 + 阈值 + 噪声地板」才保留，防止评分波动被当成真进步 |
 | `EDIT_LIMIT` | 环境变量 | 0.0 | 单次变异相对原文本的变化比例上限，超限直接拒绝（`edit_limit_exceeded`），0 关闭 |
+| `QWEN_MODEL` | 环境变量 | `gpt-5.6-sol` | 兼容保留的基础模型变量；`gpt-` 走 Codex，`deepseek-` / `glm-` 走固定例外，其余走 DashScope |
+| `CODEX_CLI_PATH` | 环境变量 | 自动发现 `codex` | 本机 Codex CLI 可执行文件；macOS 也会尝试 ChatGPT App 内置路径 |
+| `CODEX_REASONING_EFFORT` | 环境变量 | 模型 `model/list` 默认值 | Codex 推理档位，必须是账户为该模型公布的档位 |
 | `EXECUTOR_MODEL` | 环境变量 | 继承 `QWEN_MODEL` | Executor 的执行、测试生成与评分模型；适合配置为成本较低的模型 |
 | `ANALYST_MODEL` | 环境变量 | 继承 `QWEN_MODEL` | Analyst 的失败诊断模型；可配置为推理能力更强的模型 |
 | `MUTATOR_MODEL` | 环境变量 | 继承 `QWEN_MODEL` | Mutator 的单点编辑模型；可配置为指令遵循更强的模型 |
@@ -269,7 +280,7 @@ SkillForge 提供一组**可选**优化旋钮，全部默认等价于经典行�
 | `LESSON_MIN_GAIN` | 环境变量 | 0（关闭） | 普通/同轮经验的提升幅度门槛（与 `LESSON_MIN_FINAL` 为 OR；推荐 15）；跨轮同分经验如实为零总分增益，忽略此门槛 |
 | `LESSON_MIN_FINAL` | 环境变量 | 0（关闭） | 最终水位门槛（推荐 85）；普通/同轮经验仍与 `MIN_GAIN` 为 OR，跨轮同分经验启用该值后必须达到此水位才持久化 |
 
-> **安全与不变量**：主凭据字段恒为 `qwen_api_key`；请求密钥仅存组件内存与请求体，可选的厂商/RAG 环境密钥仅由后端读取，两者都绝不落日志/会话/zip/git。一次变异仍只改 SKILL.md 一处；只有「严格提升」的变异才会被保留，回归守卫只会更严格，绝不会让技能退化。
+> **安全与不变量**：主凭据字段恒为 `qwen_api_key`；Codex 子进程会剥离 OpenAI/DashScope/DeepSeek/GLM key，并以 ephemeral、只读、禁网、无批准模式运行，任何工具 item 都会中止调用。请求密钥绝不落日志/会话/zip/git。一次变异仍只改 SKILL.md 一处；只有「严格提升」的变异才会被保留。
 
 同分维度经验分为两个互不隐式联动的范围：
 
@@ -282,21 +293,23 @@ SkillForge 提供一组**可选**优化旋钮，全部默认等价于经典行�
 
 首轮仍在 baseline 后准备经验；开启跨轮学习后，后续每轮先检查协作式 stop，再在 Analyst 前刷新经验检索，使刚学到的维度信号可立即用于下一轮的弱维度定向。`off`/`tag` 只增加本地读取；`semantic`/`hybrid` 可能每轮增加查询 embedding，启用 rerank 时还可能增加 rerank 调用。embedding/检索失败会降级到 tag/轮内记忆，rerank 失败则保留重排前顺序，都不会影响优化主循环。JSONL 直接保存新字段；SQLite 用内置 `sqlite3` 向后兼容补充 `comparison_scope`，旧记录缺失该字段时按 legacy `same_round` 读取。默认开关为 0，因此不开启时调用路径与成本不变。
 
-角色模型示例（未设置三个角色变量时，行为与原来完全相同）：
+角色模型示例（未设置三个角色变量时，三者共享 `gpt-5.6-sol`）：
 
 ```bash
-EXECUTOR_MODEL=qwen-plus \
-ANALYST_MODEL=qwen-max \
-MUTATOR_MODEL=qwen-max \
+EXECUTOR_MODEL=gpt-5.6-luna \
+ANALYST_MODEL=gpt-5.6-sol \
+MUTATOR_MODEL=gpt-5.6-terra \
 python backend/app.py
 ```
 
-任一角色模型名以 `deepseek-` 开头时，仅该角色走 DeepSeek 显式路由；以 `glm-` 开头时，仅该角色走智谱 Zhipu 显式路由。GLM 生成优先读取后端 `ZHIPU_API_KEY`，未设时回退到调用方传入的主 key；当 DeepSeek/GLM 生成与 DashScope embedding/rerank 并用时，用 `DASHSCOPE_API_KEY` 为 RAG 单独配置百炼凭据。
+任一角色模型名以 `gpt-` 开头时，仅该角色走 Codex ChatGPT 登录；`deepseek-` 与 `glm-` 分别走既有 DeepSeek / 智谱路由；其他名称走 DashScope。Codex App Server 的 `model/list` 是账户可用模型的唯一运行时准绳，配置不可用模型或推理档位会明确失败。
+
+OpenAI Platform 提供 `text-embedding-3-small` / `text-embedding-3-large`，但它们需要独立 API key 并按 API 用量计费，不属于本项目的 Codex 套餐路由。SkillForge 的 lesson semantic/hybrid 检索仍使用 DashScope `text-embedding-v3`：请设置 `DASHSCOPE_API_KEY`；未配置或调用失败时沿用既有 tag/轮内记忆降级，不会改用 OpenAI embedding。
 
 在 `qwen_optimizer.py` 中调整模型：
 
 ```python
-def __init__(self, api_key: str, model: Optional[str] = None):  # 默认取 QWEN_MODEL 或 "qwen-plus"
+def __init__(self, api_key: str, model: Optional[str] = None):  # 默认取 QWEN_MODEL 或 "gpt-5.6-sol"
 ```
 
 ## 开发

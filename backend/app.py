@@ -63,9 +63,9 @@ sessions: Dict[str, dict] = {}
 
 
 # -- 请求体模型 ---------------------------------------------------------------
-# 【注意】主凭据字段为 qwen_api_key（阿里云百炼 DashScope）；【双 key】另加
-# 可选 deepseek_api_key（前端双输入框场景），模型名带 deepseek- 前缀时路由到
-# DeepSeek。密钥只随请求体传到内存，绝不持久化。
+# 【兼容】请求字段名保持 qwen_api_key。默认 gpt- 路由使用本机 ChatGPT 登录，
+# 因而允许空字符串；覆盖为 Qwen/DeepSeek/GLM 时仍按既有规则使用相应凭据。
+# 密钥只随请求体传到内存，绝不持久化。
 
 class AnalyzeRequest(BaseModel):
     session_id: str
@@ -282,7 +282,7 @@ async def upload_files(files: List[UploadFile] = File(...)):
 
 @app.post("/api/analyze")
 async def analyze_skill(request: AnalyzeRequest):
-    """Generate scenarios + evals using Qwen"""
+    """Generate scenarios and evals using the configured model route."""
     # 【主流程】步骤 2：用 SkillOptimizer 的 Executor 助手分析技能文件，
     # 生成测试场景与评估标准，写回 session，前端据此进入配置页。
     if request.session_id not in sessions:
@@ -301,7 +301,10 @@ async def analyze_skill(request: AnalyzeRequest):
         return {"scenarios": analysis["scenarios"], "evals": analysis["evals"], "domain": session["domain"]}
     except Exception as e:
         logger.error(f"Analysis error: {traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail="Analysis failed. Check your DashScope API key and try again.")
+        raise HTTPException(
+            status_code=500,
+            detail="Analysis failed. Check your Codex login or provider credentials and try again.",
+        )
 
 
 @app.post("/api/regenerate")

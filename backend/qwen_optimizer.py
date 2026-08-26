@@ -14,9 +14,9 @@
 #       必须放进工作线程（llm_client 的 to_thread），避免阻塞 FastAPI 事件循环。
 # =============================================================================
 
-"""Multi-Agent Skill Optimizer using Qwen-Agent and Alibaba Cloud Model Studio (DashScope).
+"""Multi-Agent Skill Optimizer with fixed Codex/Qwen/DeepSeek/GLM routes.
 
-3 Qwen-Agent assistants work together to improve agent skills:
+Three stateless model roles work together to improve agent skills:
   Executor: runs the skill against test scenarios, scores outputs, analyzes skills
   Analyst: diagnoses why evals failed, picks a mutation strategy
   Mutator: makes one targeted fix per round
@@ -32,7 +32,7 @@ from typing import Callable, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
-from llm_client import LLMClient
+from llm_client import DEFAULT_MODEL, LLMClient
 
 
 class _RoleMessage:
@@ -228,8 +228,9 @@ class SkillOptimizer:
     ):
         # The key is passed directly into the LLM configuration; it is never
         # written to the process environment, stored in sessions, or logged.
-        # 【安全】默认模型 qwen-plus，可用环境变量 QWEN_MODEL 覆盖后端默认值。
-        self.model = model or os.getenv("QWEN_MODEL", "qwen-plus")
+        # 【临时默认】生成走本机 Codex App Server 的 gpt-5.6-sol；沿用既有
+        # QWEN_MODEL 名称保持部署兼容，可显式覆盖回 Qwen/DeepSeek/GLM。
+        self.model = model or os.getenv("QWEN_MODEL", DEFAULT_MODEL)
         self._call_id = 0
 
         # 【C4】回归保护开关：默认开启，可用 REGRESSION_CHECK=0 关闭做实验。
@@ -508,9 +509,8 @@ class SkillOptimizer:
         # 内存 embedding 缓存（同文本不重复调用）。
         self._embed_cache = {}
 
-        # 【阶段 1 薄封装】LLM 直调客户端：dashscope 同步 SDK + to_thread 桥接 +
-        # 指数退避重试 + 超时 + JSON mode。参数与旧 Assistant 配置逐字对齐：
-        # temperature=0.2、QWEN_ENABLE_THINKING（默认关闭思考）。
+        # 【阶段 1 薄封装】LLM 直调客户端：Codex / DashScope / DeepSeek / GLM
+        # 固定路由 + to_thread 桥接 + 指数退避重试 + 超时 + JSON mode。
         # 【双 key】deepseek_api_key 是可选 DeepSeek key（前端双输入框场景）；
         # DeepSeek 分支优先用它，未传则回退 api_key / DEEPSEEK_API_KEY 环境变量。
         enable_thinking = os.getenv("QWEN_ENABLE_THINKING", "0") != "0"
@@ -524,8 +524,8 @@ class SkillOptimizer:
 
         # 【目标 1：角色模型分工】三个角色可分别覆盖基础模型。所有变量均未
         # 设置时，各角色继续复用上面的单一客户端，调用序列与旧行为一致。
-        # 路由仍由 LLMClient 的既有显式规则决定：deepseek- 前缀走 DeepSeek，
-        # 其余模型走主服务 DashScope；这里不引入通用 provider 抽象。
+        # 路由仍由 LLMClient 的显式规则决定：gpt- 走 Codex ChatGPT 登录，
+        # deepseek-/glm- 走既有例外，其余模型走 DashScope；不引入通用抽象。
         self.executor_model = os.getenv("EXECUTOR_MODEL") or self.model
         self.analyst_model = os.getenv("ANALYST_MODEL") or self.model
         self.mutator_model = os.getenv("MUTATOR_MODEL") or self.model
@@ -618,7 +618,7 @@ class SkillOptimizer:
     # （轮询/SSE 才能继续响应）。签名保留以兼容既有调用点与测试 mock 点。
 
     def _run_agent_sync(self, agent, prompt: str, json_mode: bool = False) -> str:
-        """Run the LLM synchronously via the DashScope client (thin shell).
+        """Run the LLM synchronously through the fixed-route client (thin shell).
 
         ``agent`` is kept in the signature for backward compatibility: the system
         message is read from it (real assistants carry ``system_message``; objects
@@ -642,7 +642,7 @@ class SkillOptimizer:
         return await asyncio.to_thread(self._run_agent_sync, agent, prompt, json_mode=json_mode)
 
     async def _ask_json(self, agent, prompt: str, fallback=None, schema=None):
-        """Run a Qwen-Agent assistant and parse the JSON response.
+        """Run a model role and parse the JSON response.
 
         When a Pydantic ``schema`` is provided, it is appended to the prompt and
         the parsed payload is validated with ``model_validate()``. Tolerant JSON

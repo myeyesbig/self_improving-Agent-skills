@@ -3,8 +3,9 @@
 # start-dev.sh —— SkillForge 前后端一键启动脚本
 # 用法：
 #   ./start-dev.sh           启动前后端（单终端，Ctrl+C 全部停止）
-#   QWEN_MODEL=qwen-plus ./start-dev.sh   覆盖模型名（默认 deepseek-chat）
-#   QWEN_ENABLE_THINKING=0 ./start-dev.sh 关闭思考模式（默认 1）
+#   QWEN_MODEL=qwen-plus NEXT_PUBLIC_CODEX_CHATGPT_MODE=0 ./start-dev.sh
+#                            显式切回 Qwen 与旧 API Key 界面门槛
+#   CODEX_REASONING_EFFORT=medium ./start-dev.sh  覆盖 Codex 推理档位
 # 说明：端口已被占用时自动跳过对应服务；日志直接打印到当前终端。
 # =============================================================================
 set -u
@@ -12,10 +13,11 @@ set -u
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 BACKEND_PORT=8891
 FRONTEND_PORT=3000
-# 默认模型 deepseek-chat（DeepSeek 可选 provider，见 AGENTS.md 例外）；
-# 想用 Qwen/DashScope 时以 QWEN_MODEL=qwen3.7-max-preview 覆盖。
-QWEN_MODEL="${QWEN_MODEL:-deepseek-chat}"
-QWEN_ENABLE_THINKING="${QWEN_ENABLE_THINKING:-1}"
+# 临时默认使用本机 Codex ChatGPT 登录；Qwen、DeepSeek、GLM 仍可通过
+# 既有 QWEN_MODEL / 角色模型变量显式启用。
+QWEN_MODEL="${QWEN_MODEL:-gpt-5.6-sol}"
+QWEN_ENABLE_THINKING="${QWEN_ENABLE_THINKING:-0}"
+NEXT_PUBLIC_CODEX_CHATGPT_MODE="${NEXT_PUBLIC_CODEX_CHATGPT_MODE:-1}"
 
 is_port_listening() {
   lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1
@@ -40,10 +42,11 @@ fi
 if is_port_listening "$FRONTEND_PORT"; then
   echo "[skillforge] 前端已在运行 (端口 $FRONTEND_PORT)，跳过"
 else
-  echo "[skillforge] 启动前端 (端口 $FRONTEND_PORT)..."
+  echo "[skillforge] 启动前端 (端口 $FRONTEND_PORT, Codex ChatGPT mode=$NEXT_PUBLIC_CODEX_CHATGPT_MODE)..."
   (
     cd "$ROOT/frontend" || exit 1
     exec env -u CODEBUDDY_SAFE_DELETE_BULK_STATE_DIR -u CODEBUDDY_TOOL_CALL_ID \
+      NEXT_PUBLIC_CODEX_CHATGPT_MODE="$NEXT_PUBLIC_CODEX_CHATGPT_MODE" \
       npm run dev
   ) &
   PIDS+=("$!")
