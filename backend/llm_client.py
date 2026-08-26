@@ -5,7 +5,8 @@
 #         2. 对网络/限流类异常做指数退避重试（解析错误不重试）
 #         3. 可选 JSON mode（response_format={"type": "json_object"}）
 # 服务选择（显式、非通用抽象，见 AGENTS.md 例外条款）：
-#   - 模型名以 gpt- 开头 → 本机 Codex App Server（仅 ChatGPT 登录态）
+#   - 模型名以 gpt- 开头 → 本机 Codex App Server（仅 ChatGPT 登录态；
+#     惰性 LIFO 工作池复用初始化连接，每次调用仍新建 ephemeral thread）
 #   - 模型名以 deepseek- 开头 → DeepSeek OpenAI 兼容 API（api.deepseek.com）
 #   - 模型名以 glm- 开头 → 智谱 Zhipu OpenAI 兼容 API（open.bigmodel.cn）
 #   - 其余模型 → 阿里云百炼 DashScope（key 由调用方直传）
@@ -28,6 +29,7 @@ are deliberately limited:
 """
 
 import asyncio
+import atexit
 import json
 import os
 import queue
@@ -53,6 +55,8 @@ DEFAULT_MODEL = "gpt-5.6-sol"
 CODEX_REQUEST_TIMEOUT = 300
 CODEX_CLI_PATH_ENV = "CODEX_CLI_PATH"
 CODEX_REASONING_EFFORT_ENV = "CODEX_REASONING_EFFORT"
+CODEX_APP_SERVER_POOL_SIZE_ENV = "CODEX_APP_SERVER_POOL_SIZE"
+CODEX_APP_SERVER_POOL_SIZE = 3
 CODEX_MAC_APP_PATH = "/Applications/ChatGPT.app/Contents/Resources/codex"
 
 # 子进程不继承任何模型服务 key，避免本机环境中的 OPENAI_API_KEY 抢占
@@ -126,22 +130,16 @@ def _resolve_codex_cli() -> str:
     )
 
 
-class _CodexAppServerClient:
-    """One ephemeral, text-only Codex App Server turn.
+class _CodexAppServerWorker:
+    """One reusable App Server connection serving isolated ephemeral turns."""
 
-    A fresh process per call keeps concurrent LangGraph candidates isolated and
-    avoids persisting uploaded skill text as a Codex thread. The protocol is
-    newline-delimited JSON over stdio. Authentication is deliberately checked
-    with ``account/read`` before any prompt is submitted so API-key login can
-    never silently replace ChatGPT subscription access.
-    """
-
-    def __init__(self, model: str, timeout: int = CODEX_REQUEST_TIMEOUT):
-        self.model = model
+    def __init__(self, timeout: int = CODEX_REQUEST_TIMEOUT):
         self.timeout = max(1, int(timeout))
         self._next_id = 0
         self._process = None
         self._messages = queue.Queue()
+        self._runtime_dir = None
+        self._lock = threading.RLock()
 
     def _new_id(self) -> int:
         self._next_id += 1
@@ -158,14 +156,15 @@ class _CodexAppServerClient:
         except (BrokenPipeError, OSError) as exc:
             raise RuntimeError("Codex App Server connection closed unexpectedly") from exc
 
-    def _read_stdout(self) -> None:
+    @staticmethod
+    def _read_stdout(process, messages) -> None:
         try:
-            if self._process is None or self._process.stdout is None:
+            if process is None or process.stdout is None:
                 return
-            for line in self._process.stdout:
-                self._messages.put(line)
+            for line in process.stdout:
+                messages.put(line)
         finally:
-            self._messages.put(None)
+            messages.put(None)
 
     def _next_message(self, deadline: float) -> dict:
         while True:
@@ -245,13 +244,22 @@ class _CodexAppServerClient:
             raise RuntimeError("Codex attempted a forbidden tool or state-changing action")
         return item if isinstance(item, dict) else None
 
-    def _collect_turn(self, deadline: float) -> str:
+    def _collect_turn(self, deadline: float, thread_id: str, turn_id: str) -> str:
         final_text = None
         unknown_text = None
         deltas = {}
         while True:
             message = self._next_message(deadline)
             method = message.get("method")
+            params = message.get("params") or {}
+            message_thread_id = params.get("threadId")
+            message_turn_id = params.get("turnId")
+            if method == "turn/completed" and not message_turn_id:
+                message_turn_id = (params.get("turn") or {}).get("id")
+            if message_thread_id and message_thread_id != thread_id:
+                continue
+            if message_turn_id and message_turn_id != turn_id:
+                continue
             item = self._check_item(message)
             if method == "item/completed" and item and item.get("type") == "agentMessage":
                 text = item.get("text")
@@ -263,18 +271,17 @@ class _CodexAppServerClient:
                     else:
                         unknown_text = text
             elif method == "item/agentMessage/delta":
-                params = message.get("params") or {}
                 item_id = str(params.get("itemId") or "")
                 delta = params.get("delta")
                 if isinstance(delta, str):
                     deltas[item_id] = deltas.get(item_id, "") + delta
             elif method == "turn/completed":
-                turn = (message.get("params") or {}).get("turn") or {}
+                turn = params.get("turn") or {}
                 if turn.get("status") != "completed":
                     raise RuntimeError("Codex generation did not complete successfully")
                 break
             elif method == "error":
-                if (message.get("params") or {}).get("willRetry") is True:
+                if params.get("willRetry") is True:
                     continue
                 raise RuntimeError("Codex generation failed")
 
@@ -296,37 +303,85 @@ class _CodexAppServerClient:
             raise RuntimeError("Codex structured generation returned an invalid wrapper")
         return result
 
-    def call(self, system: str, user: str, json_mode: bool) -> str:
-        deadline = time.monotonic() + self.timeout
+    def _ensure_started(self, deadline: float) -> None:
+        if self._process is not None and self._process.poll() is None:
+            return
+        self.close()
         cli = _resolve_codex_cli()
-        with tempfile.TemporaryDirectory(prefix="skillforge-codex-") as runtime_dir:
+        self._runtime_dir = tempfile.TemporaryDirectory(prefix="skillforge-codex-")
+        runtime_dir = self._runtime_dir.name
+        self._messages = queue.Queue()
+        self._next_id = 0
+        try:
+            self._process = subprocess.Popen(
+                [cli, "app-server", "--stdio", "-c", "mcp_servers={}"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                bufsize=1,
+                cwd=runtime_dir,
+                env=self._safe_environment(),
+            )
+            reader = threading.Thread(
+                target=self._read_stdout,
+                args=(self._process, self._messages),
+                daemon=True,
+            )
+            reader.start()
+            self._request(
+                "initialize",
+                {
+                    "clientInfo": {
+                        "name": "skillforge",
+                        "title": "SkillForge",
+                        "version": "1.0.0",
+                    }
+                },
+                deadline,
+            )
+            self._send({"method": "initialized", "params": {}})
+        except Exception:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        with self._lock:
+            self._close_unlocked()
+
+    def _close_unlocked(self) -> None:
+        process = self._process
+        self._process = None
+        if process is not None:
             try:
-                self._process = subprocess.Popen(
-                    [cli, "app-server", "--stdio", "-c", "mcp_servers={}"],
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.DEVNULL,
-                    text=True,
-                    bufsize=1,
-                    cwd=runtime_dir,
-                    env=self._safe_environment(),
-                )
-                reader = threading.Thread(target=self._read_stdout, daemon=True)
-                reader.start()
+                if process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait(timeout=2)
+            except OSError:
+                pass
+        runtime_dir = self._runtime_dir
+        self._runtime_dir = None
+        if runtime_dir is not None:
+            try:
+                runtime_dir.cleanup()
+            except OSError:
+                pass
 
-                self._request(
-                    "initialize",
-                    {
-                        "clientInfo": {
-                            "name": "skillforge",
-                            "title": "SkillForge",
-                            "version": "1.0.0",
-                        }
-                    },
-                    deadline,
-                )
-                self._send({"method": "initialized", "params": {}})
-
+    def call(
+        self,
+        model: str,
+        system: str,
+        user: str,
+        json_mode: bool,
+        deadline: float,
+    ) -> str:
+        with self._lock:
+            try:
+                self._ensure_started(deadline)
                 account_result = self._request(
                     "account/read", {"refreshToken": False}, deadline
                 )
@@ -339,17 +394,18 @@ class _CodexAppServerClient:
                 models_result = self._request(
                     "model/list", {"limit": 100, "includeHidden": False}, deadline
                 )
-                model_entry = self._model_entry(models_result, self.model)
+                model_entry = self._model_entry(models_result, model)
                 if model_entry is None:
                     raise RuntimeError(
-                        f"Codex model '{self.model}' is not available for this ChatGPT account"
+                        f"Codex model '{model}' is not available for this ChatGPT account"
                     )
                 effort = self._reasoning_effort(model_entry)
+                runtime_dir = self._runtime_dir.name
 
                 thread_result = self._request(
                     "thread/start",
                     {
-                        "model": self.model,
+                        "model": model,
                         "cwd": runtime_dir,
                         "approvalPolicy": "never",
                         "sandbox": "read-only",
@@ -375,23 +431,109 @@ class _CodexAppServerClient:
                     "input": [{"type": "text", "text": turn_input}],
                     "approvalPolicy": "never",
                     "sandboxPolicy": {"type": "readOnly", "networkAccess": False},
-                    "model": self.model,
+                    "model": model,
                     "effort": effort,
                     "summary": "none",
                 }
                 if json_mode:
                     turn_params["outputSchema"] = _CODEX_JSON_WRAPPER_SCHEMA
-                self._request("turn/start", turn_params, deadline)
-                text = self._collect_turn(deadline)
+                turn_result = self._request("turn/start", turn_params, deadline)
+                turn = turn_result.get("turn") or {}
+                turn_id = turn.get("id")
+                if not turn_id:
+                    raise RuntimeError("Codex failed to start a turn")
+                text = self._collect_turn(deadline, thread_id, turn_id)
                 return self._unwrap_json_result(text) if json_mode else text
-            finally:
-                if self._process is not None:
-                    self._process.terminate()
-                    try:
-                        self._process.wait(timeout=2)
-                    except subprocess.TimeoutExpired:
-                        self._process.kill()
-                        self._process.wait(timeout=2)
+            except Exception:
+                # A failed turn can leave unread notifications or active work on the
+                # connection. Reset this worker; LLMClient retry will start it cleanly.
+                self.close()
+                raise
+
+
+def _codex_pool_size() -> int:
+    try:
+        value = int(os.getenv(CODEX_APP_SERVER_POOL_SIZE_ENV, str(CODEX_APP_SERVER_POOL_SIZE)))
+    except ValueError:
+        value = CODEX_APP_SERVER_POOL_SIZE
+    return max(1, min(3, value))
+
+
+class _CodexAppServerPool:
+    """Lazy LIFO pool: sequential calls reuse one warm worker; parallel calls fan out."""
+
+    def __init__(self, size: int, timeout: int):
+        self.size = size
+        self.timeout = timeout
+        self._workers = [_CodexAppServerWorker(timeout=timeout) for _ in range(size)]
+        self._available = queue.LifoQueue(maxsize=size)
+        for worker in reversed(self._workers):
+            self._available.put(worker)
+
+    def call(self, model: str, system: str, user: str, json_mode: bool) -> str:
+        deadline = time.monotonic() + self.timeout
+        try:
+            worker = self._available.get(timeout=self.timeout)
+        except queue.Empty as exc:
+            raise TimeoutError("Codex App Server pool acquisition timed out") from exc
+        try:
+            return worker.call(model, system, user, json_mode, deadline)
+        finally:
+            self._available.put(worker)
+
+    def close(self) -> None:
+        for worker in self._workers:
+            worker.close()
+
+
+_CODEX_POOL = None
+_CODEX_POOL_PID = None
+_CODEX_POOL_LOCK = threading.Lock()
+
+
+def _get_codex_pool(timeout: int) -> _CodexAppServerPool:
+    global _CODEX_POOL, _CODEX_POOL_PID
+    pid = os.getpid()
+    size = _codex_pool_size()
+    with _CODEX_POOL_LOCK:
+        if (
+            _CODEX_POOL is None
+            or _CODEX_POOL_PID != pid
+            or _CODEX_POOL.size != size
+            or _CODEX_POOL.timeout != timeout
+        ):
+            if _CODEX_POOL is not None:
+                _CODEX_POOL.close()
+            _CODEX_POOL = _CodexAppServerPool(size=size, timeout=timeout)
+            _CODEX_POOL_PID = pid
+        return _CODEX_POOL
+
+
+def _shutdown_codex_pool() -> None:
+    global _CODEX_POOL, _CODEX_POOL_PID
+    with _CODEX_POOL_LOCK:
+        if _CODEX_POOL is not None:
+            _CODEX_POOL.close()
+        _CODEX_POOL = None
+        _CODEX_POOL_PID = None
+
+
+def _reset_codex_pool_for_tests() -> None:
+    _shutdown_codex_pool()
+
+
+atexit.register(_shutdown_codex_pool)
+
+
+class _CodexAppServerClient:
+    """Facade preserving the LLMClient route while reusing the warm process pool."""
+
+    def __init__(self, model: str, timeout: int = CODEX_REQUEST_TIMEOUT):
+        self.model = model
+        self.timeout = max(1, int(timeout))
+
+    def call(self, system: str, user: str, json_mode: bool) -> str:
+        return _get_codex_pool(self.timeout).call(self.model, system, user, json_mode)
 
 
 # 命中任一关键词视为瞬时故障，值得重试；大小写不敏感。

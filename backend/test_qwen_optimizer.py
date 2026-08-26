@@ -21,14 +21,25 @@ import asyncio
 import io
 import json
 import os
+import queue
 import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from pydantic import ValidationError
 
-from llm_client import DEFAULT_MODEL, GLM_REQUEST_TIMEOUT, LLMClient, _is_codex_model
+from llm_client import (
+    DEFAULT_MODEL,
+    GLM_REQUEST_TIMEOUT,
+    LLMClient,
+    _CodexAppServerPool,
+    _codex_pool_size,
+    _is_codex_model,
+    _reset_codex_pool_for_tests,
+)
 from qwen_optimizer import (
     ANALYST_SYSTEM_PROMPT,
     EXECUTOR_SYSTEM_PROMPT,
@@ -3646,6 +3657,12 @@ class _FakeCodexProcess:
 class TestCodexAppServerRoute(unittest.TestCase):
     """Codex ChatGPT 路由：认证、模型、隔离、结构化输出与 fail-closed。"""
 
+    def setUp(self):
+        _reset_codex_pool_for_tests()
+
+    def tearDown(self):
+        _reset_codex_pool_for_tests()
+
     @staticmethod
     def _model_entry(model="gpt-5.6-sol", efforts=None):
         efforts = efforts or ["low", "medium", "high"]
@@ -3725,6 +3742,45 @@ class TestCodexAppServerRoute(unittest.TestCase):
         self.assertFalse(_is_codex_model("deepseek-chat"))
         self.assertFalse(_is_codex_model("glm-4-flash"))
 
+    def test_pool_size_environment_is_bounded(self):
+        with patch.dict(os.environ, {"CODEX_APP_SERVER_POOL_SIZE": "bad"}, clear=False):
+            self.assertEqual(_codex_pool_size(), 3)
+        with patch.dict(os.environ, {"CODEX_APP_SERVER_POOL_SIZE": "0"}, clear=False):
+            self.assertEqual(_codex_pool_size(), 1)
+        with patch.dict(os.environ, {"CODEX_APP_SERVER_POOL_SIZE": "9"}, clear=False):
+            self.assertEqual(_codex_pool_size(), 3)
+
+    def test_pool_uses_distinct_workers_for_overlapping_calls(self):
+        barrier = threading.Barrier(2)
+
+        class FakeWorker:
+            def __init__(self):
+                self.calls = 0
+
+            def call(self, model, system, user, json_mode, deadline):
+                self.calls += 1
+                barrier.wait(timeout=1)
+                return user
+
+            def close(self):
+                pass
+
+        pool = _CodexAppServerPool(size=2, timeout=2)
+        workers = [FakeWorker(), FakeWorker()]
+        pool._workers = workers
+        pool._available = queue.LifoQueue(maxsize=2)
+        for worker in reversed(workers):
+            pool._available.put(worker)
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [
+                executor.submit(pool.call, "gpt-5.6-sol", "system", value, False)
+                for value in ("one", "two")
+            ]
+            results = [future.result(timeout=2) for future in futures]
+        self.assertCountEqual(results, ["one", "two"])
+        self.assertEqual([worker.calls for worker in workers], [1, 1])
+
     def test_chatgpt_route_is_ephemeral_text_only_and_uses_output_schema(self):
         process = _FakeCodexProcess(self._success_messages())
         env = {
@@ -3775,6 +3831,86 @@ class TestCodexAppServerRoute(unittest.TestCase):
         sent = self._sent_messages(process)
         turn_params = next(item["params"] for item in sent if item.get("method") == "turn/start")
         self.assertNotIn("outputSchema", turn_params)
+
+    def test_sequential_calls_reuse_one_initialized_process(self):
+        messages = [
+            {"id": 1, "result": {"userAgent": "test"}},
+            {"id": 2, "result": {"account": {"type": "chatgpt"}}},
+            {"id": 3, "result": {"data": [self._model_entry()]}},
+            {"id": 4, "result": {"thread": {"id": "thr_1", "ephemeral": True}}},
+            {"id": 5, "result": {"turn": {"id": "turn_1", "status": "inProgress"}}},
+            {
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thr_1",
+                    "turnId": "turn_1",
+                    "item": {"id": "msg_1", "type": "agentMessage", "phase": "final_answer", "text": "first"},
+                },
+            },
+            {
+                "method": "turn/completed",
+                "params": {"threadId": "thr_1", "turn": {"id": "turn_1", "status": "completed"}},
+            },
+            {"id": 6, "result": {"account": {"type": "chatgpt"}}},
+            {"id": 7, "result": {"data": [self._model_entry()]}},
+            {"id": 8, "result": {"thread": {"id": "thr_2", "ephemeral": True}}},
+            {"id": 9, "result": {"turn": {"id": "turn_2", "status": "inProgress"}}},
+            {
+                "method": "item/completed",
+                "params": {
+                    "threadId": "thr_2",
+                    "turnId": "turn_2",
+                    "item": {"id": "msg_2", "type": "agentMessage", "phase": "final_answer", "text": "second"},
+                },
+            },
+            {
+                "method": "turn/completed",
+                "params": {"threadId": "thr_2", "turn": {"id": "turn_2", "status": "completed"}},
+            },
+        ]
+        process = _FakeCodexProcess(messages)
+        client = LLMClient(api_key="", model="gpt-5.6-sol", max_attempts=1)
+        with (
+            patch.dict(os.environ, {"CODEX_APP_SERVER_POOL_SIZE": "3"}, clear=False),
+            patch("llm_client._resolve_codex_cli", return_value="/fake/codex"),
+            patch("llm_client.subprocess.Popen", return_value=process) as mock_popen,
+        ):
+            self.assertEqual(client.sync_call("system", "one"), "first")
+            self.assertEqual(client.sync_call("system", "two"), "second")
+        self.assertEqual(mock_popen.call_count, 1)
+        methods = [item.get("method") for item in self._sent_messages(process)]
+        self.assertEqual(methods.count("initialize"), 1)
+        self.assertEqual(methods.count("account/read"), 2)
+        self.assertEqual(methods.count("model/list"), 2)
+        self.assertEqual(methods.count("thread/start"), 2)
+        self.assertEqual(methods.count("turn/start"), 2)
+
+    def test_other_thread_tool_notification_is_ignored(self):
+        messages = self._success_messages()
+        messages.insert(5, {
+            "method": "item/started",
+            "params": {
+                "threadId": "thr_other",
+                "turnId": "turn_other",
+                "item": {"id": "cmd_other", "type": "commandExecution", "command": "pwd"},
+            },
+        })
+        process = _FakeCodexProcess(messages)
+        text, _ = self._call_with_process(process)
+        self.assertEqual(text, '{"ok":true}')
+
+    def test_broken_warm_process_restarts_on_llm_retry(self):
+        failed = _FakeCodexProcess([])
+        succeeded = _FakeCodexProcess(self._success_messages())
+        client = LLMClient(api_key="", model="gpt-5.6-sol", max_attempts=2)
+        with (
+            patch("llm_client._resolve_codex_cli", return_value="/fake/codex"),
+            patch("llm_client.subprocess.Popen", side_effect=[failed, succeeded]) as mock_popen,
+            patch("llm_client.time.sleep"),
+        ):
+            text = client.sync_call("system", "prompt", json_mode=True)
+        self.assertEqual(text, '{"ok":true}')
+        self.assertEqual(mock_popen.call_count, 2)
 
     def test_api_key_login_fails_before_prompt_submission(self):
         process = _FakeCodexProcess([

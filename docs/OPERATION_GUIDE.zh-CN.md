@@ -196,10 +196,10 @@ curl -o /dev/null -w "%{http_code}\n" http://localhost:3000   # → 200
 
 每次 `gpt-` 调用依次执行：
 
-1. 启动本机 `codex app-server --stdio`，剥离 OpenAI/DashScope/DeepSeek/GLM API-key 环境变量；
+1. 从惰性工作池取得一个 App Server worker；首次使用才启动 `codex app-server --stdio` 并剥离 OpenAI/DashScope/DeepSeek/GLM API-key 环境变量，后续复用该初始化连接；
 2. `account/read` 必须返回 `type=chatgpt`，API-key 登录直接拒绝；
 3. `model/list` 验证模型与推理档位；
-4. 在空临时目录创建 ephemeral、只读、禁网、无批准 thread；
+4. 在 worker 的空临时目录创建全新的 ephemeral、只读、禁网、无批准 thread，并按 `threadId` / `turnId` 隔离事件；
 5. 任何命令、文件、MCP、Web 等工具 item 都中止调用；结构化结果经严格 `outputSchema` wrapper 解包后再做现有 Pydantic 校验。
 
 选择 Codex 时，SKILL.md、场景、eval、执行结果和模型 Prompt 会发送给 OpenAI，并受当前 ChatGPT 工作区的数据控制约束；SkillForge 不把它们保存成 Codex 历史线程，也不写入日志或 lesson store。
@@ -333,6 +333,7 @@ improved_skill.zip
 | `QWEN_MODEL` | `gpt-5.6-sol` | 兼容保留的基础模型变量；`gpt-` 走 Codex，`deepseek-` / `glm-` 走固定例外，其余走 DashScope |
 | `CODEX_CLI_PATH` | 自动发现 | Codex CLI 路径；macOS 也尝试 ChatGPT App 内置可执行文件 |
 | `CODEX_REASONING_EFFORT` | `model/list` 默认值 | Codex 推理档位，必须属于账户为目标模型公布的档位 |
+| `CODEX_APP_SERVER_POOL_SIZE` | `3` | 惰性长驻 worker 数，范围 1–3；串行复用一个热连接，并行候选才按需启动更多 |
 | `EXECUTOR_MODEL` / `ANALYST_MODEL` / `MUTATOR_MODEL` | 回退 `QWEN_MODEL` | 按角色选模型，沿用上述固定路由 |
 | `ZHIPU_API_KEY` | 无 | GLM 生成的后端凭据，优先于调用方传入的主 key；不得写入日志或会话 |
 | `DASHSCOPE_API_KEY` | 无 | Codex/DeepSeek/GLM 做生成时，单独为 lesson embedding/rerank 提供 DashScope 凭据 |
@@ -419,7 +420,7 @@ MUTATION_PARALLELISM=2 ./start-dev.sh
 ```
 - **收益**：每轮尝试 2–3 个不同候选，取最优；跑同一总轮数下找改进的概率更高
 - **代价**：每轮 LLM 调用量 ×并行数；Token 费用线性增长
-- **注意**：上限 3；Codex 路由为每次调用创建独立 ephemeral App Server 进程，候选之间不会共享线程历史
+- **注意**：上限 3；Codex 默认工作池也是 3。候选可占用不同热连接，但每次调用仍创建独立 ephemeral thread，不共享对话历史
 
 ### Q6. 跨会话经验库怎么开？怎么决定 LESSON_RETRIEVAL 选哪档？
 **答**：

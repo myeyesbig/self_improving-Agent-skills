@@ -189,7 +189,9 @@ JSONL 可直接承载新字段；SQLite 只用内置 `sqlite3` 增加可空 `com
 
 OpenAI 官方把 Codex App Server 定位为富客户端的本地集成协议：客户端先初始化，再通过 `account/read`、`model/list`、`thread/start` 和 `turn/start` 驱动一次任务。它与 OpenAI Platform API 是两种计费/认证边界：ChatGPT 登录使用订阅访问，API key 登录按 Platform 用量计费。因此 SkillForge 没有复用 OpenAI-compatible HTTP 客户端，也没有把 `OPENAI_API_KEY` 加入凭据优先级，而是为 `gpt-` 建立单一、可审计的 App Server 分支。
 
-本路由选择每次调用一个全新进程与 ephemeral thread，而不是复用持久 Codex 对话。代价是增加进程启动开销；收益是并行候选之间没有历史串扰，上传技能与 Prompt 不会落入 Codex 本地 thread 历史，且在提交任何 Prompt 前就能验证 `account.type=chatgpt` 和账户模型目录。进程运行在空临时目录，设置只读、禁网、无批准，并剥离所有模型 API key；协议流只允许 user/agent/reasoning/plan 文本 item，任何命令、文件、MCP 或 Web item 都 fail closed。
+初版为每次调用启动一个全新进程与 ephemeral thread，隔离简单但重复支付进程、SQLite 状态和 `initialize` 握手成本。OpenAI App Server 协议本身要求“一条连接只初始化一次”，且 turn/item 通知携带 `threadId` / `turnId`，因此后续优化为惰性 LIFO 工作池：串行调用持续复用一个已初始化进程，并行候选忙时才启动第 2/3 个 worker；每次 LLM 调用仍创建全新 ephemeral thread，不复用对话历史。每个 worker 运行在独立空临时目录，设置只读、禁网、无批准并剥离所有模型 API key；匹配当前 thread/turn 的命令、文件、MCP 或 Web item 仍 fail closed，失败连接在重试前销毁重建。
+
+同机低推理档位实测中，连续两个最小 JSON turn 的冷/热耗时为 7.66 秒与 6.70 秒，热连接约快 14%；相同 `max_rounds=1` 小技能从初版约 62 秒降至 49.82 秒。该对比受模型服务波动影响，只能说明重复初始化是可消除成本，不能把全部延迟归因于冷启动：模型推理仍占主要部分。工作池默认/max 都是 3，与现有并行候选上限一致，避免无界启动本机 Codex 进程。
 
 App Server 的严格 `outputSchema` 不允许任意 object（顶层必须 `additionalProperties=false`）。现有 Analyst/Mutator 的具体 Pydantic schema 已写入 Prompt，但 `llm_client` 的通用 JSON-mode 接口不知道每次具体字段。因此适配层使用唯一的 `{result: string}` 严格 wrapper，让模型把原目标 JSON 序列化进 `result`；解包后继续走既有宽容 JSON 提取和 Pydantic 校验。这样没有改动三角色协议，也没有让结构化输出退化为纯文本约定。
 

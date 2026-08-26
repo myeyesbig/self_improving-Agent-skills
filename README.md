@@ -207,6 +207,8 @@ zip -r my-skill.zip my-skill/
 
 生成模型临时默认使用 `gpt-5.6-sol`，通过本机 Codex App Server 消耗当前 ChatGPT/Codex 套餐额度。每次调用都会先用 `account/read` 确认认证类型为 `chatgpt`，再用 `model/list` 验证模型与推理档位；如果 Codex CLI 使用 API key 登录则直接失败，避免静默产生 OpenAI Platform API 费用。
 
+App Server 采用惰性长驻工作池：串行请求复用同一个已初始化进程，并行候选忙时才启动额外 worker；每次模型请求仍创建新的 ephemeral thread，按 `threadId` / `turnId` 隔离事件，不复用模型对话历史。`CODEX_APP_SERVER_POOL_SIZE` 默认 3，并钳制在 1–3。
+
 请求字段仍为 `qwen_api_key` 以保持 API 兼容，Codex 默认模式允许传空字符串。覆盖为 Qwen、DeepSeek 或 GLM 时，该字段和既有厂商环境变量继续按原规则工作。所有请求密钥均不写入进程级环境变量、不存入会话、不记入日志。Executor、Analyst、Mutator 可分别用 `EXECUTOR_MODEL`、`ANALYST_MODEL`、`MUTATOR_MODEL` 覆盖。服务运行在 **8891** 端口。
 
 > **数据边界**：选择 `gpt-` 模型时，SKILL.md、场景、评估标准、执行结果和生成 Prompt 会发送到 OpenAI Codex，并受当前 ChatGPT 工作区的数据控制约束。SkillForge 使用临时只读 thread，不把它们持久化为 Codex 对话，也不写入日志或 lesson store。
@@ -244,6 +246,7 @@ SkillForge 提供一组**可选**优化旋钮，全部默认等价于经典行�
 | `QWEN_MODEL` | 环境变量 | `gpt-5.6-sol` | 兼容保留的基础模型变量；`gpt-` 走 Codex，`deepseek-` / `glm-` 走固定例外，其余走 DashScope |
 | `CODEX_CLI_PATH` | 环境变量 | 自动发现 `codex` | 本机 Codex CLI 可执行文件；macOS 也会尝试 ChatGPT App 内置路径 |
 | `CODEX_REASONING_EFFORT` | 环境变量 | 模型 `model/list` 默认值 | Codex 推理档位，必须是账户为该模型公布的档位 |
+| `CODEX_APP_SERVER_POOL_SIZE` | 环境变量 | `3` | 惰性长驻 App Server worker 数（1–3）；串行只启动并复用 1 个，并行时按需扩展 |
 | `EXECUTOR_MODEL` | 环境变量 | 继承 `QWEN_MODEL` | Executor 的执行、测试生成与评分模型；适合配置为成本较低的模型 |
 | `ANALYST_MODEL` | 环境变量 | 继承 `QWEN_MODEL` | Analyst 的失败诊断模型；可配置为推理能力更强的模型 |
 | `MUTATOR_MODEL` | 环境变量 | 继承 `QWEN_MODEL` | Mutator 的单点编辑模型；可配置为指令遵循更强的模型 |
